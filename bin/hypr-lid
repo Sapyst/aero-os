@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Ajusta a tela do laptop (eDP-1) conforme a tampa e o modo escolhido no app Configurações.
+# Uso: hypr-lid [closed|open]   (sem argumento, lê o sensor da tampa)
+#
+# Modos (salvos em ~/.config/hypr/painel.conf pelo app):
+#   espelhar   -> tela do laptop mostra o mesmo que o monitor externo
+#   so-externo -> tela do laptop apagada; só o monitor externo
+#   estender   -> duas telas lado a lado (laptop à direita do monitor)
+# Com a tampa fechada e monitor externo ligado, a tela do laptop sempre apaga.
+#
+# A regra escolhida também é gravada em ~/.config/hypr/tampa.conf (lido pelo hyprland.conf
+# logo depois do monitores.conf). Assim, num "hyprctl reload" o Hyprland já lê a regra certa
+# e não precisa LIGAR a tela do laptop só pra este script DESLIGAR de novo um instante depois
+# (isso causava um "monitor removido/adicionado" a cada reload). (notas pessoais)
+
+# Valores padrão, sobrescritos pelo painel.conf se ele existir
+MODO=espelhar
+ESCALA_LAPTOP=1.6
+. "$HOME/.local/share/aero-shell/painel.sh" && ler_painel   # lê sem executar (painel.sh)
+
+estado="${1:-$(grep -oE 'open|closed' /proc/acpi/button/lid/*/state | head -1)}"
+
+# Primeiro monitor que não seja a tela interna
+externo=$(hyprctl monitors all | awk '/^Monitor/ && $2 != "eDP-1" {print $2; exit}')
+
+if [ -z "$externo" ]; then
+    regra="eDP-1,preferred,auto,$ESCALA_LAPTOP"
+elif [ "$estado" = "closed" ] || [ "$MODO" = "so-externo" ]; then
+    regra="eDP-1,disable"
+elif [ "$MODO" = "espelhar" ]; then
+    regra="eDP-1,preferred,auto,$ESCALA_LAPTOP,mirror,$externo"
+else
+    regra="eDP-1,preferred,auto-right,$ESCALA_LAPTOP"
+fi
+
+# Grava a regra pro próximo reload (só reescreve se mudou)
+tampa="$HOME/.config/hypr/tampa.conf"
+novo="# Gerado pelo ~/.local/bin/hypr-lid (tampa + modo da tela). Não editar: é reescrito sozinho.
+monitor=$regra"
+[ "$(cat "$tampa" 2>/dev/null)" = "$novo" ] || printf '%s\n' "$novo" > "$tampa"
+
+hyprctl keyword monitor "$regra"

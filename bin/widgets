@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Widgets da área de trabalho (doc 51). Código: ~/.local/share/aero-shell/widgets.py (+ widget_*.py)
+# Uso: widgets                 inicia (se já estiver rodando, não faz nada)
+#      widgets --editar        liga/desliga o modo "arrumar" (arrastar widgets)
+#      widgets --adicionar T   adiciona um widget do tipo T (relogio, sistema, recursos, clima, batalha)
+#      widgets --recarregar    relê a configuração e recria tudo
+#      widgets --reiniciar     fecha e abre de novo (pra pegar uma mudança no código)
+# Se fechar sozinho (erro), este lançador abre de novo em 2 s. Registro: ~/.cache/aero-shell/widgets.log
+mkdir -p "$HOME/.cache/aero-shell"
+LOG="$HOME/.cache/aero-shell/widgets.log"
+rodar() { WIDGETS_DEPURAR=${WIDGETS_DEPURAR:-} LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$HOME/.local/share/aero-shell/widgets.py" "$@" >> "$LOG" 2>&1 9>&-; }
+if [ "$1" = --reiniciar ]; then
+    pkill -f '^python3 /home/[^ ]*/aero-shell/widgets.py'; sleep 0.5
+    exec "$0"
+fi
+if [ $# -gt 0 ]; then
+    rodar "$@"            # comando pro daemon que já está aberto (o GTK entrega pra ele)
+    exit 0
+fi
+exec 9> "${XDG_RUNTIME_DIR:-/tmp}/aero-widgets.trava"
+flock -n 9 || exit 0
+rodando() { ps -eo args | awk '$1=="python3" && $2 ~ /aero-shell\/widgets\.py$/' | grep -q .; }
+while true; do
+    if rodando; then sleep 2; continue; fi
+    rodar
+    echo "$(date '+%F %T') os widgets fecharam; abrindo de novo" >> "$LOG"
+    sleep 2
+done

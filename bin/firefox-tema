@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+firefox-tema — cores e fonte do textfox (tema "terminal" do Firefox) a partir do tema do sistema.
+
+Escreve chrome/config.css no perfil padrão do Firefox com as DUAS paletas do sistema
+(~/.config/waybar/cores-claro.css e cores-escuro.css): o Firefox troca sozinho entre elas quando o
+sistema troca claro/escuro. Fonte: a monoespaçada do sistema (Settings → Theme → Monospace font).
+Botões da janela: seguem Settings → Theme → Window buttons (BOTOES_JANELA).
+Chamado pelo hypr-tema. Mudanças de COR valem ao reabrir o Firefox; claro/escuro vale na hora.
+"""
+import configparser
+import os
+import re
+import subprocess
+
+FF = os.path.expanduser("~/.config/mozilla/firefox")
+WB = os.path.expanduser("~/.config/waybar")
+
+
+def perfil():
+    cp = configparser.ConfigParser()
+    cp.read(os.path.join(FF, "profiles.ini"))
+    for s in cp.sections():
+        if s.startswith("Install") and cp[s].get("Default"):
+            return os.path.join(FF, cp[s]["Default"])
+    return None
+
+
+def cores(arq):
+    c = {"fundo-solido": "#1e1e1e", "texto": "#f0f0f0", "destaque": "#f0f0f0"}
+    try:
+        c.update(dict(re.findall(r"@define-color\s+([\w-]+)\s+(#[0-9a-fA-F]{6});", open(arq).read())))
+    except OSError:
+        pass
+    return c
+
+
+def mistura(a, b, t):
+    pa = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+    pb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(pa, pb))
+
+
+def bloco(c):
+    f, t = c["fundo-solido"], c["texto"]
+    return (f"    --tf-bg: {f};\n"
+            f"    --tf-accent: {t};\n"
+            f"    --tf-border: {mistura(t, f, 0.78)};\n"
+            f"    --toolbar-color: {t};\n")
+
+
+def main():
+    p = perfil()
+    if not p:
+        return
+    fonte = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"],
+                           capture_output=True, text=True).stdout.strip().strip("'")
+    familia = re.sub(r"\s+\d+(\.\d+)?$", "", fonte) or "monospace"
+    botoes = "flex"
+    try:
+        if "BOTOES_JANELA=0" in open(os.path.expanduser("~/.config/hypr/painel.conf")).read().split():
+            botoes = "none"
+    except OSError:
+        pass
+    escuro, claro = cores(os.path.join(WB, "cores-escuro.css")), cores(os.path.join(WB, "cores-claro.css"))
+    css = f"""/* Gerado por ~/.local/bin/firefox-tema (cores e fonte do sistema). Não edite: é refeito. */
+:root {{
+  --tf-font-family: "{familia}", monospace;
+  --tf-font-size: 13px;
+  --tf-border-width: 1px;
+  --tf-rounding: 6px;
+  --tf-display-horizontal-tabs: inline-flex;   /* abas em cima, como antes */
+  --tf-display-window-controls: {botoes};
+  --tf-display-nav-buttons: flex;              /* voltar / avançar */
+  --tf-display-urlbar-icons: flex;             /* favoritar, leitor, permissões do site */
+  --tf-display-titles: flex;
+  --tf-bookmarks-alignment: left;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+{bloco(escuro)}  }}
+}}
+@media (prefers-color-scheme: light) {{
+  :root {{
+{bloco(claro)}  }}
+}}
+"""
+    os.makedirs(os.path.join(p, "chrome"), exist_ok=True)
+    with open(os.path.join(p, "chrome", "config.css"), "w") as f:
+        f.write(css)
+    print(os.path.join(p, "chrome", "config.css"))
+
+
+main()

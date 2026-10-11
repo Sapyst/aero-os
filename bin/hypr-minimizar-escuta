@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""
+Ouve os eventos do Hyprland e cuida de duas coisas:
+
+1) Minimizar: quando um app pede pra ser minimizado (pelo botão de minimizar que o PRÓPRIO app
+   desenha, ex: apps GTK), manda a janela pra special:minimized.            evento: minimized>>END,1
+
+2) Ativação ("me mostra!"): quando você abre um app que JÁ está aberto (pelo Super Menu, pelo
+   ícone da bandeja, por um link...), o app pede pra sua janela ser ativada. Por padrão o Hyprland
+   ignora esse pedido (evita apps roubando o foco) e só marca a janela como "urgente". Aqui a gente
+   atende: se ela estiver minimizada, volta pra área de trabalho atual; e vem pra frente com foco.
+                                                                         evento: urgent>>END
+
+3) "Sempre visível": depois de um "hyprctl reload", cola de novo as etiquetas que o reload apagou.
+                                                                         evento: configreloaded>>
+
+O Hyprland publica eventos num "socket" (um arquivo especial de comunicação):
+  $XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock
+Cada evento é uma linha:  nome>>dados
+"""
+import json
+import os
+import socket
+import subprocess
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def janela(endereco):
+    for c in json.loads(hyprctl("clients", "-j") or "[]"):
+        if c["address"] == endereco:
+            return c
+    return None
+
+
+ESTADO = os.path.expanduser("~/.cache/aero-shell/minimizadas.json")
+
+
+def devolver_estado(endereco):
+    """A janela saiu de special:minimized: devolve como era (tiled volta pro tile; flutuante volta pro lugar
+    e tamanho). O hypr-minimizar encolheu ela no ícone do Dock, então ela CRESCE de volta a partir dali."""
+    try:
+        estado = json.load(open(ESTADO))
+    except (OSError, ValueError):
+        return
+    antes = estado.pop(endereco, None)
+    if antes is None:
+        return
+    json.dump(estado, open(ESTADO, "w"))
+    if janela(endereco) is None:
+        return
+    # A janela volta SEMPRE solta (flutuante), no tamanho e lugar de antes. Antes, se ela estava em
+    # mosaico (tiled), voltava pro mosaico, e o Aero não quer mosaico forçado: ele prendia o Firefox
+    # em mosaico e nada aparecia por cima dele (doc 31). Mosaico só se ele pedir (Super+V).
+    (x, y), (w, h) = antes["at"], antes["size"]
+    hyprctl("--batch", f"dispatch resizewindowpixel exact {w} {h},address:{endereco} ; "
+                       f"dispatch movewindowpixel exact {x} {y},address:{endereco}")
+
+
+def trazer(endereco):
+    """Traz a janela pra frente; se estiver minimizada, primeiro devolve pra área de trabalho atual."""
+    c = janela(endereco)
+    if c is None:
+        return
+    # Algo em TELA CHEIA na frente (jogo, vídeo)? Não rouba o foco: o Hyprland tiraria o jogo da tela
+    # cheia, e o jogo ficava cortado (doc 32). O app continua marcado como "pedindo atenção".
+    ativa = json.loads(hyprctl("activewindow", "-j") or "{}")
+    if ativa.get("fullscreen") and ativa.get("address") != endereco:
+        return
+    if c["workspace"]["name"] == "special:minimized":
+        atual = json.loads(hyprctl("activeworkspace", "-j"))["id"]
+        hyprctl("dispatch", "movetoworkspacesilent", f"{atual},address:{endereco}")
+    hyprctl("dispatch", "focuswindow", f"address:{endereco}")
+
+
+def restaurar_focada():
+    """Alt+Tab (ou qualquer foco) numa janela minimizada abre a special:minimized por cima;
+    em vez de deixar assim, fecha ela e devolve a janela pra área de trabalho atual."""
+    ativa = json.loads(hyprctl("activewindow", "-j") or "{}")
+    if not ativa or ativa.get("workspace", {}).get("name") != "special:minimized":
+        return
+    hyprctl("dispatch", "togglespecialworkspace", "minimized")
+    mon = next((m for m in json.loads(hyprctl("monitors", "-j") or "[]") if m.get("focused")), None)
+    if mon is None:
+        return
+    hyprctl("dispatch", "movetoworkspacesilent", f"{mon['activeWorkspace']['id']},address:{ativa['address']}")
+    hyprctl("dispatch", "focuswindow", f"address:{ativa['address']}")
+
+
+def remarcar_sempre_visiveis():
+    """Todo "hyprctl reload" apaga as etiquetas das janelas. O hypr-sempre-visivel anota quais
+    janelas estavam marcadas; aqui a gente cola a etiqueta de novo.        evento: configreloaded>>"""
+    try:
+        with open(os.path.join(os.environ["XDG_RUNTIME_DIR"], "sempre-visivel")) as f:
+            marcadas = set(f.read().split())
+    except OSError:
+        return
+    for c in json.loads(hyprctl("clients", "-j") or "[]"):
+        if c["address"] in marcadas and "sempre-visivel" not in c["tags"]:
+            hyprctl("dispatch", "tagwindow", f"sempre-visivel address:{c['address']}")
+
+
+caminho = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr",
+                       os.environ["HYPRLAND_INSTANCE_SIGNATURE"], ".socket2.sock")
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(caminho)
+for linha in s.makefile("r", encoding="utf-8", errors="replace"):
+    evento, _, dados = linha.strip().partition(">>")
+    if evento == "minimized":
+        endereco, _, minimizar = dados.partition(",")
+        if minimizar == "1":
+            # Popen (não espera): a animação leva ~0,4 s e o ouvinte não pode parar de ler eventos
+            subprocess.Popen([os.path.expanduser("~/.local/bin/hypr-minimizar"), "0x" + endereco.removeprefix("0x")])
+    elif evento == "movewindowv2":
+        # movewindowv2>>ENDEREÇO,ID_DA_ÁREA,NOME_DA_ÁREA  (saiu de special:minimized = foi restaurada)
+        partes = dados.split(",", 2)
+        if len(partes) == 3 and not partes[2].startswith("special:"):
+            devolver_estado("0x" + partes[0].removeprefix("0x"))
+    elif evento == "urgent":
+        trazer("0x" + dados.removeprefix("0x"))
+    elif evento == "activespecial" and dados.startswith("special:minimized,"):
+        restaurar_focada()
+    elif evento == "configreloaded":
+        remarcar_sempre_visiveis()

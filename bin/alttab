@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Alt+Tab estilo Windows. Código: ~/.local/share/aero-shell/alttab.py (doc 20)
+# Uso: alttab --daemon               inicia o programa em segundo plano (o Hyprland faz isso ao ligar)
+#      alttab next|prev|confirm|cancel   comandos que os atalhos do hyprland.conf mandam
+sock="$XDG_RUNTIME_DIR/aero-alttab.sock"
+if [ "$1" = --daemon ]; then
+    mkdir -p "$HOME/.cache/aero-shell"
+    # o registro (o que chegou, erros) fica em ~/.cache/aero-shell/alttab.log
+    LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 "$HOME/.local/share/aero-shell/alttab.py" \
+        > "$HOME/.cache/aero-shell/alttab.log" 2>&1
+fi
+# UNIX-SENDTO = manda UMA mensagem pro socket e sai (rápido: não espera resposta)
+echo "$1" | socat - "UNIX-SENDTO:$sock" 2>/dev/null || {
+    # o programa não estava rodando: inicia (o próximo Alt+Tab já funciona)
+    hyprctl dispatch exec "$HOME/.local/bin/alttab --daemon" >/dev/null
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Password window for sudo: SUDO_ASKPASS=~/.local/bin/aero-askpass sudo -A ...
+# (SUDO_ASKPASS must be a program without arguments, hence this tiny wrapper)
+exec python3 "$HOME/.local/share/aero-settings/askpass.py" "$@"

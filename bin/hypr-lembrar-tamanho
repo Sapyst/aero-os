@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+Lembra o tamanho das janelas de alguns apps e reabre com ele (ex: Thunar).
+
+Por que precisa: o Hyprland avisa TODA janela nova que ela está "tiled + maximizada" (pra apps GTK não
+desenharem sombra), mesmo quando ela é flutuante. O Thunar acredita, acha que está sempre maximizado e
+nunca grava o tamanho da janela. Então este script faz isso no lugar dele:
+  - 1x por segundo confere o tamanho das janelas desses apps e guarda o último (conversa direta pelo
+    socket do Hyprland, sem abrir programa: custa quase nada);
+  - quando uma janela desse app abre, aplica o tamanho guardado e centraliza.
+Tamanhos: ~/.cache/aero-shell/tamanhos.json  ({classe: [largura, altura]})
+Pra incluir outro app, ponha a classe dele (hyprctl clients) em APPS.
+"""
+import json
+import os
+import socket
+import threading
+import time
+
+APPS = {"thunar"}
+ARQ = os.path.expanduser("~/.cache/aero-shell/tamanhos.json")
+MINIMIZADAS = os.path.expanduser("~/.cache/aero-shell/minimizadas.json")   # do hypr-minimizar (animação)
+HYPR = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr", os.environ["HYPRLAND_INSTANCE_SIGNATURE"])
+MINIMO = 300        # tamanhos menores que isso não são guardados (ex: janela encolhendo pra minimizar)
+
+
+def hypr(comando):
+    """Fala direto com o socket de comandos do Hyprland (o mesmo do hyprctl)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(os.path.join(HYPR, ".socket.sock"))
+            s.sendall(comando.encode())
+            partes = []
+            while (bloco := s.recv(65536)):
+                partes.append(bloco)
+        return b"".join(partes).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def ler(caminho):
+    try:
+        return json.load(open(caminho))
+    except (OSError, ValueError):
+        return {}
+
+
+tamanhos = ler(ARQ)
+ultimo = {}          # endereço da janela -> último tamanho visto (pra perceber quando você redimensiona)
+trava = threading.Lock()
+
+
+def vigiar():
+    """1x por segundo: guarda o tamanho atual das janelas dos apps da lista."""
+    while True:
+        time.sleep(1)
+        try:
+            clientes = json.loads(hypr("j/clients") or "[]")
+        except ValueError:
+            continue
+        minimizando = ler(MINIMIZADAS)
+        mudou = False
+        vistas = set()
+        for c in clientes:
+            classe = (c.get("class") or "").lower()
+            if classe not in APPS or not c.get("floating") or c.get("fullscreen"):
+                continue
+            if c["workspace"]["name"].startswith("special:") or c["address"] in minimizando:
+                continue
+            w, h = c["size"]
+            vistas.add(c["address"])
+            antes = ultimo.get(c["address"])
+            ultimo[c["address"]] = [w, h]
+            # só guarda quando ESTA janela mudou de tamanho (você redimensionou). Assim, com duas janelas do
+            # mesmo app de tamanhos diferentes, o guardado não fica pulando de uma pra outra.
+            if antes is None or antes == [w, h] or w < MINIMO or h < MINIMO:
+                continue
+            with trava:
+                tamanhos[classe] = [w, h]
+                mudou = True
+        for endereco in list(ultimo):
+            if endereco not in vistas:
+                del ultimo[endereco]         # janela fechou
+        if mudou:
+            os.makedirs(os.path.dirname(ARQ), exist_ok=True)
+            with trava:
+                json.dump(tamanhos, open(ARQ, "w"))
+
+
+def aplicar(endereco, classe):
+    """Janela nova de um app da lista: tamanho guardado + centralizada no monitor dela."""
+    with trava:
+        tam = tamanhos.get(classe)
+    if not tam:
+        return
+    time.sleep(0.15)
+    c = next((x for x in json.loads(hypr("j/clients") or "[]") if x["address"] == endereco), None)
+    if c is None or not c.get("floating"):
+        return
+    m = next((m for m in json.loads(hypr("j/monitors") or "[]") if m["id"] == c["monitor"]), None)
+    w, h = tam
+    if m:
+        esc = m.get("scale", 1) or 1
+        res = m.get("reserved", [0, 0, 0, 0])        # esquerda, cima, direita, baixo (barra de cima etc.)
+        larg, alt = m["width"] / esc - res[0] - res[2], m["height"] / esc - res[1] - res[3]
+        w, h = min(w, int(larg)), min(h, int(alt))
+        x, y = int(m["x"] + res[0] + (larg - w) / 2), int(m["y"] + res[1] + (alt - h) / 2)
+        hypr(f"[[BATCH]]dispatch resizewindowpixel exact {w} {h},address:{endereco};"
+             f"dispatch movewindowpixel exact {x} {y},address:{endereco}")
+    else:
+        hypr(f"dispatch resizewindowpixel exact {w} {h},address:{endereco}")
+
+
+threading.Thread(target=vigiar, daemon=True).start()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.path.join(HYPR, ".socket2.sock"))
+for linha in s.makefile("r", encoding="utf-8", errors="replace"):
+    evento, _, dados = linha.strip().partition(">>")
+    if evento == "openwindow":
+        partes = dados.split(",", 3)
+        if len(partes) >= 3 and partes[2].lower() in APPS:
+            threading.Thread(target=aplicar, args=("0x" + partes[0].removeprefix("0x"), partes[2].lower()),
+                             daemon=True).start()

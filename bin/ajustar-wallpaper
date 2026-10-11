@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+ajustar-wallpaper — brilho, contraste e saturação do papel de parede (doc 45).
+
+O arquivo ORIGINAL nunca é mexido: o ffmpeg gera uma CÓPIA ajustada e é ela que vai pra tela.
+Os ajustes ficam no painel.conf e valem pra todo wallpaper novo (o papel-de-parede chama este programa).
+
+painel.conf:
+  WALL_ORIGINAL="/caminho/da/imagem/original"
+  WALL_BRILHO=0       (-0.5 a 0.5;  0 = normal)
+  WALL_CONTRASTE=1    (0.5 a 1.5;   1 = normal)
+  WALL_SATURACAO=1    (0 a 2;       1 = normal; 0 = preto e branco)
+
+Uso: ajustar-wallpaper              aplica os ajustes do painel.conf no wallpaper atual
+     ajustar-wallpaper --previa SAIDA.jpg [B C S]   só gera uma prévia pequena (pro Settings), sem trocar nada
+"""
+import hashlib
+import os
+import re
+import subprocess
+import sys
+
+PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
+CONF = os.path.expanduser("~/.config/hypr/hyprpaper.conf")
+PASTA = os.path.expanduser("~/.local/share/wallpapers-ajustados")
+
+
+def ler_painel():
+    v = {}
+    try:
+        for linha in open(PAINEL):
+            if "=" in linha and not linha.startswith("#"):
+                k, x = linha.strip().split("=", 1)
+                v[k] = x.strip('"')
+    except OSError:
+        pass
+    return v
+
+
+def gravar_painel(**kv):
+    try:
+        linhas = open(PAINEL).read().splitlines()
+    except OSError:
+        linhas = []
+    falta = {k: str(v).replace("\n", "").replace("\r", "") for k, v in kv.items()}   # 1 chave = 1 linha
+    for i, l in enumerate(linhas):
+        k = l.split("=", 1)[0].strip()
+        if k in falta:
+            linhas[i] = f'{k}="{falta.pop(k)}"'
+    linhas += [f'{k}="{v}"' for k, v in falta.items()]
+    open(PAINEL, "w").write("\n".join(linhas) + "\n")
+
+
+def caminho_na_tela():
+    m = re.search(r"^\s*path\s*=\s*(.+)$", open(CONF).read(), re.M)
+    return os.path.expanduser(m.group(1).strip()) if m else None
+
+
+def numeros(p):
+    def num(chave, padrao):
+        try:
+            return float(p.get(chave, padrao))
+        except ValueError:
+            return float(padrao)
+    return num("WALL_BRILHO", 0), num("WALL_CONTRASTE", 1), num("WALL_SATURACAO", 1)
+
+
+# IMPORTANTE (doc 45): ffmpeg SEMPRE com -nostdin e stdin=DEVNULL. Sem isso, ele tenta configurar o
+# terminal (pra aceitar "q"); um programa de segundo plano que mexe no terminal recebe do Linux a ordem
+# de PAUSAR (SIGTTOU) — e a pausa pegava o Settings inteiro ("Not Responding").
+def filtro(b, c, s):
+    """Tudo em RGB (doc 45). O "eq" do ffmpeg trabalha em YUV (formato de vídeo): na ida e volta os
+    arredondamentos puxavam o cinza pro VERDE (cinza 18,18,18 virava 18,21,18).
+    - saturação: cada canal = mistura com a luminância (pesos do sRGB); s=0 -> R=G=B exatos
+    - brilho/contraste: a MESMA curva nos 3 canais: (valor-128)*contraste + 128 + brilho*255"""
+    k = 1 - s
+    lr, lg, lb = 0.2126 * k, 0.7152 * k, 0.0722 * k
+    mix = (f"colorchannelmixer=rr={lr + s:.4f}:rg={lg:.4f}:rb={lb:.4f}:"
+           f"gr={lr:.4f}:gg={lg + s:.4f}:gb={lb:.4f}:"
+           f"br={lr:.4f}:bg={lg:.4f}:bb={lb + s:.4f}")
+    curva = f"clip((val-128)*{c:.3f}+128+{b * 255:.1f}\\,0\\,255)"
+    return f"format=rgb24,{mix},lutrgb=r='{curva}':g='{curva}':b='{curva}',format=rgb24"
+
+
+def por_na_tela(caminho):
+    """Troca o wallpaper (hyprpaper ao vivo + hyprpaper.conf) sem passar pelo papel-de-parede."""
+    texto = open(CONF).read()
+    texto = re.sub(r"^(\s*path\s*=\s*).*$", lambda m: m.group(1) + caminho, texto, flags=re.M)
+    open(CONF + ".tmp", "w").write(texto)
+    os.replace(CONF + ".tmp", CONF)
+    subprocess.run(["hyprctl", "hyprpaper", "wallpaper", f",{caminho},cover"], capture_output=True)
+    subprocess.run([os.path.expanduser("~/.local/bin/sincronizar-fundos")], capture_output=True)
+
+
+def main():
+    p = ler_painel()
+    original = p.get("WALL_ORIGINAL", "")
+    atual = caminho_na_tela()
+    # o original é o que está na tela, a não ser que a tela já mostre uma cópia ajustada nossa
+    if not original or not os.path.exists(original) or (atual and not atual.startswith(PASTA)):
+        original = atual
+        gravar_painel(WALL_ORIGINAL=original)
+    b, c, s = numeros(p)
+
+    if len(sys.argv) > 2 and sys.argv[1] == "--previa":
+        if len(sys.argv) == 6:                         # valores passados direto (prévia ao vivo do Settings)
+            b, c, s = (float(x) for x in sys.argv[3:6])
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", original, "-vf", f"scale=640:-2,{filtro(b, c, s)}",
+                        "-frames:v", "1", "-y", sys.argv[2]], check=True, stdin=subprocess.DEVNULL)
+        return
+
+    if (b, c, s) == (0, 1, 1):                         # sem ajuste: o original mesmo
+        if atual != original:
+            por_na_tela(original)
+        return
+    os.makedirs(PASTA, exist_ok=True)
+    nome = hashlib.sha1(f"rgb2|{original}|{os.path.getmtime(original)}|{b}|{c}|{s}".encode()).hexdigest()[:16]
+    saida = os.path.join(PASTA, nome + ".png")
+    if not os.path.exists(saida):
+        for velho in os.listdir(PASTA):                # só guarda a cópia em uso
+            os.remove(os.path.join(PASTA, velho))
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", original, "-vf", filtro(b, c, s),
+                        "-frames:v", "1", "-y", saida], check=True, stdin=subprocess.DEVNULL)
+    por_na_tela(saida)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+hypr-encaixar — Super+← / Super+→ como no Windows (doc 25).
+
+- Janela FLUTUANTE: vai pra metade esquerda/direita da tela (respeitando a barra de cima, os gaps e a
+  barra de título). Apertar pro lado oposto devolve o tamanho e o lugar de antes.
+- Janela EM MOSAICO (tiling): troca de lugar com a vizinha daquele lado (movewindow).
+
+O tamanho de antes fica guardado em $XDG_RUNTIME_DIR/encaixe.json (por endereço da janela).
+"""
+import json
+import os
+import subprocess
+import sys
+
+BARRA_TITULO = 0        # sem barra do plugin: cada app desenha a sua DENTRO da janela (doc 28)
+GUARDADO = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "encaixe.json")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def opcao(nome):
+    """Lê um número do Hyprland. Os gaps vêm como texto "12 12 12 12" (cima, direita, baixo, esquerda)."""
+    valor = json.loads(hyprctl("getoption", nome, "-j"))
+    if "custom" in valor:
+        return int(valor["custom"].split()[0])
+    return int(valor.get("int", 0))
+
+
+lado = sys.argv[1] if len(sys.argv) > 1 else "left"
+janela = json.loads(hyprctl("activewindow", "-j") or "{}")
+if not janela.get("address"):
+    sys.exit(0)
+if not janela["floating"]:
+    hyprctl("dispatch", "movewindow", "l" if lado == "left" else "r")
+    sys.exit(0)
+
+try:
+    guardado = json.load(open(GUARDADO))
+except (OSError, ValueError):
+    guardado = {}
+endereco = janela["address"]
+anterior = guardado.get(endereco)
+
+# Já estava encaixada do OUTRO lado? Então volta ao tamanho/lugar de antes (igual o Windows)
+if anterior and anterior["lado"] != lado:
+    (x, y), (w, h) = anterior["at"], anterior["size"]
+    hyprctl("--batch", f"dispatch resizeactive exact {w} {h} ; dispatch moveactive exact {x} {y}")
+    del guardado[endereco]
+else:
+    monitor = next(m for m in json.loads(hyprctl("monitors", "-j")) if m["id"] == janela["monitor"])
+    esq, cima, dir_, baixo = monitor["reserved"]             # espaço da barra de cima etc.
+    fora = opcao("general:gaps_out")
+    dentro = opcao("general:gaps_in")
+    escala = monitor["scale"]
+    largura_tela, altura_tela = monitor["width"] / escala, monitor["height"] / escala
+    area_x, area_y = monitor["x"] + esq + fora, monitor["y"] + cima + fora
+    area_w = largura_tela - esq - dir_ - 2 * fora
+    area_h = altura_tela - cima - baixo - 2 * fora
+    w = int((area_w - dentro) / 2)
+    h = int(area_h - BARRA_TITULO)                           # a barra de título fica acima da janela
+    x = int(area_x if lado == "left" else area_x + w + dentro)
+    y = int(area_y + BARRA_TITULO)
+    if not anterior:
+        guardado[endereco] = {"lado": lado, "at": janela["at"], "size": janela["size"]}
+    else:
+        guardado[endereco]["lado"] = lado
+    hyprctl("--batch", f"dispatch resizeactive exact {w} {h} ; dispatch moveactive exact {x} {y}")
+
+with open(GUARDADO, "w") as f:
+    json.dump(guardado, f)

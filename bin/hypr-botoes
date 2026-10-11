@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""
+hypr-botoes — os botões "–" (minimizar) e "□" (maximizar/restaurar) DOS PRÓPRIOS APPS funcionando (doc 33).
+
+O Hyprland 0.56 recebe o pedido desses botões e joga fora (está no código dele: o "set_minimized" de
+um app Wayland não é usado por ninguém). Então a gente vigia o CLIQUE:
+  - o Hyprland tem um atalho "bindn" de clique esquerdo (não engole o clique: o app recebe normal);
+  - o atalho manda uma palavra pra este programa (rápido, por um socket);
+  - aqui a gente vê a janela embaixo do mouse e onde, dentro dela, foi o clique;
+  - se caiu em cima do "–" ou do "□" daquele app → nosso hypr-minimizar / hypr-maximizar.
+    (O hypr-maximizar alterna: maximiza, ou devolve o tamanho de antes se já estava maximizada.)
+
+Também é ele quem faz o "clicou fora = fecha" das janelinhas (central, som, notificações, Super Menu):
+um vigia só pra tudo.
+
+Uso: hypr-botoes --daemon        (o Hyprland inicia no login)
+     hypr-botoes clique          (o atalho de clique chama; não precisa rodar à mão)
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+SOCK = os.path.join(RUN, "hypr-botoes.sock")
+BIN = os.path.expanduser("~/.local/bin")
+
+# Onde ficam os botões em cada app, medido num print (doc 33):
+#   (distância do centro do botão até a BORDA DIREITA da janela, distância até o TOPO, raio de acerto)
+# Apps que não estão aqui usam o "padrão" (apps GTK com os botões minimizar/maximizar/fechar à direita).
+BOTOES = {
+    "firefox":              {"minimizar": (96, 21, 15), "maximizar": (60, 21, 15)},
+    "com.anthropic.Claude": {"minimizar": (96, 18, 15), "maximizar": (60, 18, 15)},
+    "discord":              {"minimizar": (89, 16, 14), "maximizar": (52, 16, 14)},
+    "padrao":               {"minimizar": (96, 21, 15), "maximizar": (60, 21, 15)},
+}
+# Nunca: nossos apps (as bolinhas deles já chamam os scripts), jogos e a Steam (X11, desenha diferente)
+IGNORAR = ("com.aero.", "steam", "gamescope", "kitty", "thunar", "Thunar", "ez-fm")   # kitty e Thunar: usam a NOSSA barra (hyprbars), que já tem os botões
+JANELINHAS = ("central-rapida", "som", "central-notificacoes", "menu-janela")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def ao_clicar():
+    x, y = (int(v) for v in hyprctl("cursorpos").split(","))
+    camadas = [l for m in json.loads(hyprctl("layers", "-j") or "{}").values()
+               for nivel in m["levels"].values() for l in nivel]
+    abertas = {l["namespace"] for l in camadas}
+
+    # 1) "clicou fora = fecha": avisa quem estiver aberto (cada um confere se o clique foi fora dele)
+    if abertas & set(JANELINHAS):
+        subprocess.Popen([f"{BIN}/som", "clique", "fora"])
+    if "supermenu" in abertas:
+        subprocess.Popen([f"{BIN}/supermenu", "--clique-fora"])
+
+    # clique em cima de uma camada (barra, Dock, janelinha): não é botão de janela
+    for l in camadas:
+        altura = l["h"]
+        if l["namespace"] == "central-rapida":    # a central tem altura fixa; o resto dela é vazio (não pega clique)
+            try:
+                altura = int(open(os.path.join(RUN, "central-altura")).read())
+            except (OSError, ValueError):
+                pass
+        if l["namespace"] not in ("hyprpaper",) and l["x"] <= x < l["x"] + l["w"] and l["y"] <= y < l["y"] + altura:
+            return
+
+    # 2) a janela embaixo do mouse (a de cima, se houver várias: a usada mais recentemente)
+    visiveis = {m["activeWorkspace"]["id"] for m in json.loads(hyprctl("monitors", "-j") or "[]")}
+    candidatas = [c for c in json.loads(hyprctl("clients", "-j") or "[]")
+                  if c["workspace"]["id"] in visiveis and not c["hidden"] and not c["fullscreen"]
+                  and c["at"][0] <= x < c["at"][0] + c["size"][0] and c["at"][1] <= y < c["at"][1] + c["size"][1]]
+    if not candidatas:
+        return
+    c = min(candidatas, key=lambda c: c["focusHistoryID"])
+    if c["class"].startswith(IGNORAR):
+        return
+    da_direita = c["at"][0] + c["size"][0] - x
+    do_topo = y - c["at"][1]
+    for acao, (dx, dy, raio) in BOTOES.get(c["class"], BOTOES["padrao"]).items():
+        if (da_direita - dx) ** 2 + (do_topo - dy) ** 2 <= raio * raio:
+            subprocess.Popen([f"{BIN}/hypr-{'minimizar' if acao == 'minimizar' else 'maximizar'}", c["address"]])
+            return
+
+
+def daemon():
+    # Uma cópia por sessão: se o socket responde, já tem um rodando
+    if os.path.exists(SOCK):
+        teste = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            teste.sendto(b"ping", SOCK)
+            return
+        except OSError:
+            os.unlink(SOCK)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.bind(SOCK)
+    sessao = os.path.join(RUN, "hypr", os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""))
+    s.settimeout(30)
+    while True:
+        try:
+            msg = s.recv(64).decode().strip()     # strip: o "echo" manda uma quebra de linha no fim
+        except socket.timeout:
+            if not os.path.exists(os.path.join(sessao, "hyprland.lock")):
+                return                     # o Hyprland desta sessão acabou: não vira fantasma
+            continue
+        if msg == "clique":
+            try:
+                ao_clicar()
+            except Exception as erro:      # um clique estranho nunca derruba o vigia
+                print("hypr-botoes:", erro, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        daemon()
+    else:
+        socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM).sendto(b"clique", SOCK)

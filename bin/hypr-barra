@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""
+hypr-barra — ações dos botões da barra de título (hyprbars), na janela CERTA.
+
+O problema: o plugin só roda um comando quando você clica num botão; ele não diz DE QUAL janela era
+o botão. Comandos como "killactive" e "fullscreen" agem na janela ATIVA (a que tem o foco). Então
+clicar na bolinha de uma janela sem foco agia na OUTRA janela (a ativa)!
+
+A solução: ver onde o mouse está (hyprctl cursorpos) e achar a janela cuja barra fica ali.
+
+Uso: hypr-barra fechar | minimizar | maximizar | visivel
+"""
+import json
+import os
+import subprocess
+import sys
+
+BARRA = 32          # altura da barra (bar_height no hyprbars.conf)
+BIN = os.path.expanduser("~/.local/bin")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def janela_sob_o_mouse():
+    x, y = (int(v) for v in hyprctl("cursorpos").split(","))
+    visiveis = {m["activeWorkspace"]["id"] for m in json.loads(hyprctl("monitors", "-j"))}
+    candidatas = []
+    for c in json.loads(hyprctl("clients", "-j")):
+        if c["workspace"]["id"] not in visiveis or c["hidden"]:
+            continue
+        (cx, cy), (w, h) = c["at"], c["size"]
+        # a barra fica logo ACIMA da área da janela: de cy-BARRA até cy
+        if cx <= x <= cx + w and cy - BARRA - 4 <= y <= cy + h:
+            candidatas.append(c)
+    # janelas sobrepostas (flutuantes): a usada mais recentemente está por cima
+    candidatas.sort(key=lambda c: c["focusHistoryID"])
+    return candidatas[0]["address"] if candidatas else None
+
+
+acao = sys.argv[1] if len(sys.argv) > 1 else ""
+alvo = janela_sob_o_mouse()
+if alvo is None:
+    sys.exit(0)
+
+if acao == "fechar":
+    hyprctl("dispatch", "closewindow", f"address:{alvo}")
+elif acao == "minimizar":
+    subprocess.Popen([f"{BIN}/hypr-minimizar", alvo])
+elif acao == "maximizar":
+    subprocess.run([f"{BIN}/hypr-maximizar", alvo])   # maximiza flutuando (fullscreen 1 ficava atrás das flutuantes)
+elif acao == "visivel":
+    subprocess.run([f"{BIN}/hypr-sempre-visivel", alvo])

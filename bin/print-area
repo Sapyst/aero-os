@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# print-area — print de uma área escolhida com o mouse (igual Win+Shift+S).
+# Arraste um retângulo; ao soltar, o print vai pra área de transferência
+# e é salvo em ~/Pictures/Prints. Esc cancela.
+#
+# Uso: print-area            (escolhe a área com o mouse)        Print e Super+Shift+S
+#      print-area tela       (a tela inteira)                     Shift+Print
+#      print-area janela     (só a janela ativa, mesmo coberta)   Alt+Print
+#      print-area "X,Y LxA"  (área já definida, ex: "100,100 400x300")
+
+# Pasta de imagens do usuário (xdg-user-dir respeita o nome configurado, ex: "Imagens")
+pasta="$(xdg-user-dir PICTURES 2>/dev/null || echo "$HOME/Pictures")/Prints"
+mkdir -p "$pasta"
+
+arquivo="$pasta/screenshot-$(date +%Y-%m-%d_%H-%M-%S).png"   # hora do APERTO, não da seleção
+
+modo=area
+if [ "$1" = tela ]; then
+    modo=tela
+elif [ "$1" = janela ]; then
+    modo=janela
+elif [ -n "$1" ]; then
+    area="$1"
+else
+    # CONGELA A TELA no instante do Print: o hyprpicker tira um retrato da tela e mostra ele parado
+    # por cima de tudo (vídeos, jogos e animações param na imagem). Você seleciona em cima do retrato.
+    #   -r = congela também os outros monitores | -z = sem a lupa de cor (ele é um conta-gotas)
+    hyprpicker -r -z >/dev/null 2>&1 &
+    congela=$!
+    trap 'kill $congela 2>/dev/null' EXIT    # descongela ao sair, dando certo ou não (até com Esc)
+    sleep 0.15                               # tempo do retrato aparecer na tela
+
+    # slurp: desenha a seleção e devolve "X,Y LARGURAxALTURA"
+    #   -d = mostra o tamanho enquanto arrasta
+    #   -b = cor do fundo escurecido | -c = cor da borda | -w = espessura da borda
+    # cor da borda = a cor de destaque do sistema (Settings → Appearance → Accent color)
+    # (no destaque "mono", a cor do tema: branco no escuro, preto no claro; o hypr-tema grava a cor em uso)
+    destaque=$(cat "$HOME/.cache/hypr-tema/destaque" 2>/dev/null); destaque=${destaque:-3584e4}
+    area=$(slurp -d -b 00000066 -c "${destaque}ff" -w 2) || exit 0   # Esc: slurp sai com erro, então cancela
+fi
+
+# grim tira o print. Na seleção, a tela ainda está congelada: ele captura o RETRATO do momento do Print.
+case $modo in
+    tela)   grim "$arquivo" ;;                                   # sem -g = a tela toda
+    janela) id=$(hyprctl activewindow -j | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("stableId",""))')
+            grim -T "$id" "$arquivo" ;;                          # -T = só aquela janela (doc 20)
+    *)      grim -g "$area" "$arquivo" ;;
+esac || { notify-send "Screenshot failed" "Could not capture the screen"; exit 1; }
+
+# Emagrece o PNG sem perder a leitura de texto pequeno:
+#   pngquant: reduz pra 256 cores bem escolhidas (visualmente igual em UI/texto); --quality 85-98 faz ele
+#             DESISTIR (e manter o original) se não conseguir ficar com qualidade alta, ex: fotos
+#   oxipng:   recompressão sem perda por cima. Se qualquer um falhar, o print original continua intacto.
+tmp="$arquivo.tmp.png"
+if pngquant --quality 85-98 --speed 1 --force --output "$tmp" "$arquivo" 2>/dev/null; then
+    mv -f "$tmp" "$arquivo"
+fi
+rm -f "$tmp"
+oxipng -o 4 --strip safe -q "$arquivo" 2>/dev/null
+
+# wl-copy coloca a imagem na área de transferência (Ctrl+V cola em qualquer lugar)
+wl-copy --type image/png < "$arquivo"
+
+# Notificação com a miniatura do print e um botão "Show in folder" (-A = ação; o notify-send espera a
+# resposta, por isso roda em segundo plano com "&": o print não fica preso esperando você clicar)
+(
+    resposta=$(notify-send -i "$arquivo" -A pasta="Show in folder" \
+        "Screenshot copied" "Saved to Prints/$(basename "$arquivo")")
+    [ "$resposta" = pasta ] && thunar "$arquivo"
+) &

@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""
+sincronizar-fundos — leva o wallpaper do desktop pros outros lugares que estão em "Same as desktop" (doc 37).
+
+Lugares: tela de login (lock screen) e Super Menu. O Super Menu lê o wallpaper do desktop sozinho
+quando abre; a tela de login roda como outro usuário e NÃO lê a sua pasta, então precisa de uma
+cópia em /etc/greetd/aero-login/visual/fundo (pasta sua, criada pelo instalar.sh do doc 34).
+
+O papel-de-parede chama este programa toda vez que troca o wallpaper; o Settings também,
+quando você liga "Same as desktop".
+"""
+import os
+import re
+import shutil
+
+PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
+VISUAL = "/etc/greetd/aero-login/visual"
+
+
+def ler_painel():
+    valores = {}
+    try:
+        for linha in open(PAINEL):
+            if "=" in linha and not linha.startswith("#"):
+                k, v = linha.strip().split("=", 1)
+                valores[k] = v.strip('"')
+    except OSError:
+        pass
+    return valores
+
+
+def wallpaper_desktop():
+    texto = open(os.path.expanduser("~/.config/hypr/hyprpaper.conf")).read()
+    m = re.search(r"^\s*path\s*=\s*(.+)$", texto, re.M)
+    return os.path.expanduser(m.group(1).strip()) if m else None
+
+
+p = ler_painel()
+origem = wallpaper_desktop()
+if origem and os.path.exists(origem) and p.get("FUNDO_LOGIN_SINC", "1") == "1" and os.access(VISUAL, os.W_OK):
+    destino = os.path.join(VISUAL, "fundo")
+    shutil.copyfile(origem, destino + ".novo")
+    os.replace(destino + ".novo", destino)        # troca de uma vez: a tela de login nunca lê pela metade

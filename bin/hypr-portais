@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# hypr-portais — deixa os "portais" do sistema prontos pra ESTA sessão do Hyprland (doc 38).
+#
+# Portal = o serviço que os apps usam pra pedir coisas ao sistema: compartilhar a tela (Discord,
+# OBS, Meet no Firefox), escolher arquivo, saber se o tema é escuro... No Hyprland, quem compartilha
+# a tela é o xdg-desktop-portal-hyprland.
+#
+# O problema: o portal fica rodando de uma sessão pra outra. Se o Hyprland trava e você entra de
+# novo, ele continua "preso" à sessão velha (outro WAYLAND_DISPLAY) e o compartilhamento de tela
+# simplesmente não acontece. Então, a cada início do Hyprland:
+#   1) passa as variáveis da sessão NOVA pro systemd/D-Bus (é de lá que os portais leem);
+#   2) para os portais velhos e liga de novo (o do Hyprland é chamado sozinho quando precisar).
+dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE DISPLAY GDK_WAYLAND_DISABLE
+systemctl --user stop xdg-desktop-portal-hyprland xdg-desktop-portal-gtk xdg-desktop-portal
+systemctl --user start xdg-desktop-portal

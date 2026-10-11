@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Abre o app Settings. O código fica em ~/.local/share/aero-settings (um arquivo por seção).
+exec python3 "$HOME/.local/share/aero-settings/main.py" "$@"

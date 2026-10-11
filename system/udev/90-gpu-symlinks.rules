@@ -1,0 +1,2 @@
+KERNEL=="card*", KERNELS=="0000:66:00.0", SUBSYSTEM=="drm", SUBSYSTEMS=="pci", SYMLINK+="dri/amd-igpu"
+KERNEL=="card*", KERNELS=="0000:64:00.0", SUBSYSTEM=="drm", SUBSYSTEMS=="pci", SYMLINK+="dri/nvidia-dgpu"

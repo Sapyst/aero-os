@@ -1,0 +1,57 @@
+{
+  "versao": 1,
+  "editar": false,
+  "escala": "1",
+  "menos_movimento": false,
+  "vidro": "0.62",
+  "widgets": [
+    {
+      "id": "sistema-1",
+      "tipo": "sistema",
+      "x": 12,
+      "y": 54,
+      "ativo": true,
+      "opcoes": {}
+    },
+    {
+      "id": "recursos-1",
+      "tipo": "recursos",
+      "x": 12,
+      "y": 316,
+      "ativo": true,
+      "opcoes": {}
+    },
+    {
+      "id": "processos-1",
+      "tipo": "processos",
+      "x": 12,
+      "y": 692,
+      "ativo": true,
+      "opcoes": {}
+    },
+    {
+      "id": "relogio-1",
+      "tipo": "relogio",
+      "x": 2002,
+      "y": 54,
+      "ativo": true,
+      "opcoes": {}
+    },
+    {
+      "id": "batalha-1",
+      "tipo": "batalha",
+      "x": 2002,
+      "y": 198,
+      "ativo": true,
+      "opcoes": {}
+    },
+    {
+      "id": "clima-1",
+      "tipo": "clima",
+      "x": 2002,
+      "y": 502,
+      "ativo": true,
+      "opcoes": {}
+    }
+  ]
+}

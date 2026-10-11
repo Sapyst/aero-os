@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Controle de som da barra + avisos de volume/brilho (OSD). Código: ~/.local/share/aero-shell/som.py (doc 23)
+# Uso: som popup simples|completo    som osd volume|mic|brilho    som --daemon
+export LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so
+if [ "$1" != --daemon ] && [ $# -eq 2 ]; then
+    # Caminho rápido: pede pelo D-Bus pro programa que já está rodando (ação com um texto de parâmetro)
+    gdbus call --session --dest com.aero.Sound --object-path /com/aero/Sound \
+        --method org.gtk.Actions.Activate "$1" "[<'$2'>]" '{}' >/dev/null 2>&1 && exit 0
+fi
+exec python3 "$HOME/.local/share/aero-shell/som.py" "$@"

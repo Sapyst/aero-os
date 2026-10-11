@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Brilho da tela do notebook: brilho +5 | brilho -5   (porcentagem). Doc 23.
+# Sem instalar nada: o systemd-logind deixa o usuário da sessão mudar o brilho pelo D-Bus
+# (é o mesmo caminho que o brightnessctl usa por baixo). O monitor HDMI não muda por aqui.
+dispositivo=amdgpu_bl1
+pasta=/sys/class/backlight/$dispositivo
+atual=$(cat $pasta/brightness); maximo=$(cat $pasta/max_brightness)
+passo=$(( maximo * ${1#[+-]} / 100 ))
+case "$1" in -*) novo=$(( atual - passo )) ;; *) novo=$(( atual + passo )) ;; esac
+(( novo < maximo / 100 )) && novo=$(( maximo / 100 ))    # nunca apaga de vez (1%)
+(( novo > maximo )) && novo=$maximo
+busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto \
+    org.freedesktop.login1.Session SetBrightness ssu backlight $dispositivo $novo
+"$HOME/.local/bin/som" osd brilho

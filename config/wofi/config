@@ -1,0 +1,16 @@
+# Super Menu (wofi). Opções: man 5 wofi
+mode=drun
+# Um clique do mouse já abre o app (padrão seria clique duplo)
+single_click=true
+# Mostrar o ícone de cada app
+allow_images=true
+image_size=28
+# Busca sem ligar pra maiúsculas
+insensitive=true
+prompt=Search apps
+width=520
+height=480
+hide_scroll=true
+# Esconder sub-ações dos apps (ex: "Nova janela anônima"), deixa a lista limpa
+no_actions=true
+term=kitty

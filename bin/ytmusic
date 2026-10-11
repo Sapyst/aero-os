@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# YTMusic — app nativo do YouTube Music (GTK4), layout menu | lista | Now Playing.
+# Toca pelo motor (~/.local/share/ytmotor/motor.py: mpv + sua conta via login do Firefox).
+# O TerMusic (terminal) usa o mesmo motor: os dois mostram e controlam a mesma música.
+exec python3 "$HOME/.local/share/ytmotor/ytmusic_app.py" "$@"

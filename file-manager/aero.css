@@ -1,0 +1,157 @@
+/* ============================================================================
+   Tema do sistema do Aero por cima do EZ File Manager (doc 43).
+   Carregado DEPOIS do styles.css: só troca cores, fonte e alguns detalhes.
+   Minimalista e monocromático: sem azul; o "destaque" é a cor do próprio tema
+   (claro no escuro, escuro no claro), com halo de contraste nas linhas de foco.
+   Segue o claro/escuro do sistema sozinho (prefers-color-scheme).
+   ============================================================================ */
+
+:root {                                   /* ESCURO (padrão) */
+    --bg-primary: rgba(30, 30, 30, 0.62); /* frosted glass: translucent background + Hyprland blur behind */
+    --bg-secondary: rgba(255, 255, 255, 0.03);
+    --bg-tertiary: rgba(255, 255, 255, 0.06);
+    --menu-bg: rgba(30, 30, 30, 0.97);
+    --menu-overlay-bg: rgba(30, 30, 30, 0.98);
+    --bg-hover: rgba(255, 255, 255, 0.07);
+    --bg-active: rgba(255, 255, 255, 0.13);
+    --text-primary: #f0f0f0;
+    --text-secondary: rgba(240, 240, 240, 0.70);
+    --text-muted: rgba(240, 240, 240, 0.45);
+    --border-color: rgba(255, 255, 255, 0.08);
+    --accent-color: rgba(255, 255, 255, 0.16);
+    --accent-hover: rgba(255, 255, 255, 0.28);
+    --linha: #f0f0f0;                     /* linhas de foco: a cor do texto... */
+    --halo: rgba(0, 0, 0, 0.55);          /* ...com sombra do lado oposto */
+    --pasta: #f0f0f0;                     /* pastas em ALTO contraste */
+}
+@media (prefers-color-scheme: light) {
+    :root {                               /* CLARO */
+        --bg-primary: rgba(246, 246, 246, 0.72);
+        --bg-secondary: rgba(0, 0, 0, 0.025);
+        --bg-tertiary: rgba(0, 0, 0, 0.05);
+        --menu-bg: rgba(246, 246, 246, 0.98);
+        --menu-overlay-bg: rgba(246, 246, 246, 0.99);
+        --bg-hover: rgba(0, 0, 0, 0.06);
+        --bg-active: rgba(0, 0, 0, 0.11);
+        --text-primary: #1e1e1e;
+        --text-secondary: rgba(30, 30, 30, 0.72);
+        --text-muted: rgba(30, 30, 30, 0.48);
+        --border-color: rgba(0, 0, 0, 0.09);
+        --accent-color: rgba(0, 0, 0, 0.12);
+        --accent-hover: rgba(0, 0, 0, 0.22);
+        --linha: #1e1e1e;
+        --halo: rgba(255, 255, 255, 0.85);
+        --pasta: #1e1e1e;
+        --modal-backdrop: rgba(0, 0, 0, 0.25);
+        --bg-overlay: rgba(0, 0, 0, 0.25);
+    }
+}
+
+/* fonte do sistema */
+body, input, button, select, textarea { font-family: "Inter", sans-serif; }
+
+/* ícones: pastas em alto contraste, o resto neutro (sem as cores de cada tipo) */
+.file-item[data-is-directory="true"] .file-icon { color: var(--pasta) !important; }
+.file-item[data-is-directory="false"] .file-icon { color: var(--text-secondary) !important; }
+
+/* miniaturas (imagem, vídeo, capa de música): preenchem o bloco, cantos suaves */
+.file-icon img { object-fit: cover; border-radius: 10px; }
+
+/* item ativo da lateral: fundo neutro, texto na cor do tema (não branco fixo) */
+.sidebar-item.active { color: var(--text-primary); }
+
+/* seleção: fundo neutro + contorno fino da cor do texto */
+.file-item.selected { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--linha) 35%, transparent); }
+
+/* foco (busca, endereço, campos): linha na cor do texto + halo do lado oposto */
+input:focus, .search-input:focus, .search-input:focus-within {
+    border-color: var(--linha) !important;
+    box-shadow: 0 0 0 1px var(--linha), 0 0 0 3px var(--halo) !important;
+    outline: none !important;
+}
+
+/* barra de rolagem fininha e neutra */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--accent-color); border-radius: 99px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- barra de cima: botões da janela + abas; o espaço vazio ARRASTA a janela (doc 43) ---- */
+.barra-topo {
+    display: flex;
+    align-items: center;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+    min-height: 40px;
+    -webkit-app-region: drag;
+}
+.barra-topo .tab-bar { flex: 1; background: transparent; border-bottom: none; min-height: 40px; }
+.barra-topo .tab-bar:empty { display: flex; }          /* sem abas extras: continua ocupando (e arrastando) */
+.barra-topo .tab, .barra-topo button, .barra-topo [class*="tab-"] button { -webkit-app-region: no-drag; }
+.controles-janela { display: flex; gap: 2px; padding: 0 6px 0 12px; -webkit-app-region: no-drag; }
+.controles-janela button {
+    /* Same geometry as the Aero Symbols font (doc 49), drawn as SVG: a 9x9 px box centered in a 27 px
+       button = 9 px on every side, whole pixels (text glyphs landed on half pixels in Chromium) */
+    width: 27px; height: 27px; padding: 0; border: none; border-radius: 99px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--text-primary); cursor: pointer;
+}
+.controles-janela button svg { display: block; }
+.controles-janela button:hover { background: var(--bg-hover); }
+
+/* ============================================================================
+   "Terminal" look, inspired by superfile (doc 50) — fused with our frosted carbon glass:
+   monospace type, thin 1px outlined panels with titles running along the line, a huge faint
+   clock behind the file list and a segmented status bar.
+   ============================================================================ */
+:root { --painel-linha: color-mix(in srgb, var(--text-primary) 22%, transparent); }
+
+body, input, button, select, textarea { font-family: "JetBrainsMono Nerd Font", "Adwaita Mono", monospace; }
+body { font-size: 13px; }
+
+/* panels: sidebar, file list and preview become outlined boxes floating on the glass */
+.main-content { padding: 8px 10px 4px; gap: 10px; }
+.sidebar, .file-pane, .preview-panel {
+    background: transparent !important;
+    border: 1px solid var(--painel-linha) !important;
+    border-radius: 14px;
+    overflow: hidden;
+}
+.sidebar { border-right: 1px solid var(--painel-linha) !important; }
+.sidebar-resizer, .preview-resizer { width: 2px; background: transparent; }
+
+/* section titles along a line:  Quick access ────────── */
+.sidebar-title {
+    display: flex; align-items: center; gap: 8px;
+    text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 500;
+    color: var(--text-secondary); padding: 0 12px; margin: 10px 0 6px;
+}
+.sidebar-title::after { content: ""; flex: 1; height: 1px; background: var(--painel-linha); }
+
+/* preview header: ┤ Preview ├ sitting on the line */
+.preview-header { border-bottom: 1px solid var(--painel-linha); background: transparent; }
+.preview-title { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.preview-title::before { content: "┤ "; color: var(--painel-linha); }
+.preview-title::after { content: " ├"; color: var(--painel-linha); }
+
+/* file list: monospace header, quiet rows */
+.file-list-header { background: transparent; border-bottom: 1px solid var(--painel-linha);
+                    text-transform: none; letter-spacing: 0; font-weight: 500; }
+.file-item { border-radius: 8px; }
+
+
+/* status bar: segments separated by thin vertical lines */
+.status-bar { background: transparent; border-top: 1px solid var(--painel-linha); font-size: 12px; }
+.status-left > *, .status-right > * { padding: 0 10px; }
+.status-left > * + *, .status-right > * + * { border-left: 1px solid var(--painel-linha); }
+#aero-data, #aero-hora { color: var(--text-secondary); }
+
+/* toolbar fields (path, search) also outlined, same family */
+.path-bar, .search-input { border: 1px solid var(--painel-linha) !important;
+                                                     background: transparent !important; }
+#selected-count:empty { display: none; }
+
+/* [Aero/doc 43] Borda da pré-visualização: área de pegar de 10px (a linha visível continua fina) */
+.preview-resizer { width: 10px; margin-left: -4px; margin-right: -4px; z-index: 5; cursor: col-resize; touch-action: none; -webkit-app-region: no-drag; }
+.preview-resizer::before { right: 4px; }
+/* Imagem da pré-visualização ocupa a largura do painel (arraste a borda para aumentar) */
+.preview-image { width: 100%; max-width: 100%; height: auto; max-height: 72vh; object-fit: contain; }

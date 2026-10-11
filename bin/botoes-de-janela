@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# botoes-de-janela on|off|status — liga/desliga os botões minimizar/maximizar/fechar das janelas.
+# Desligado = "modo Hyprland puro": tudo pelo teclado (Super+↓ minimiza, Super+↑ maximiza, Super+C fecha).
+#
+# O que muda:
+#   - apps GTK3/GTK4/libadwaita (e o Firefox, que segue o GTK): gsettings button-layout. Vale NA HORA;
+#     o Firefox só depois de reabrir.
+#   - o nosso Settings: as bolinhas da barra lateral (lê BOTOES_JANELA do painel.conf).
+#   - Electron (Claude, Discord) e jogos desenham botões próprios: esses não mudam.
+# O layout de antes fica guardado em BOTOES_LAYOUT no painel.conf (ligar devolve ele).
+# Chamado por: Settings → Theme → Windows → "Window buttons".
+set -u
+PAINEL="$HOME/.config/hypr/painel.conf"
+CHAVE="org.gnome.desktop.wm.preferences"
+PADRAO="appmenu:minimize,maximize,close"
+
+gravar() {   # gravar CHAVE VALOR (troca a linha se existe, senão acrescenta). O valor é só texto:
+    # vai pelo ambiente pro awk (nunca vira código do sed) e perde quebras de linha.
+    local v="${2//[$'\n\r']/}" tmp
+    touch "$PAINEL"; tmp="$(mktemp "$PAINEL.XXXXXX")"
+    K="$1" V="$v" awk 'BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"] }
+        index($0, k "=") == 1 { if (!feito) print k "=" v; feito = 1; next } { print }
+        END { if (!feito) print k "=" v }' "$PAINEL" > "$tmp" && mv "$tmp" "$PAINEL"
+}
+ler() { sed -n "s/^$1=//p" "$PAINEL" 2>/dev/null | head -1 | tr -d '"'; }
+
+case "${1:-status}" in
+    off)
+        atual="$(gsettings get $CHAVE button-layout | tr -d "'")"
+        case "$atual" in *minimize*|*maximize*|*close*) gravar BOTOES_LAYOUT "\"$atual\"" ;; esac
+        gsettings set $CHAVE button-layout "appmenu:"
+        gravar BOTOES_JANELA 0 ;;
+    on)
+        layout="$(ler BOTOES_LAYOUT)"
+        gsettings set $CHAVE button-layout "${layout:-$PADRAO}"
+        gravar BOTOES_JANELA 1 ;;
+    status)
+        [ "$(ler BOTOES_JANELA)" = 0 ] && echo off || echo on ;;
+    *) echo "uso: botoes-de-janela on|off|status" >&2; exit 2 ;;
+esac
+# Firefox (textfox) mostra/esconde os botões da janela conforme BOTOES_JANELA (vale ao reabrir)
+case "${1:-status}" in on|off) [ -x "$HOME/.local/bin/firefox-tema" ] && "$HOME/.local/bin/firefox-tema" >/dev/null 2>&1 ;; esac

@@ -1,0 +1,13 @@
+[Unit]
+Description=EZ File Manager as the system file picker (xdg-desktop-portal FileChooser)
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.myfm
+WorkingDirectory=%h/.local/share/ez-fm
+Environment=APP_PATH=%h/.local/share/ez-fm
+Environment=ELECTRON_BIN=/usr/bin/electron
+ExecStart=/usr/bin/node %h/.local/share/ez-fm/portal-service.js
+Restart=on-failure
+RestartSec=3

@@ -1,0 +1,35 @@
+# Gerado pelo hypr-tema (cores do tema). O modo "claro" é ativado com: makoctl mode -s claro
+anchor=top-right
+margin=12
+padding=12,16
+width=320
+border-radius=22
+border-size=0
+background-color=#1e1e1ecc
+text-color=#f0f0f0
+font=Inter 11
+default-timeout=4000
+# Histórico (central de notificações, doc 25): guarda as 50 últimas
+max-history=50
+# Clique esquerdo = abre o que a notificação oferece (ex: a conversa no Discord); direito = fecha
+on-button-left=invoke-default-action
+on-button-right=dismiss
+
+# Urgentes (bateria acabando...): ficam até você fechar, com uma faixa vermelha
+[urgency=critical]
+default-timeout=0
+border-size=2
+border-color=#e01b24
+
+# "Não perturbe": esconde tudo... menos as urgentes
+[mode=dnd]
+invisible=1
+[mode=dnd urgency=critical]
+invisible=0
+
+[app-name=teclado]
+default-timeout=1500
+
+[mode=claro]
+background-color=#f6f6f6cc
+text-color=#1e1e1e

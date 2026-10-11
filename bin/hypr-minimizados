@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Super+M: lista as janelas minimizadas (com miniatura) e traz de volta a escolhida.
+# --contar: só imprime um JSON pra barra (waybar): {"text": "2", "tooltip": "..."}; vazio se 0
+if [ "$1" = --contar ]; then
+    hyprctl clients -j | python3 -I -c '
+import json, sys
+m = [c["title"] for c in json.load(sys.stdin) if c["workspace"]["name"] == "special:minimized"]
+print(json.dumps({"text": f"\uf2d1  {len(m)}" if m else "", "tooltip": "Minimized:\n" + "\n".join(m)}))
+'
+    exit 0
+fi
+# A lista é a do Alt+Tab, só com as minimizadas: cartões com miniatura, clique/Enter restaura,
+# Esc fecha (doc 25; antes era o wofi). O programa do Alt+Tab já fica rodando em segundo plano.
+exec "$HOME/.local/bin/alttab" minimized

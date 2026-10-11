@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# papel-de-parede — o "Set as Wallpaper" do SISTEMA (funciona com qualquer app e navegador). Doc 21.
+#
+# Uso:
+#   papel-de-parede                  no login: garante o hyprpaper rodando (ele lê o hyprpaper.conf)
+#   papel-de-parede ARQUIVO          uma imagem do disco (é o que o Thunar chama no botão direito)
+#   papel-de-parede --clipboard      a imagem que está na área de transferência (Super+Shift+W)
+#                                    (vale também: arquivo copiado no Thunar, ou um link http de imagem)
+#   papel-de-parede --url URL [PAG]  baixa uma imagem da internet (PAG = página, vira o "Referer")
+#   papel-de-parede --cores          só refaz as cores do tema a partir do wallpaper atual
+#
+# Quem chama: o Thunar (botão direito numa imagem → "Set as wallpaper"), o histórico do clipboard
+# (Ctrl+Shift+V → botão direito numa imagem → "Set as Wallpaper"), o atalho Super+Shift+W e o
+# exec-once do hyprland.conf (sem argumentos, no login).
+#
+# A ORDEM importa (pedido do Aero):
+#   1) pega a imagem  2) GUARDA em ~/Pictures/Wallpapers (nome legível e único)
+#   3) só então aponta o papel de parede pro arquivo guardado — nunca pra um temporário.
+#
+# Quem desenha o papel de parede é o hyprpaper; a escolha fica gravada em ~/.config/hypr/hyprpaper.conf
+# (por isso vale depois de reiniciar).
+# Códigos de saída: 0 = deu certo, 2 = uso errado, 3 = não consegui pegar a imagem,
+#                   4 = não é imagem, 5 = outro erro.
+
+set -u    # usar uma variável que não existe = erro (pega erro de digitação)
+
+LOG="$HOME/.cache/aero-shell/papel-de-parede.log"
+CONF="$HOME/.config/hypr/hyprpaper.conf"
+PAINEL="$HOME/.config/hypr/painel.conf"
+mkdir -p "$(dirname "$LOG")"
+registrar() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+
+avisar_erro() {
+    # -u critical: o aviso fica na tela até clicar (erros não podem passar batido)
+    notify-send -a "Wallpaper" -u critical -i dialog-error "Couldn't set wallpaper" "$1"
+    registrar "ERRO: $1"
+}
+
+# O hyprpaper DESTA sessão está rodando? ("pgrep -x" = nome exato do programa; não usa pgrep -f, ver CONTEXTO)
+# Só conta o hyprpaper com o MESMO HYPRLAND_INSTANCE_SIGNATURE que nós. Cada processo guarda o ambiente
+# com que foi iniciado em /proc/PID/environ (variáveis separadas por um byte zero; o "grep -z" lê assim).
+# Assim, um hyprpaper "fantasma" de uma sessão que travou (crash do Hyprland) não impede o login novo
+# de abrir o seu. Sem isso, a sessão nova ficaria sem papel de parede (como aconteceu com o Dock).
+hyprpaper_rodando() {
+    local pid
+    for pid in $(pgrep -x hyprpaper); do
+        # Sem assinatura (chamado de fora do Hyprland): qualquer hyprpaper serve, como antes
+        [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && return 0
+        grep -qzxF "HYPRLAND_INSTANCE_SIGNATURE=$HYPRLAND_INSTANCE_SIGNATURE" "/proc/$pid/environ" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+iniciar_hyprpaper() {
+    # "hyprctl dispatch exec": quem inicia é o Hyprland. Assim o hyprpaper não fica "filho" de
+    # quem chamou (o Thunar, o histórico...) e não morre junto se aquele app fechar.
+    hyprpaper_rodando || hyprctl dispatch exec hyprpaper >/dev/null
+}
+
+# ---------- cores do tema a partir do wallpaper (Settings → Appearance → Wallpaper color scheme) ----------
+cores_do_wallpaper() {
+    # Só se o Aero ligou a opção (WALL_CORES=1). Desligada (o padrão), nada muda.
+    grep -qx 'WALL_CORES=1' "$PAINEL" 2>/dev/null || return 0
+    "$HOME/.local/bin/cores-do-wallpaper" --aplicar "$1" >> "$LOG" 2>&1 \
+        || registrar "cores-do-wallpaper falhou (veja acima)"
+}
+
+# ---------- 1. ler o pedido ----------
+MODO="" ORIGEM="" PAGINA=""
+case "${1:-}" in
+    "")           iniciar_hyprpaper; exit 0 ;;
+    --clipboard)  MODO=clipboard ;;
+    --url)        MODO=url; ORIGEM="${2:-}"; PAGINA="${3:-}" ;;
+    --cores)      atual="$(sed -n 's/^\s*path\s*=\s*//p' "$CONF" 2>/dev/null | head -1)"
+                  [ -f "$atual" ] && cores_do_wallpaper "$atual"; exit 0 ;;
+    -h|--help)    sed -n '2,24p' "$0"; exit 0 ;;
+    -*)           echo "opção desconhecida: $1" >&2; exit 2 ;;
+    *)            MODO=arquivo; ORIGEM="$1" ;;
+esac
+registrar "pedido: $MODO ${ORIGEM:0:300}"
+
+# ---------- 2. a pasta de wallpapers ----------
+# xdg-user-dir diz qual é a pasta "Imagens" do usuário (doc 02). Sem configuração ele devolve a
+# própria home; aí usamos ~/Pictures.
+FOTOS="$(xdg-user-dir PICTURES 2>/dev/null)"
+{ [ -z "$FOTOS" ] || [ "$FOTOS" = "$HOME" ]; } && FOTOS="$HOME/Pictures"
+PASTA="$FOTOS/Wallpapers"
+mkdir -p "$PASTA" || { avisar_erro "Can't create $PASTA"; exit 5; }
+
+# Arquivo provisório DENTRO da pasta (escondido: começa com ponto). Se algo der errado, o "trap"
+# apaga ele ao sair. Se der certo, ele é renomeado pro nome final.
+PROVISORIO="$(mktemp "$PASTA/.chegando-XXXXXX")" || { avisar_erro "Can't write to $PASTA"; exit 5; }
+trap 'rm -f "$PROVISORIO" "$PROVISORIO.png"' EXIT
+NOME_ORIGINAL=""      # dica de nome pro arquivo final
+
+baixar() {   # baixar URL [PAGINA] -> $PROVISORIO
+    local versao ua
+    versao="$(sed -n 's/^Version=\([0-9]*\).*/\1/p' /usr/lib/firefox/application.ini 2>/dev/null | head -1)"
+    ua="Mozilla/5.0 (X11; Linux x86_64; rv:${versao:-150}.0) Gecko/20100101 Firefox/${versao:-150}.0"
+    local opcoes=(
+        --fail                 # erro do site (404, 403...) = falha, e não salvar a página de erro
+        --location             # segue redirecionamentos...
+        --proto =http,https --proto-redir =https   # ...mas só para https (nada de ftp/file/http no meio)
+        --silent --show-error
+        --max-time 90
+        --max-filesize 300M    # proteção: nada de baixar um "wallpaper" de 5 GB
+        --compressed
+        --user-agent "$ua"     # se apresenta como um navegador comum
+        --header "Accept: image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
+    )
+    # Referer = "vim desta página". Muitos sites recusam imagem pedida sem ele (anti-"hotlink").
+    [ -n "${2:-}" ] && opcoes+=(--referer "$2")
+    local erro
+    if ! erro="$(curl "${opcoes[@]}" --output "$PROVISORIO" "$1" 2>&1)"; then
+        avisar_erro "Download failed: ${erro:0:120}"
+        exit 3
+    fi
+    NOME_ORIGINAL="$(python3 -I -c 'import sys, urllib.parse as u; print(u.unquote(u.urlsplit(sys.argv[1]).path.rsplit("/", 1)[-1]))' "$1" 2>/dev/null)"
+    SITE="$(printf '%s' "${2:-$1}" | sed -E 's#^[a-zA-Z]+://([^/@]*@)?(www\.)?([^/:?#]+).*#\3#')"
+}
+
+# ---------- 3. pegar a imagem (passo 1 do Aero) ----------
+SITE=""
+case "$MODO" in
+    arquivo)
+        [ -f "$ORIGEM" ] || { avisar_erro "File not found: $ORIGEM"; exit 3; }
+        ORIGEM="$(realpath "$ORIGEM")"
+        if [ "$(dirname "$ORIGEM")" = "$(realpath "$PASTA")" ]; then
+            # Já está na pasta de wallpapers: usa ele mesmo (não faz cópia repetida)
+            rm -f "$PROVISORIO"; PROVISORIO=""
+            FINAL="$ORIGEM"
+        else
+            cp -f "$ORIGEM" "$PROVISORIO" || { avisar_erro "Can't read $ORIGEM"; exit 3; }   # CÓPIA: o original fica onde está
+            NOME_ORIGINAL="$(basename "$ORIGEM")"
+            # Veio do histórico do clipboard (arquivos com nome de "impressão digital", ex: 3fa9...bin)
+            case "$ORIGEM" in "$HOME/.local/share/aero-clipboard/"*) NOME_ORIGINAL=""; SITE="clipboard" ;; esac
+        fi ;;
+    url)
+        case "$ORIGEM" in
+            http://*|https://*) baixar "$ORIGEM" "$PAGINA" ;;
+            *) avisar_erro "Not a web address: ${ORIGEM:0:60}"; exit 2 ;;
+        esac ;;
+    clipboard)
+        # Quem copia "oferece" o conteúdo em formatos (tipos MIME). wl-paste --list-types mostra quais.
+        tipos="$(wl-paste --list-types 2>/dev/null)"
+        imagem="$(printf '%s\n' "$tipos" | grep -m1 -E '^image/(png|jpeg|webp|avif|jxl|gif|bmp|tiff|heic|svg\+xml)$')"
+        if [ -n "$imagem" ]; then
+            # "Copy Image" de qualquer navegador, print copiado, imagem copiada num editor...
+            wl-paste --no-newline --type "$imagem" > "$PROVISORIO" 2>/dev/null
+            SITE="clipboard"
+        elif printf '%s\n' "$tipos" | grep -qx 'text/uri-list'; then
+            # Arquivo copiado no Thunar (Ctrl+C): vem como "file:///caminho/foto.jpg"
+            uri="$(wl-paste --no-newline --type text/uri-list | grep -m1 '^file://')"
+            caminho="$(python3 -I -c 'import sys, urllib.parse as u; print(u.unquote(u.urlsplit(sys.argv[1]).path))' "$uri" 2>/dev/null)"
+            [ -f "$caminho" ] || { avisar_erro "The copied item isn't an image file."; exit 3; }
+            cp -f "$caminho" "$PROVISORIO"
+            NOME_ORIGINAL="$(basename "$caminho")"
+        else
+            # Texto: se for um link de imagem ("Copy Image Link"), baixa
+            texto="$(wl-paste --no-newline --type text/plain 2>/dev/null | head -c 4096 | tr -d '\r\n')"
+            case "$texto" in
+                http://*|https://*) baixar "$texto" ;;
+                *) avisar_erro "There's no image in the clipboard. Use \"Copy Image\" first."; exit 3 ;;
+            esac
+        fi
+        [ -s "$PROVISORIO" ] || { avisar_erro "There's no image in the clipboard."; exit 3; } ;;
+esac
+
+if [ -n "$PROVISORIO" ]; then
+    # ---------- 4. é imagem mesmo? ----------
+    # "file --mime-type" olha os primeiros bytes do arquivo (não confia no nome nem no site).
+    tipo="$(file --brief --mime-type "$PROVISORIO")"
+    case "$tipo" in
+        image/jpeg) ext=jpg ;;
+        image/png)  ext=png ;;
+        image/webp) ext=webp ;;
+        image/jxl)  ext=jxl ;;
+        image/svg+xml) ext=svg ;;
+        image/*)
+            # O hyprpaper só abre jpg, png, webp, jxl e svg. Os outros (avif, heic, gif, bmp, tiff...)
+            # viram PNG com o GdkPixbuf do Python (ele lê quase tudo; de um gif, pega o 1º quadro).
+            if python3 -I -c 'import sys, gi; gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf
+GdkPixbuf.Pixbuf.new_from_file(sys.argv[1]).savev(sys.argv[2], "png", [], [])' \
+                    "$PROVISORIO" "$PROVISORIO.png" 2>>"$LOG"; then
+                mv -f "$PROVISORIO.png" "$PROVISORIO"
+                registrar "convertido de $tipo para png"
+                ext=png
+            else
+                avisar_erro "This image format ($tipo) can't be used as wallpaper."
+                exit 4
+            fi ;;
+        *)
+            avisar_erro "That isn't an image (it's $tipo)."
+            exit 4 ;;
+    esac
+
+    # ---------- 5. guardar com nome legível e único (passo 2 do Aero) ----------
+    # Mesma imagem já guardada antes? Usa a que já existe (não enche a pasta de cópias iguais).
+    FINAL=""
+    tam="$(stat -c %s "$PROVISORIO")"
+    for f in "$PASTA"/*; do
+        [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$tam" ] && cmp -s "$f" "$PROVISORIO" && { FINAL="$f"; break; }
+    done
+    if [ -z "$FINAL" ]; then
+        limpar_nome() {
+            # tira acentos, troca o que não for letra/número por "-", e corta o tamanho
+            printf '%s' "$1" | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
+                | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-60 | sed -E 's/-+$//'
+        }
+        nome="$(limpar_nome "${NOME_ORIGINAL%.*}")"      # sem a extensão (a certa vem do "file")
+        # Nome sem graça (vazio, só números/códigos, "image", "download"...)? Usa origem + data.
+        if [ ${#nome} -lt 3 ] || ! [[ "$nome" =~ [a-z]{3} ]] ||
+           [[ "$nome" =~ ^(image|img|download|file|photo|picture|original|default|index|media|blob)$ ]] ||
+           [[ "$nome" =~ ^[0-9a-f-]{16,}$ ]]; then      # códigos tipo "3fa94c0e..." também não contam
+            nome="$(limpar_nome "${SITE:-wallpaper}")-$(date '+%Y-%m-%d_%H%M%S')"
+        fi
+        FINAL="$PASTA/$nome.$ext"
+        n=2
+        while [ -e "$FINAL" ]; do                    # já existe? acrescenta -2, -3...
+            FINAL="$PASTA/$nome-$n.$ext"; n=$((n + 1))
+        done
+        mv "$PROVISORIO" "$FINAL" || { avisar_erro "Can't save $FINAL"; exit 5; }
+        chmod 644 "$FINAL"
+        registrar "salvo: $FINAL ($tipo)"
+    else
+        registrar "já estava guardada: $FINAL"
+    fi
+fi
+
+# ---------- 6. definir como papel de parede (passo 3 do Aero) ----------
+#  a) persistir: no hyprpaper.conf, a linha "path = ..." passa a apontar pro arquivo guardado.
+#     A versão anterior fica em hyprpaper.conf.anterior (pra desfazer).
+#  b) trocar ao vivo: "hyprctl hyprpaper wallpaper 'MONITOR,ARQUIVO,AJUSTE'" conversa com o
+#     hyprpaper que já está rodando. MONITOR vazio = todos; cover = cobre a tela, cortando as sobras.
+python3 -I - "$CONF" "$FINAL" <<'PY' || { avisar_erro "Can't save the wallpaper setting in $CONF"; exit 5; }
+import os, re, shutil, sys
+conf, arquivo = sys.argv[1], sys.argv[2]
+try:
+    texto = open(conf).read()
+    shutil.copy2(conf, conf + ".anterior")                  # a versão de antes, pra desfazer
+except FileNotFoundError:
+    texto = "splash = false\n"
+if re.search(r"^\s*path\s*=", texto, flags=re.M):
+    # troca SÓ o valor das linhas "path = ..." (cada bloco wallpaper { } tem uma)
+    texto = re.sub(r"^(\s*path\s*=\s*).*$", lambda m: m.group(1) + arquivo, texto, flags=re.M)
+else:
+    texto += "\nwallpaper {\n    monitor =\n    path = %s\n    fit_mode = cover\n}\n" % arquivo
+with open(conf + ".tmp", "w") as f:                       # grava num .tmp e renomeia:
+    f.write(texto)                                        # ninguém lê o arquivo pela metade
+os.replace(conf + ".tmp", conf)
+PY
+
+if hyprpaper_rodando; then
+    hyprctl hyprpaper wallpaper ",$FINAL,cover" >/dev/null
+    sleep 0.3
+    if ! hyprctl hyprpaper listactive | grep -qF "$FINAL"; then
+        avisar_erro "hyprpaper didn't accept the image. It's saved in $PASTA."
+        exit 5
+    fi
+else
+    iniciar_hyprpaper          # ele lê o hyprpaper.conf, que já aponta pra imagem nova
+fi
+registrar "definido: $FINAL"
+
+# ---------- 7. passos extras ----------
+# Cores do tema combinando com o wallpaper (só se a opção estiver ligada no Settings).
+cores_do_wallpaper "$FINAL"
+# Brilho/contraste/saturação escolhidos no Settings valem pra todo wallpaper novo (doc 45)
+"$HOME/.local/bin/ajustar-wallpaper" 2>/dev/null || true
+# Tela de login (e outros lugares) em "Same as desktop": recebem o wallpaper novo também (doc 37)
+"$HOME/.local/bin/sincronizar-fundos" 2>/dev/null || true
+
+notify-send -a "Wallpaper" -i "$FINAL" "Wallpaper set" "$(basename "$FINAL")"
+exit 0

@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+pokefetch-catalogar — monta o catálogo LOCAL do pokefetch (uma vez; depois o terminal não usa internet).
+
+Fonte: PokeAPI (pokeapi.co, os mesmos dados das wikis) + sprites do github.com/PokeAPI/sprites.
+Guarda em ~/.local/share/pokefetch/:
+  catalogo.json      um registro por Pokémon (nome, tipos, fraquezas, status, golpes, habilidades...)
+  sprites/NNNN.png   o sprite, já recortado e ampliado sem borrar (pixel art)
+Pode rodar de novo: o que já foi baixado é pulado. Uso: pokefetch-catalogar [--ate N]
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf  # noqa: E402
+
+PASTA = os.path.expanduser("~/.local/share/pokefetch")
+SPRITES = os.path.join(PASTA, "sprites")
+CAT = os.path.join(PASTA, "catalogo.json")
+API = "https://pokeapi.co/api/v2"
+UA = {"User-Agent": "pokefetch-local-cache (personal use)"}
+TIPOS = ["normal", "fire", "water", "electric", "grass", "ice", "fighting", "poison", "ground", "flying",
+         "psychic", "bug", "rock", "ghost", "dragon", "dark", "steel", "fairy"]
+
+
+def pegar(url, binario=False, tentativas=4):
+    for i in range(tentativas):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r:
+                dados = r.read()
+            return dados if binario else json.loads(dados)
+        except Exception:  # noqa: BLE001
+            if i == tentativas - 1:
+                raise
+            time.sleep(1.5 * (i + 1))
+
+
+def tabela_de_tipos():
+    """multiplicador[atacante][defensor]"""
+    tab = {a: {d: 1.0 for d in TIPOS} for a in TIPOS}
+    for a in TIPOS:
+        rel = pegar(f"{API}/type/{a}")["damage_relations"]
+        for d in rel["double_damage_to"]:
+            if d["name"] in TIPOS: tab[a][d["name"]] = 2.0
+        for d in rel["half_damage_to"]:
+            if d["name"] in TIPOS: tab[a][d["name"]] = 0.5
+        for d in rel["no_damage_to"]:
+            if d["name"] in TIPOS: tab[a][d["name"]] = 0.0
+    return tab
+
+
+def ingles(lista, campo="name"):
+    for x in lista:
+        if x["language"]["name"] == "en":
+            return x[campo]
+    return None
+
+
+def sprite(n, url):
+    destino = os.path.join(SPRITES, f"{n:04d}.png")
+    if os.path.exists(destino) or not url:
+        return
+    tmp = destino + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(pegar(url, binario=True))
+    pix = GdkPixbuf.Pixbuf.new_from_file(tmp)
+    if pix.get_has_alpha():                       # recorta a sobra transparente
+        w, h, rs, nc = pix.get_width(), pix.get_height(), pix.get_rowstride(), pix.get_n_channels()
+        px = pix.get_pixels()
+        xs, ys = [], []
+        for y in range(h):
+            for x in range(w):
+                if px[y * rs + x * nc + 3] > 0:
+                    xs.append(x); ys.append(y)
+        if xs:
+            pix = pix.new_subpixbuf(min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+    fator = max(1, 240 // max(pix.get_width(), pix.get_height()))   # ampliação inteira = pixel nítido
+    pix = pix.scale_simple(pix.get_width() * fator, pix.get_height() * fator, GdkPixbuf.InterpType.NEAREST)
+    pix.savev(destino, "png", [], [])
+    os.remove(tmp)
+
+
+_grupos = {}   # url do version-group -> nome (preenchido no main)
+
+
+def golpes(p):
+    """Golpes por nível no jogo mais recente que o Pokémon tem (os 'de sempre' dele)."""
+    por_jogo = {}
+    for m in p["moves"]:
+        for v in m["version_group_details"]:
+            if v["move_learn_method"]["name"] == "level-up":
+                por_jogo.setdefault(v["version_group"]["url"], []).append((v["level_learned_at"], m["move"]["name"]))
+    if not por_jogo:
+        return []
+    # o jogo mais novo em que ele aparece (os ids da API não seguem a ordem de lançamento)
+    ordem = ["scarlet-violet", "sword-shield", "brilliant-diamond-shining-pearl", "legends-arceus",
+             "ultra-sun-ultra-moon", "sun-moon", "lets-go-pikachu-lets-go-eevee", "omega-ruby-alpha-sapphire",
+             "x-y", "black-2-white-2", "black-white", "heartgold-soulsilver", "platinum", "diamond-pearl",
+             "emerald", "firered-leafgreen", "ruby-sapphire", "crystal", "gold-silver", "yellow", "red-blue"]
+    nomes = {u: None for u in por_jogo}
+    def posicao(u):
+        nome = _grupos.get(u)
+        return ordem.index(nome) if nome in ordem else len(ordem)
+    ultimo = min(por_jogo, key=posicao)
+    lista = sorted(set(por_jogo[ultimo]))
+    return [nome.replace("-", " ").title() for _, nome in lista[-6:]]   # os 6 de nível mais alto
+
+
+def um(n, tab):
+    p = pegar(f"{API}/pokemon/{n}")
+    e = pegar(f"{API}/pokemon-species/{n}")
+    tipos = [t["type"]["name"] for t in sorted(p["types"], key=lambda t: t["slot"])]
+    defesa = {a: 1.0 for a in TIPOS}
+    for a in TIPOS:
+        for d in tipos:
+            defesa[a] *= tab[a].get(d, 1.0)
+    forte = sorted({d for t in tipos for d in TIPOS if tab[t][d] == 2.0})
+    textos = [x for x in e["flavor_text_entries"] if x["language"]["name"] == "en"]
+    descricao = " ".join(textos[-1]["flavor_text"].split()) if textos else ""
+    sprite(n, p["sprites"]["front_default"] or (p["sprites"]["other"]["official-artwork"]["front_default"]))
+    return {
+        "id": n,
+        "nome": ingles(e["names"]) or p["name"].title(),
+        "genero": ingles(e["genera"], "genus") or "",
+        "tipos": tipos,
+        "altura_m": p["height"] / 10,
+        "peso_kg": p["weight"] / 10,
+        "habilidades": [h["ability"]["name"].replace("-", " ").title() + (" (hidden)" if h["is_hidden"] else "")
+                        for h in p["abilities"]],
+        "status": {s["stat"]["name"]: s["base_stat"] for s in p["stats"]},
+        "fraco_x4": [a for a in TIPOS if defesa[a] == 4],
+        "fraco_x2": [a for a in TIPOS if defesa[a] == 2],
+        "resiste": [a for a in TIPOS if 0 < defesa[a] < 1],
+        "imune": [a for a in TIPOS if defesa[a] == 0],
+        "forte_contra": forte,
+        "golpes": golpes(p),
+        "geracao": e["generation"]["name"].replace("generation-", "").upper(),
+        "lendario": e["is_legendary"], "mitico": e["is_mythical"],
+        "habitat": (e["habitat"] or {}).get("name"),
+        "captura": e["capture_rate"],
+        "descricao": descricao,
+    }
+
+
+def main():
+    os.makedirs(SPRITES, exist_ok=True)
+    ate = int(sys.argv[sys.argv.index("--ate") + 1]) if "--ate" in sys.argv else pegar(f"{API}/pokemon-species?limit=1")["count"]
+    try:
+        with open(CAT) as f:
+            cat = json.load(f)
+    except (OSError, ValueError):
+        cat = {}
+    if "naturezas" not in cat:
+        nat = []
+        for r in pegar(f"{API}/nature?limit=30")["results"]:
+            d = pegar(r["url"])
+            nat.append({"nome": d["name"].title(),
+                        "sobe": (d["increased_stat"] or {}).get("name"), "desce": (d["decreased_stat"] or {}).get("name")})
+        cat["naturezas"] = nat
+    tab = tabela_de_tipos()
+    for r in pegar(f"{API}/version-group?limit=100")["results"]:
+        _grupos[r["url"]] = r["name"]
+    pokes = cat.setdefault("pokemon", {})
+    faltam = [n for n in range(1, ate + 1) if str(n) not in pokes or not os.path.exists(os.path.join(SPRITES, f"{n:04d}.png"))]
+    print(f"faltam {len(faltam)} de {ate}", flush=True)
+    feitos = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:            # 8 de cada vez: educado com a PokeAPI
+        for r in ex.map(lambda n: (n, _tentar(um, n, tab)), faltam):
+            n, dado = r
+            if isinstance(dado, dict):
+                pokes[str(n)] = dado
+            else:
+                print(f"#{n}: falhou ({dado})", flush=True)
+            feitos += 1
+            if feitos % 50 == 0:
+                print(f"{feitos}/{len(faltam)}", flush=True)
+                _gravar(cat)
+    _gravar(cat)
+    print(f"pronto: {len(pokes)} Pokémon no catálogo", flush=True)
+
+
+def _tentar(f, *a):
+    try:
+        return f(*a)
+    except Exception as erro:  # noqa: BLE001
+        return erro
+
+
+def _gravar(cat):
+    with open(CAT + ".tmp", "w") as f:
+        json.dump(cat, f, ensure_ascii=False)
+    os.replace(CAT + ".tmp", CAT)
+
+
+main()

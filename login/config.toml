@@ -1,0 +1,7 @@
+# /etc/greetd/config.toml (doc 34)
+[terminal]
+vt = 1
+
+[default_session]
+command = "start-hyprland -- --config /etc/greetd/aero-login/hyprland.conf"
+user = "greeter"

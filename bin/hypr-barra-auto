@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Aprende sozinho quais apps desenham a PRÓPRIA barra de título (pra não ficar barra dupla com o hyprbars).
+
+O Wayland/Hyprland não informa isso de forma confiável, então: na PRIMEIRA vez que uma classe de janela
+nova aparece, abre um menu (wofi) perguntando. A resposta fica gravada e nunca mais pergunta daquele app.
+  Sim -> grava a regra "hyprbars:no_bar" em ~/.config/hypr/barras-auto.conf e recarrega o Hyprland
+  Não -> só lembra que o app está certo
+  Esc -> não grava nada; pergunta de novo da próxima vez que o app abrir
+
+Estado:  ~/.local/share/hypr-barra-auto/decididas.txt   (uma classe por linha)
+Desfazer um app: apague a linha dele em barras-auto.conf (e em decididas.txt, se quiser que pergunte de novo).
+Evento ouvido: openwindow>>ENDEREÇO,WORKSPACE,CLASSE,TÍTULO  (socket2 do Hyprland)
+"""
+import os
+import re
+import socket
+import subprocess
+import time
+
+HOME = os.path.expanduser("~")
+DECIDIDAS = f"{HOME}/.local/share/hypr-barra-auto/decididas.txt"
+REGRAS = f"{HOME}/.config/hypr/barras-auto.conf"
+# Já tratadas à mão (hyprbars.conf) ou que sabidamente usam a barra do sistema: nunca perguntar.
+SEMENTES = {"steam", "discord", "firefox", "kitty", "thunar", "pavucontrol", "com.anthropic.Claude"}
+
+
+def ler_decididas():
+    try:
+        return {l.strip() for l in open(DECIDIDAS) if l.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def anotar(classe):
+    with open(DECIDIDAS, "a") as f:
+        f.write(classe + "\n")
+
+
+def regra_existe(classe):
+    try:
+        return re.escape(classe) in open(REGRAS).read()
+    except FileNotFoundError:
+        return False
+
+
+def perguntar(classe, titulo):
+    """Janelinha com dois botões: OS (a barra do sistema serve) ou APP (o app já tem barra própria)."""
+    r = subprocess.run([f"{HOME}/.local/bin/hypr-barra-auto-janela", classe], capture_output=True, text=True)
+    return {"os": "Não", "app": "Sim"}.get(r.stdout.strip(), "")
+
+
+def ignorar(classe):
+    return classe.startswith("com.aero.")    # apps do próprio shell: regra fixa no hyprbars.conf
+
+
+def tratar(classe, titulo):
+    time.sleep(2)  # deixa a janela aparecer pra você ver se tem barra dupla
+    if classe in ler_decididas():
+        return
+    resposta = perguntar(classe, titulo)
+    if resposta.startswith("Sim"):
+        if not regra_existe(classe):
+            with open(REGRAS, "a") as f:
+                f.write(f"windowrule = hyprbars:no_bar on, match:class ^{re.escape(classe)}$\n")
+        anotar(classe)
+        subprocess.run(["hyprctl", "reload"], capture_output=True)
+        subprocess.run(["notify-send", "Double title bar", f"{classe}: system title bar removed."])
+    elif resposta.startswith("Não"):
+        anotar(classe)
+    # Esc (resposta vazia): não grava, pergunta de novo da próxima vez
+
+
+os.makedirs(os.path.dirname(DECIDIDAS), exist_ok=True)
+open(REGRAS, "a").close()
+if not os.path.exists(DECIDIDAS):
+    open(DECIDIDAS, "w").write("\n".join(sorted(SEMENTES)) + "\n")
+    # também marca como decididas as janelas abertas agora (evita uma enxurrada de perguntas no 1º uso)
+    import json
+    for c in json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True).stdout or "[]"):
+        if c.get("class") and c["class"] not in SEMENTES:
+            anotar(c["class"])
+
+caminho = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr",
+                       os.environ["HYPRLAND_INSTANCE_SIGNATURE"], ".socket2.sock")
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(caminho)
+perguntando = False
+for linha in s.makefile("r", encoding="utf-8", errors="replace"):
+    evento, _, dados = linha.strip().partition(">>")
+    if evento != "openwindow":
+        continue
+    partes = dados.split(",", 3)
+    if len(partes) < 4 or not partes[2]:
+        continue
+    classe, titulo = partes[2], partes[3]
+    if ignorar(classe) or classe in ler_decididas() or perguntando:
+        continue
+    perguntando = True  # uma pergunta por vez
+    try:
+        tratar(classe, titulo)
+    finally:
+        perguntando = False

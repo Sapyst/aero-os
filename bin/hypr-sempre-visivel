@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Liga/desliga "sempre visível" numa janela: ela NÃO esmaece nem fica transparente ao perder o foco
+# (bom pra vídeo ou texto que você acompanha enquanto usa outro app).
+# Funciona colando/tirando a etiqueta (tag) "sempre-visivel"; as regras do aparencia.conf fazem o resto.
+# Uso: hypr-sempre-visivel            (janela ativa)
+#      hypr-sempre-visivel 0xENDERECO (uma janela específica)
+alvo=${1:+" address:$1"}
+hyprctl dispatch tagwindow "sempre-visivel$alvo" >/dev/null
+# Anota quais janelas estão marcadas: todo "hyprctl reload" apaga as etiquetas, e o
+# hypr-minimizar-escuta usa esta lista pra colar de novo depois do reload.
+hyprctl clients -j | python3 -I -c '
+import json, sys
+print("\n".join(c["address"] for c in json.load(sys.stdin) if "sempre-visivel" in c["tags"]))' \
+    > "$XDG_RUNTIME_DIR/sempre-visivel"
+# Confere como ficou e avisa
+ligado=$(hyprctl clients -j | python3 -I -c '
+import json, sys
+alvo = sys.argv[1]   # endereço da janela; vazio = a ativa (focusHistoryID 0)
+for c in json.load(sys.stdin):
+    if c["address"] == alvo or (not alvo and c["focusHistoryID"] == 0):
+        print("sempre-visivel" in c["tags"])' "$1")
+if [ "$ligado" = True ]; then
+    notify-send -a "Window" -t 1500 "Always visible: on" "This window won't dim or fade when unfocused."
+else
+    notify-send -a "Window" -t 1500 "Always visible: off" "This window dims normally when unfocused."
+fi

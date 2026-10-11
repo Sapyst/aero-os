@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Ícone do sininho na barra (waybar, módulo custom/notificacoes). Doc 25.
+# Sino cortado = "Não perturbe" ligado. A barra pede de novo quando recebe o sinal RTMIN+10.
+if makoctl mode 2>/dev/null | grep -qx dnd; then
+    echo '{"text": "", "class": "dnd"}'
+else
+    echo '{"text": "", "class": "normal"}'
+fi

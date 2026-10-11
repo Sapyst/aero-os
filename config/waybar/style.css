@@ -1,0 +1,78 @@
+/* Visual da barra: vidro fosco (o desfoque vem do Hyprland: layerrule blur).
+   As cores ficam em cores.css, que é um atalho para cores-escuro.css ou cores-claro.css
+   (o script hypr-tema troca conforme o horário). */
+@import "cores.css";
+
+* {
+    font-family: Inter, "Font Awesome 7 Free Solid", "Font Awesome 7 Brands", sans-serif;
+    font-size: 13px;
+    min-height: 0;
+    border: none;
+}
+
+window#waybar {
+    background: @fundo;
+    color: @texto;
+    border-radius: 22px;   /* 22 = o mesmo de tudo; com 34 px de altura vira pílula (doc 30) */
+}
+
+/* Áreas de trabalho como pontinhos (doc 25): o botão vira uma bolinha (sem texto);
+   a ativa estica numa pílula da cor de destaque; as vazias ficam mais apagadas.
+   "transition" = a mudança de tamanho/cor é animada. */
+#workspaces { margin-left: 6px; }
+#workspaces button {
+    padding: 0;
+    margin: 13px 3px;
+    min-width: 8px;
+    min-height: 8px;
+    border-radius: 99px;
+    background: alpha(@texto, 0.45);
+    border: none;
+    transition: all 200ms ease;
+}
+#workspaces button.empty { background: alpha(@texto, 0.18); }
+#workspaces button label { font-size: 0; }   /* sem texto: senão a fonte deixa a bolinha alta */
+#workspaces button.active { min-width: 24px; background: @destaque; }
+#workspaces button:hover { background: alpha(@texto, 0.65); box-shadow: none; text-shadow: none; }
+#workspaces button.active:hover { background: @destaque; }
+
+#clock, #tray, #language, #pulseaudio, #network, #bluetooth, #battery,
+#custom-settings, #custom-minimizados, #custom-notificacoes {
+    padding: 0 10px;
+    margin: 4px 0;
+    border-radius: 10px;
+}
+#clock { font-weight: 600; }
+#custom-minimizados { background: @hover; }
+#pulseaudio:hover, #network:hover, #bluetooth:hover, #custom-settings:hover,
+#language:hover, #custom-minimizados:hover, #custom-notificacoes:hover,
+#battery:hover, #clock:hover { background: @hover; }
+#battery.warning { color: #e5a50a; }
+#battery.critical { color: #e01b24; }
+
+tooltip { background: @fundo-solido; color: @texto; border-radius: 10px; }
+tooltip label { color: @texto; }   /* sem isto o texto do balão herdava um cinza claro (pouco contraste) */
+
+
+/* Espaço da bandeja: 30 px por ícone (a bandeja desenha os ícones por cima) */
+#custom-espaco-bandeja { padding: 0; margin: 0; }
+#custom-espaco-bandeja.n1 { min-width: 30px; }
+#custom-espaco-bandeja.n2 { min-width: 60px; }
+#custom-espaco-bandeja.n3 { min-width: 90px; }
+#custom-espaco-bandeja.n4 { min-width: 120px; }
+#custom-espaco-bandeja.n5 { min-width: 150px; }
+#custom-espaco-bandeja.n6 { min-width: 180px; }
+#custom-espaco-bandeja.n7 { min-width: 210px; }
+#custom-espaco-bandeja.n8 { min-width: 240px; }
+#custom-espaco-bandeja.n9 { min-width: 270px; }
+#custom-espaco-bandeja.n10 { min-width: 300px; }
+#custom-espaco-bandeja.n11 { min-width: 330px; }
+#custom-espaco-bandeja.n12 { min-width: 360px; }
+#custom-notificacoes.dnd { opacity: 0.55; }   /* Não perturbe: sininho cortado e mais apagado */
+/* Bluetooth mostra o estado (doc 25): desligado = apagado; conectado = cor de destaque */
+#bluetooth.off, #bluetooth.disabled { opacity: 0.45; }
+#bluetooth.connected { color: @destaque; }
+/* Botão da central rápida, no canto direito (doc 30). Largura FIXA de 40 px (24 + 8 + 8):
+   a bandeja (bandeja.py, MARGEM_DIREITA) conta com esse número pra ficar logo à esquerda dele. */
+#custom-central { min-width: 24px; padding: 0 8px; margin: 4px 0; border-radius: 10px; }
+#custom-central:hover { background: @hover; }

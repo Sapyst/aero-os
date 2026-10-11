@@ -1,0 +1,9 @@
+/* Cores do tema (sincronizadas com a barra de cima). Gerado pelo hypr-tema; doc 18. */
+@import url("cores-tema.css");
+
+/* (Os botões das janelas voltaram ao padrão de cada app: doc 28.) */
+
+/* (Antes: "window { backdrop-filter: blur(20px); }" aqui, pra ter vidro nos apps GTK4. Ele fazia o app
+   pedir desfoque de um RETÂNGULO, e em menus/popups aparecia um quadrado atrás dos cantos redondos.
+   Agora o GTK nem usa esse pedido (GDK_WAYLAND_DISABLE no hyprland.conf) e o Hyprland desfoca as
+   janelas sozinho, seguindo a curva. Doc 39.) */

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# TerMusic — YouTube Music no terminal. Mesmo motor do app YTMusic (tocam e controlam a mesma música).
+#   termusic            janela completa: capa em braille | visualizador | player (abas, busca, fila)
+#   termusic --widget   widget: janelinha fixa no canto (capa, música, progresso, mini visualizador)
+#   termusic --aqui     só o player, dentro do terminal atual
+# Código: ~/.local/share/ytmotor/termusic.py · Layout: ~/.config/termusic/janela.kitty
+D="$HOME/.local/share/ytmotor"
+# cores do tema do sistema (as mesmas da barra): fundo, texto, e cinzas entre eles
+read -r FUNDO TEXTO MEIO LINHA G1 G2 < <(python3 -I - <<'PY'
+import re, os
+c = {"fundo-solido": "#1e1e1e", "texto": "#f0f0f0"}
+try:
+    c.update(dict(re.findall(r"@define-color\s+([\w-]+)\s+(#[0-9a-fA-F]{6});", open(os.path.expanduser("~/.config/waybar/cores.css")).read())))
+except OSError:
+    pass
+f, t = [tuple(int(c[k][i:i+2], 16) for i in (1, 3, 5)) for k in ("fundo-solido", "texto")]
+mix = lambda a, b, x: "#" + "".join(f"{round(p + (q - p) * x):02x}" for p, q in zip(a, b))
+print(c["fundo-solido"], c["texto"], mix(t, f, .45), mix(t, f, .78), mix(t, f, .7), mix(t, f, .35))
+PY
+)
+# visualizador: degradê de cinza até a cor do texto (neutro)
+sed -i -e "s/^gradient_color_1 = .*/gradient_color_1 = '$G1'/" -e "s/^gradient_color_2 = .*/gradient_color_2 = '$G2'/" \
+       -e "s/^gradient_color_3 = .*/gradient_color_3 = '$TEXTO'/" "$HOME/.config/termusic/cava.conf"
+# Config PRÓPRIA do kitty pro TerMusic (KITTY_CONFIG_DIRECTORY): inclui a sua config normal (fontes...) e
+# põe as cores do tema por cima. Com "-o" não dava: o tema automático do kitty (dark/light-theme.auto.conf)
+# reinicia todas as cores ao abrir, e as bordas voltavam pro verde padrão.
+CONF="$HOME/.config/termusic/kitty"
+mkdir -p "$CONF"
+cat > "$CONF/kitty.conf" <<KC
+# Gerado por ~/.local/bin/termusic a cada abertura (cores = tema do sistema). Não edite.
+include $HOME/.config/kitty/kitty.conf
+background $FUNDO
+foreground $TEXTO
+active_border_color $MEIO
+inactive_border_color $LINHA
+bell_border_color $MEIO
+hide_window_decorations yes
+tab_bar_style hidden
+confirm_os_window_close 0
+enabled_layouts splits
+window_border_width 1px
+draw_minimal_borders no
+window_margin_width 5
+single_window_margin_width 0
+window_padding_width 10
+background_opacity 0.82
+inactive_text_alpha 0.85
+KC
+export KITTY_CONFIG_DIRECTORY="$CONF"
+# Layout da janela completa (capa | visualizador / player), também gerado aqui: caminhos com o SEU $HOME
+cat > "$HOME/.config/termusic/janela.kitty" <<KS
+# Layout do TerMusic (kitty): capa | (visualizador / player). Gerado por ~/.local/bin/termusic. Não edite.
+layout splits
+launch --title "capa" python3 $D/termusic.py capa
+launch --location=vsplit --title "visualizer" cava -p $HOME/.config/termusic/cava.conf
+launch --location=hsplit --bias=68 --title "TerMusic" python3 $D/termusic.py tui
+focus
+KS
+case "${1:-}" in
+    --widget) exec kitty --class termusic-widget --title TerMusic -o window_padding_width=8 \
+                  python3 "$D/termusic.py" widget ;;
+    --aqui)   exec python3 "$D/termusic.py" tui ;;
+    *)        exec kitty --class termusic --title TerMusic --session "$HOME/.config/termusic/janela.kitty" ;;
+esac

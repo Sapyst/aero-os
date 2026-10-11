@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""
+hypr-frente — a janela que ganha o foco SEMPRE vem pra frente (como no Windows).
+
+Ouve os eventos do Hyprland (socket2) e, a cada troca de janela ativa, manda "bringactivetotop".
+Evento: activewindowv2>>ENDEREÇO. Sem janela ativa o endereço vem vazio: não faz nada.
+
+Também: janela nova (openwindow>>ENDEREÇO,...) e o login passam pelo hypr-limite, pra nenhuma
+janela nascer com a barra de título acima da barra do sistema.
+
+E um vigia (thread) olha a janela ativa 5x por segundo: quando ela se moveu e PAROU por ~0,6 s,
+chama o hypr-limite (se ficou acima da barra, desce). Não dá pra saber quando o botão do mouse é
+solto: o hyprbars engole esse evento. Pergunta direto pelo socket de comandos (.socket.sock), que é
+bem mais leve do que abrir um "hyprctl" a cada vez.
+"""
+import os
+import socket
+import json
+import subprocess
+import threading
+import time
+
+LIMITE = os.path.expanduser("~/.local/bin/hypr-limite")
+subprocess.Popen([LIMITE, "--todas"])
+PASTA = f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{os.environ['HYPRLAND_INSTANCE_SIGNATURE']}"
+
+
+def perguntar(pedido):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+        c.connect(f"{PASTA}/.socket.sock")
+        c.sendall(pedido.encode())
+        resposta = b""
+        while bloco := c.recv(65536):
+            resposta += bloco
+    return resposta
+
+
+def vigia_limite():
+    ultima, parada, conferida = None, 0, None
+    while True:
+        time.sleep(0.2)
+        try:
+            j = json.loads(perguntar("j/activewindow") or b"{}")
+        except (OSError, ValueError):
+            continue
+        if not j.get("floating"):
+            ultima = None
+            continue
+        agora = (j["address"], tuple(j["at"]))
+        if agora != ultima:
+            ultima, parada = agora, 0
+            if conferida is None:
+                conferida = agora           # posição de quando o vigia começou: nada a conferir
+            continue
+        parada += 1
+        if parada == 3 and agora != conferida:   # parou há ~0,6 s numa posição nova
+            conferida = agora
+            subprocess.Popen([LIMITE, j["address"]])
+
+
+threading.Thread(target=vigia_limite, daemon=True).start()
+caminho = f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{os.environ['HYPRLAND_INSTANCE_SIGNATURE']}/.socket2.sock"
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.connect(caminho)
+    resto = b""
+    while dados := s.recv(4096):
+        resto += dados
+        *linhas, resto = resto.split(b"\n")
+        for linha in linhas:
+            nome, _, valor = linha.decode(errors="replace").partition(">>")
+            if nome == "activewindowv2" and valor.strip(", "):
+                subprocess.run(["hyprctl", "dispatch", "bringactivetotop"], capture_output=True)
+            elif nome == "openwindow":
+                subprocess.Popen([LIMITE, "0x" + valor.split(",")[0]])

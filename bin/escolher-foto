@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""escolher-foto — escolhe a foto do seu perfil (doc 34).
+Guarda em ~/.face e avisa o AccountsService, que faz uma cópia que a tela de login consegue ler."""
+import shutil, os, subprocess, sys
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, Gtk
+
+FACE = os.path.expanduser("~/.face")
+
+def escolhido(dialogo, resultado, app):
+    try:
+        arquivo = dialogo.open_finish(resultado)
+    except GLib.Error:
+        app.quit(); return
+    shutil.copyfile(arquivo.get_path(), FACE)
+    subprocess.run(["busctl", "call", "org.freedesktop.Accounts", f"/org/freedesktop/Accounts/User{os.getuid()}",
+                    "org.freedesktop.Accounts.User", "SetIconFile", "s", FACE])
+    subprocess.run(["notify-send", "-i", FACE, "Profile picture", "Updated"])
+    app.quit()
+
+def ativar(app):
+    app.hold()
+    filtro = Gtk.FileFilter(name="Images")
+    filtro.add_mime_type("image/*")
+    filtros = Gio.ListStore.new(Gtk.FileFilter); filtros.append(filtro)
+    d = Gtk.FileDialog(title="Choose a profile picture", filters=filtros,
+                       initial_folder=Gio.File.new_for_path(os.path.expanduser("~/Pictures")))
+    d.open(None, None, escolhido, app)
+
+app = Gtk.Application(application_id="com.aero.PhotoPicker")
+app.connect("activate", ativar)
+sys.exit(app.run([]))

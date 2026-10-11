@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Janelinha minimalista do hypr-barra-auto: dois botões, OS ou APP. Imprime "os", "app" (ou nada com Esc).
+Uso: hypr-barra-auto-janela NOME-DA-CLASSE"""
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gtk  # noqa: E402
+
+classe = sys.argv[1] if len(sys.argv) > 1 else "?"
+resposta = []
+
+CSS = """
+.pergunta { font-weight: 600; }
+.classe { font-size: 11px; opacity: 0.6; }
+button.escolha { min-height: 44px; font-weight: 700; border-radius: 12px; }
+"""
+
+
+def ao_ativar(app):
+    css = Gtk.CssProvider()
+    css.load_from_string(CSS)
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                              Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    janela = Gtk.ApplicationWindow(application=app, title="Title bar", decorated=False, resizable=False,
+                                   default_width=300)
+    caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                    margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+    pergunta = Gtk.Label(label="Who draws the title bar?")
+    pergunta.add_css_class("pergunta")
+    nome = Gtk.Label(label=classe, ellipsize=3)
+    nome.add_css_class("classe")
+    linha = Gtk.Box(spacing=8, homogeneous=True)
+
+    def escolher(valor):
+        resposta.append(valor)
+        janela.close()
+
+    for rotulo, valor, estilo in (("OS", "os", None), ("APP", "app", "suggested-action")):
+        b = Gtk.Button(label=rotulo)
+        b.add_css_class("escolha")
+        if estilo:
+            b.add_css_class(estilo)
+        b.connect("clicked", lambda _b, v=valor: escolher(v))
+        linha.append(b)
+    for w in (pergunta, nome, linha):
+        caixa.append(w)
+    janela.set_child(caixa)
+
+    teclas = Gtk.EventControllerKey()
+    teclas.connect("key-pressed", lambda _c, k, *_: (janela.close(), True)[1] if k == Gdk.KEY_Escape else False)
+    janela.add_controller(teclas)
+    janela.present()
+
+
+app = Adw.Application(application_id="com.aero.TitlebarAuto")
+app.connect("activate", ao_ativar)
+app.run([])
+print(resposta[0] if resposta else "")

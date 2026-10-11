@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+pokefetch [NÚMERO|nome] — um Pokémon aleatório ao abrir o terminal: sprite à esquerda, ficha à direita.
+
+Tudo local (o catálogo vem do pokefetch-catalogar): não usa internet, abre na hora.
+A imagem usa o protocolo de imagens do kitty ("C=1" = desenha sem mover o cursor; o texto vem ao lado).
+A natureza é sorteada a cada aparição, como num encontro selvagem.
+Desligar: POKEFETCH=0 no ambiente, ou apague a linha "pokefetch" do ~/.bashrc.
+"""
+import base64
+import fcntl
+import json
+import math
+import os
+import random
+import struct
+import sys
+import termios
+import textwrap
+
+PASTA = os.path.expanduser("~/.local/share/pokefetch")
+LINHAS_IMG = 12          # caixa máxima da imagem: altura em linhas...
+COLUNAS_IMG = 26         # ...e largura em colunas. A imagem cabe INTEIRA nela, sem distorcer.
+
+COR = {"normal": "a8a77a", "fire": "ee8130", "water": "6390f0", "electric": "f7d02c", "grass": "7ac74c",
+       "ice": "96d9d6", "fighting": "c22e28", "poison": "a33ea1", "ground": "e2bf65", "flying": "a98ff3",
+       "psychic": "f95587", "bug": "a6b91a", "rock": "b6a136", "ghost": "735797", "dragon": "6f35fc",
+       "dark": "705746", "steel": "b7b7ce", "fairy": "d685ad"}
+CURTO = {"hp": "HP", "attack": "Atk", "defense": "Def", "special-attack": "SpA", "special-defense": "SpD",
+         "speed": "Spe"}
+R = "\033[0m"
+B = "\033[1m"
+DIM = "\033[2m"
+
+
+def limpo(x):
+    """Tira ESC e outros caracteres de controle de todo texto do catálogo (vem da internet)."""
+    if isinstance(x, str):
+        return "".join(c for c in x if c >= " " and not "\x7f" <= c <= "\x9f")
+    if isinstance(x, list):
+        return [limpo(v) for v in x]
+    if isinstance(x, dict):
+        return {k: limpo(v) for k, v in x.items()}
+    return x
+
+
+def rgb(h, fundo=False):
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"\033[{48 if fundo else 38};2;{r};{g};{b}m"
+
+
+def selo(t):        # [FIRE] com o fundo da cor do tipo
+    return f"{rgb(COR[t], True)}\033[38;2;20;20;20m{B} {t.upper()} {R}"
+
+
+def tipo(t):
+    return f"{rgb(COR[t])}{t}{R}"
+
+
+def visivel(s):     # tamanho do texto sem os códigos de cor
+    import re
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+def lista(rotulo, itens, largura, sufixo=""):
+    """'Rotulo: a b c ...' quebrando em várias linhas alinhadas se passar da largura."""
+    recuo = 11
+    linhas, atual = [], f"{DIM}{rotulo}{R}" + " " * (recuo - len(rotulo))
+    usado = recuo
+    for it in itens or ["—"]:
+        n = visivel(it) + 1
+        if usado + n > largura and usado > recuo:
+            linhas.append(atual)
+            atual, usado = " " * recuo, recuo
+        atual += it + " "
+        usado += n
+    linhas.append(atual + sufixo)
+    return linhas
+
+
+def main():
+    if os.environ.get("POKEFETCH") == "0" or not sys.stdout.isatty():
+        return
+    try:
+        with open(os.path.join(PASTA, "catalogo.json")) as f:
+            cat = limpo(json.load(f))      # textos vieram da PokeAPI: sem controles de terminal
+    except (OSError, ValueError):
+        return
+    pokes = cat.get("pokemon", {})
+    if not pokes:
+        return
+    alvo = sys.argv[1].lower() if len(sys.argv) > 1 else None
+    if alvo:
+        p = pokes.get(alvo.lstrip("#").lstrip("0") or "0") or next(
+            (x for x in pokes.values() if x["nome"].lower() == alvo), None)
+        if not p:
+            print(f"pokefetch: não achei '{sys.argv[1]}'")
+            return
+    else:
+        p = random.choice(list(pokes.values()))
+    nat = random.choice(cat.get("naturezas") or [{"nome": "Hardy", "sobe": None, "desce": None}])
+
+    # tamanho da célula em pixels, pra calcular quantas colunas a imagem ocupa
+    linhas_t, colunas_t, px_x, px_y = struct.unpack("HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+    cel_w = (px_x / colunas_t) if px_x else 10
+    cel_h = (px_y / linhas_t) if px_y else 20
+    sprite = os.path.join(PASTA, "sprites", f"{p['id']:04d}.png")
+    tem_img = os.environ.get("TERM") == "xterm-kitty" and os.path.exists(sprite) and colunas_t >= 60
+    cols_img = 0
+    linhas_img = 0
+    if tem_img:
+        w, h = struct.unpack(">II", open(sprite, "rb").read()[16:24])     # do cabeçalho do PNG
+        # Cabe na caixa COLUNAS_IMG x LINHAS_IMG mantendo a proporção. O kitty recebe SÓ a largura
+        # (c=): ele calcula a altura pela proporção da imagem, então nunca estica nem invade o texto.
+        c = max(4, min(COLUNAS_IMG, math.floor(w / h * LINHAS_IMG * cel_h / cel_w)))
+        linhas_img = math.ceil(c * cel_w * h / w / cel_h) + 1           # +1: folga pro arredondamento
+        cols_img = c + 2
+    largura = max(30, min(colunas_t - cols_img - 1, 78))
+
+    # ---- a ficha ----
+    s = p["status"]
+    extra = " ★ Legendary" if p.get("lendario") else (" ✦ Mythical" if p.get("mitico") else "")
+    linhas = [
+        f"{DIM}#{p['id']:04d}{R}  {B}{p['nome']}{R}  {DIM}{p['genero']} · Gen {p['geracao']}{R}{rgb('e8c34a')}{extra}{R}",
+        " ".join(selo(t) for t in p["tipos"]) + f"   {p['altura_m']} m · {p['peso_kg']} kg",
+    ]
+    partes = []
+    for k, curto in CURTO.items():
+        cor = "\033[32m" if k == nat["sobe"] else ("\033[31m" if k == nat["desce"] else "")
+        partes.append(f"{DIM}{curto}{R} {cor}{B}{s.get(k, '?')}{R}")
+    linhas.append("  ".join(partes) + f"  {DIM}= {sum(s.values())}{R}")
+    efeito = (f"+{CURTO.get(nat['sobe'], nat['sobe'])} −{CURTO.get(nat['desce'], nat['desce'])}"
+              if nat["sobe"] else "neutral")
+    linhas.append(f"{DIM}Wild nature:{R} {nat['nome']} {DIM}({efeito}){R}")
+    linhas += lista("Abilities:", [h + " ·" for h in p["habilidades"][:-1]] + p["habilidades"][-1:], largura)
+    linhas += lista("Strong vs:", [tipo(t) for t in p["forte_contra"]], largura)
+    linhas += lista("Weak to:", [f"{tipo(t)}{B}×4{R}" for t in p["fraco_x4"]] + [tipo(t) for t in p["fraco_x2"]], largura)
+    linhas += lista("Resists:", [tipo(t) for t in p["resiste"]], largura)
+    if p["imune"]:
+        linhas += lista("Immune:", [tipo(t) for t in p["imune"]], largura)
+    if p.get("golpes"):
+        linhas += lista("Moves:", [g + " ·" for g in p["golpes"][:-1]] + p["golpes"][-1:], largura)
+    if p.get("descricao"):
+        for l in textwrap.wrap(p["descricao"], largura)[:3]:
+            linhas.append(f"{DIM}{l}{R}")
+
+    # ---- desenha ----
+    saida = []
+    if tem_img:
+        dados = base64.standard_b64encode(open(sprite, "rb").read()).decode()
+        pedacos = [dados[i:i + 4096] for i in range(0, len(dados), 4096)]
+        for i, ped in enumerate(pedacos):
+            ctrl = f"a=T,f=100,c={cols_img - 2},C=1,q=2," if i == 0 else ""
+            saida.append(f"\033_G{ctrl}m={1 if i < len(pedacos) - 1 else 0};{ped}\033\\")
+    total = max(len(linhas), linhas_img)
+    topo = max(0, (linhas_img - len(linhas)) // 2) if tem_img else 0     # ficha centrada na altura da imagem
+    for i in range(total):
+        j = i - topo
+        texto = linhas[j] if 0 <= j < len(linhas) else ""
+        avanco = f"\033[{cols_img}C" if cols_img else ""
+        saida.append(f"\r{avanco}{texto}\033[K\n")
+    sys.stdout.write("".join(saida) + "\n")
+    sys.stdout.flush()
+
+
+main()

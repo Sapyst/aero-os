@@ -1,0 +1,37 @@
+@import url("cores-tema.css");   /* cores do tema, geradas pelo hypr-tema (doc 25) */
+
+/* (Os botões das janelas voltaram ao padrão de cada app: doc 28.) */
+
+/* Thunar (doc 41): campos de texto (busca, endereço) em "pílula", igual ao resto do sistema:
+   fundo suave, sem a borda dura do Adwaita; no foco, um contorno fino na cor de destaque. */
+.thunar entry {
+    border-radius: 99px;
+    padding: 0 12px;
+    min-height: 30px;
+    background-color: alpha(@theme_fg_color, 0.07);
+    border: 1px solid transparent;
+    box-shadow: none;
+}
+.thunar entry:focus {
+    border-color: alpha(@theme_selected_bg_color, 0.70);
+    background-color: alpha(@theme_fg_color, 0.10);
+    box-shadow: none;
+    outline: none;
+}
+
+/* Busca rápida do GTK3 (aparece no canto de baixo quando você digita com a lista de arquivos em foco).
+   É uma janelinha à parte com esta estrutura: janela > moldura (frame) > caixa > campo (entry).
+   Sem moldura, campo em pílula com contorno fino na cor de destaque. (Janela cujo filho direto é uma
+   moldura quase só existe nessa busca; doc 41.) */
+window > frame > border { border: none; }
+window > frame { background-color: transparent; }
+window > frame > box { padding: 0; }
+window > frame > box > entry, window > frame > box > entry:focus {
+    border-radius: 99px;
+    padding: 0 14px;
+    min-height: 32px;
+    border: 1px solid alpha(@theme_selected_bg_color, 0.75);
+    background-color: @theme_bg_color;
+    box-shadow: none;
+    outline: none;
+}

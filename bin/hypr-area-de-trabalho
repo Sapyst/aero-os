@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""
+hypr-area-de-trabalho — "Mostrar a área de trabalho" (Super+D), como no Windows.
+
+1º toque: minimiza TODAS as janelas da área de trabalho atual (manda pra special:minimized,
+          o mesmo lugar do botão amarelo) e anota quais foram.
+2º toque: traz de volta exatamente essas (as que você não restaurou à mão nesse meio-tempo).
+
+A lista fica em $XDG_RUNTIME_DIR/area-de-trabalho (some ao desligar o PC, de propósito).
+"""
+import json
+import os
+import subprocess
+
+LISTA = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "area-de-trabalho")
+MINIMIZAR = os.path.expanduser("~/.local/bin/hypr-minimizar")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+clientes = json.loads(hyprctl("clients", "-j") or "[]")
+atual = json.loads(hyprctl("activeworkspace", "-j") or "{}").get("id")
+
+try:
+    with open(LISTA) as f:
+        guardadas = f.read().split()
+except OSError:
+    guardadas = []
+
+minimizadas = {c["address"] for c in clientes if c["workspace"]["name"] == "special:minimized"}
+voltar = [a for a in guardadas if a in minimizadas]
+
+if voltar:
+    # 2º toque: devolve na ordem inversa (a última janela usada fica por cima)
+    for endereco in reversed(voltar):
+        hyprctl("dispatch", "movetoworkspacesilent", f"{atual},address:{endereco}")
+    hyprctl("dispatch", "focuswindow", f"address:{voltar[0]}")
+    os.remove(LISTA)
+else:
+    # 1º toque: minimiza as janelas da área atual, da mais usada pra menos usada
+    janelas = sorted((c for c in clientes if c["workspace"]["id"] == atual and c["mapped"]),
+                     key=lambda c: c["focusHistoryID"])
+    for c in janelas:
+        subprocess.run([MINIMIZAR, c["address"]])
+    with open(LISTA, "w") as f:
+        f.write("\n".join(c["address"] for c in janelas))

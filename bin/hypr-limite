@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""
+hypr-limite [--todas | ENDEREÇO] — nenhuma janela flutuante fica com a barra de título acima da barra
+do sistema (ou fora da tela). Medida de segurança: dá pra arrastar pra cima (forçando o ímã), mas
+ao SOLTAR o botão a janela desce até o limite = fim da barra + gaps_out (o mesmo espacinho da
+maximização).
+
+Quem chama:
+  - hyprland.conf: "bindrn = , mouse:272" (soltar o botão esquerdo, sem atrapalhar o clique) -> janela ativa
+  - hypr-frente: quando uma janela abre -> ela; no login -> --todas
+
+O ímã durante o arraste é o snap nativo do Hyprland (aparencia.conf: snap { respect_gaps = true }).
+Ficam de fora: janelas fixadas (pin), em tela cheia, lado a lado (tiled), minimizadas e o Super Menu.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+# Nunca mexer: o Super Menu e JOGOS (steam_app_..., gamescope): jogo decide o próprio tamanho/lugar (doc 32)
+IGNORAR = re.compile(r"SuperMenu|^steam_app_|^gamescope$")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def sem_barra():
+    """Classes sem barra de título (regras hyprbars:no_bar do hyprbars.conf)."""
+    regras = []
+    try:
+        with open(os.path.expanduser("~/.config/hypr/hyprbars.conf")) as f:
+            for linha in f:
+                m = re.match(r"\s*windowrule\s*=\s*hyprbars:no_bar on,\s*match:class\s+(\S+)", linha)
+                if m:
+                    # "negative:X" = todo mundo MENOS quem casa com X (ex: só o kitty tem barra, doc 35)
+                    padrao = m.group(1)
+                    negativa = padrao.startswith("negative:")
+                    regras.append((negativa, re.compile(padrao[len("negative:"):] if negativa else padrao)))
+    except OSError:
+        pass
+    return regras
+
+
+def altura_titulo():
+    try:
+        with open(os.path.expanduser("~/.config/hypr/hyprbars.conf")) as f:
+            for linha in f:
+                if linha.strip().startswith("bar_height"):
+                    return int(linha.split("=")[1].split("#")[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 32
+
+
+def folga():
+    try:
+        return int(json.loads(hyprctl("getoption", "general:gaps_out", "-j"))["custom"].split()[0])
+    except (ValueError, KeyError, IndexError):
+        return 12
+
+
+def main():
+    clientes = json.loads(hyprctl("clients", "-j") or "[]")
+    if len(sys.argv) > 1 and sys.argv[1] == "--todas":
+        alvos = clientes
+    else:
+        end = sys.argv[1] if len(sys.argv) > 1 else json.loads(hyprctl("activewindow", "-j") or "{}").get("address")
+        alvos = [c for c in clientes if c["address"] == end]
+    alvos = [c for c in alvos if c["floating"] and not c["pinned"] and not c["fullscreen"]
+             and c["workspace"]["id"] > 0 and not c["hidden"] and not IGNORAR.search(c["class"])]
+    if not alvos:
+        return
+    monitores = {m["id"]: m for m in json.loads(hyprctl("monitors", "-j"))}
+    regras, titulo, g = sem_barra(), altura_titulo(), folga()
+    lote = []
+    for c in alvos:
+        mon = monitores.get(c["monitor"])
+        if not mon:
+            continue
+        t = 0 if any(bool(r.search(c["class"])) != negativa for negativa, r in regras) else titulo
+        limite = mon["y"] + mon["reserved"][1] + g + t       # onde a janela (sem a barra de título) pode começar
+        if c["at"][1] < limite:
+            lote.append(f"dispatch movewindowpixel exact {c['at'][0]} {limite},address:{c['address']}")
+    if lote:
+        hyprctl("--batch", " ; ".join(lote))
+
+
+main()

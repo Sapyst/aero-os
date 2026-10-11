@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""
+Minimiza uma janela COM ANIMAÇÃO em direção ao ícone dela no Dock (funciona em janela tiled e flutuante).
+
+Uso: hypr-minimizar            (janela ativa)
+     hypr-minimizar 0xENDEREÇO (uma janela específica)
+
+Como funciona:
+  1. Guarda como a janela estava (tiled/flutuante, posição e tamanho) em ~/.cache/aero-shell/minimizadas.json.
+  2. Se estava tiled, solta ela (setfloating) e manda ENCOLHER e ir pro ícone do Dock. Quem anima é o próprio
+     Hyprland (animação windowsMove), então fica suave.
+  3. No fim da animação, esconde a janela em special:minimized (como já era antes).
+  4. Na volta (qualquer jeito de restaurar), o hypr-minimizar-escuta devolve o estado guardado: a janela
+     CRESCE a partir do ícone e, se era tiled, volta pro tile.
+O Dock publica a posição dos ícones em $XDG_RUNTIME_DIR/aero-dock-icones.json ({endereço: [x, y]}).
+Sem ícone (app não está no Dock), vai pro meio da borda de baixo da tela.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+ICONES = f"{RUN}/aero-dock-icones.json"
+ESTADO = os.path.expanduser("~/.cache/aero-shell/minimizadas.json")
+TAM = 44          # tamanho (px) da janela quando "chega" no ícone
+DURACAO = 0.40    # segundos esperando a animação terminar (windowsMove tem 4 décimos de segundo)
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def ler_json(caminho, padrao):
+    try:
+        return json.load(open(caminho))
+    except (OSError, ValueError):
+        return padrao
+
+
+alvo = sys.argv[1] if len(sys.argv) > 1 else (json.loads(hyprctl("activewindow", "-j") or "{}").get("address"))
+if not alvo:
+    sys.exit(0)
+alvo = "0x" + alvo.removeprefix("0x")
+
+c = next((x for x in json.loads(hyprctl("clients", "-j") or "[]") if x["address"] == alvo), None)
+if c is None or c["workspace"]["name"] == "special:minimized":
+    sys.exit(0)
+
+
+def esconder():
+    hyprctl("dispatch", "movetoworkspacesilent", f"special:minimized,address:{alvo}")
+
+
+if c.get("fullscreen", 0) or not c["floating"]:
+    # tela cheia, ou janela do MOSAICO: sem animação, só esconde. (A animação solta a janela pra encolher
+    # até o Dock; regra do Aero: nada tira janela do tile. Só as flutuantes ganham a animação.)
+    esconder()
+    sys.exit(0)
+
+# 1) guarda o estado pra restaurar
+estado = ler_json(ESTADO, {})
+estado[alvo] = {"floating": c["floating"], "at": c["at"], "size": c["size"]}
+os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+json.dump(estado, open(ESTADO, "w"))
+
+# 2) pra onde ir: ícone no Dock, ou meio da borda de baixo do monitor
+destino = ler_json(ICONES, {}).get(alvo)
+if destino is None:
+    m = next((m for m in json.loads(hyprctl("monitors", "-j") or "[]") if m["id"] == c["monitor"]), None)
+    if m is None:
+        esconder()
+        sys.exit(0)
+    escala = m.get("scale", 1) or 1
+    destino = [m["x"] + m["width"] / escala / 2, m["y"] + m["height"] / escala - 40]
+x, y = int(destino[0] - TAM / 2), int(destino[1] - TAM / 2)
+
+comandos = []
+if not c["floating"]:
+    comandos.append(f"dispatch setfloating address:{alvo}")
+comandos.append(f"dispatch resizewindowpixel exact {TAM} {TAM},address:{alvo}")
+comandos.append(f"dispatch movewindowpixel exact {x} {y},address:{alvo}")
+hyprctl("--batch", " ; ".join(comandos))
+
+# 3) espera a animação e esconde
+time.sleep(DURACAO)
+esconder()

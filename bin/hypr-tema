@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# hypr-tema — tema claro/escuro, filtro de luz azul e A COR DO TEMA.
+# Configuração em ~/.config/hypr/painel.conf (o app Settings edita):
+#   TEMA_MODO=auto|claro|escuro      TEMA_CLARO=07:00  TEMA_ESCURO=18:00
+#   FILTRO_MODO=auto|ligado|desligado FILTRO_INICIO=19:00 FILTRO_FIM=07:00 FILTRO_TEMP=4500
+#   COR_CLARA=f6f6f6  COR_ESCURA=1e1e1e  COR_ALFA=0.80   cor da barra (taskbar) em cada tema
+#   COR_SINC=1   1 = todo o sistema usa a cor da barra; 0 = só a barra, o resto com as cores padrão
+#   COR_DESTAQUE=3584e4   cor de destaque (seleção, interruptores, links): vale sempre, com ou sem sincronia
+#   COR_DESTAQUE=mono     destaque MONOCROMÁTICO (doc 42): no escuro quase branco com texto escuro e sombra
+#                         preta em volta das linhas; no claro quase preto com texto claro e brilho branco
+#
+# A cor da barra é a "fonte": daqui saem as cores de
+#   barra de cima (waybar) · barras de título (hyprbars) · apps GTK4/libadwaita (Settings, menu...)
+#   · notificações (mako)
+#
+# Uso: hypr-tema           aplica agora (só o que mudou)
+#      hypr-tema --forcar  aplica tudo de novo
+#      hypr-tema --loop    fica rodando, conferindo a cada minuto (o Hyprland inicia assim);
+#                          sai sozinho quando o Hyprland que o iniciou morre (ex: travou)
+
+ESTADO="$HOME/.cache/hypr-tema"
+mkdir -p "$ESTADO"
+
+# "07:30" -> 450 (minutos desde a meia-noite). 10# = ler como decimal ("08" não é octal)
+minutos() {   # "HH:MM" -> minutos; qualquer outra coisa vale 0 (o valor vem do painel.conf: nunca vira conta)
+    [[ $1 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || { echo 0; return; }
+    echo $((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+}
+
+# dentro AGORA INICIO FIM: o horário está no intervalo? (funciona passando da meia-noite)
+dentro() {
+    local a=$1 i=$2 f=$3
+    if (( i <= f )); then (( a >= i && a < f )); else (( a >= i || a < f )); fi
+}
+
+# "f6f6f6" -> "246,246,246"   (cada par de letras é um número em hexadecimal: f6 = 246)
+rgb() { printf "%d,%d,%d" "0x${1:0:2}" "0x${1:2:2}" "0x${1:4:2}"; }
+# "0.80" -> "cc"   (opacidade de 0 a 1 vira 00 a ff, o formato que o Hyprland usa)
+alfa_hex() { awk -v a="$1" 'BEGIN { printf "%02x", int(a * 255 + 0.5) }'; }
+
+# Apps GTK3 não leem as --variáveis do libadwaita: o tema Adwaita do GTK3 usa "@define-color".
+# Fundo com transparência = o vidro do Hyprland aparece atrás (Thunar com o mesmo branco 80% da barra).
+gerar_gtk3() {
+    local tema=$1 rgbs=$2 arquivo="$HOME/.config/gtk-3.0/cores-tema.css"
+    {
+        echo "/* Gerado pelo hypr-tema (tema $tema). Importado no gtk-3.0/gtk.css. Doc 25. */"
+        echo "@define-color theme_selected_bg_color #$DEST;"
+        echo "@define-color theme_unfocused_selected_bg_color #$DEST;"
+        echo "@define-color theme_selected_fg_color #$DEST_FG;"
+        # O Adwaita do GTK3 pinta seleção e foco com o azul DELE (embutido); estas regras trocam pela nossa cor
+        echo "*:selected, *:selected:focus, row:selected, .view:selected, .view:selected:focus, iconview:selected,"
+        echo "treeview.view:selected, placessidebar row:selected { background-color: #$DEST; color: #$DEST_FG; }"
+        echo "row:selected label, row:selected image, .view:selected label { color: #$DEST_FG; }"
+        echo "selection, entry selection, textview text selection, .view selection { background-color: #$DEST; color: #$DEST_FG; }"
+        echo "entry:focus { border-color: #$DEST; box-shadow: inset 0 0 0 1px #$DEST, 0 0 0 2px $HALO; }"
+        echo "rubberband, .rubberband { border: 1px solid #$DEST; background-color: alpha(#$DEST, 0.15); }"
+        if [ "$COR_SINC" = 1 ]; then
+            # fundo de VIDRO FOSCO ("carbono"): semitransparente + o desfoque do Hyprland atrás. O texto
+            # continua 100% nítido (só o fundo é translúcido). Sem foco, o Hyprland deixa mais transparente (doc 44).
+            echo "@define-color theme_bg_color rgba($rgbs, $COR_ALFA);"
+            echo "@define-color theme_unfocused_bg_color rgba($rgbs, $COR_ALFA);"
+            echo "@define-color theme_base_color rgba($rgbs, 0.55);"
+            echo "@define-color theme_unfocused_base_color rgba($rgbs, 0.55);"
+            echo "window.background, .background { background-color: @theme_bg_color; }"
+            # barra de título SÓLIDA (janela em foco nunca transparente, doc 44); lateral transparente sobre o fundo sólido
+            echo "headerbar, .titlebar { background-color: @theme_bg_color; }"
+            echo ".sidebar, placessidebar, placessidebar list { background: transparent; }"
+        fi
+    } > "$arquivo"
+}
+
+gerar_cores() {
+    local tema=$1 hex texto hover rgbs ah
+    if [ "$tema" = escuro ]; then hex=$COR_ESCURA; texto=f0f0f0; hover="rgba(255, 255, 255, 0.10)"
+    else hex=$COR_CLARA; texto=1e1e1e; hover="rgba(0, 0, 0, 0.07)"; fi
+    rgbs=$(rgb "$hex"); ah=$(alfa_hex "$COR_ALFA")
+
+    # Cor de destaque EM USO (globais, usadas abaixo e no gerar_gtk3). "mono" = a cor do próprio tema:
+    #   escuro: quase branco, texto escuro por cima, SOMBRA preta em volta das linhas
+    #   claro:  quase preto, texto claro por cima, BRILHO branco em volta das linhas
+    if [ "$COR_DESTAQUE" = mono ]; then
+        if [ "$tema" = escuro ]; then DEST=f0f0f0; DEST_FG=1e1e1e; HALO="rgba(0,0,0,0.55)"
+        else DEST=1e1e1e; DEST_FG=f6f6f6; HALO="rgba(255,255,255,0.80)"; fi
+    else
+        DEST=$COR_DESTAQUE; DEST_FG=ffffff; HALO="rgba(0,0,0,0)"
+    fi
+    echo "$DEST" > "$ESTADO/destaque"          # o print-area lê daqui a cor da linha de seleção
+
+    # 1) Barra de cima (waybar): sempre a cor escolhida. É ela a referência.
+    cat > "$HOME/.config/waybar/cores-$tema.css" <<EOF
+/* Gerado pelo hypr-tema a partir de COR_$( [ "$tema" = escuro ] && echo ESCURA || echo CLARA ) e COR_ALFA (painel.conf). */
+@define-color fundo rgba($rgbs, $COR_ALFA);
+@define-color fundo-solido #$hex;
+@define-color texto #$texto;
+@define-color destaque #$DEST;
+@define-color destaque-texto #$DEST_FG;
+@define-color hover $hover;
+EOF
+
+    # 2) Barras de título (hyprbars) e 3) apps GTK4: a cor da barra se sincronizado; senão, o padrão
+    local barra textoh
+    if [ "$COR_SINC" = 1 ]; then
+        barra="rgba(${hex}${ah})"
+        cat > "$HOME/.config/gtk-4.0/cores-tema.css" <<EOF
+/* Gerado pelo hypr-tema: apps GTK4/libadwaita com a MESMA cor da barra de cima (COR_SINC=1), em VIDRO
+   FOSCO: fundo semitransparente + desfoque do Hyprland ("carbono"); texto sempre nítido (doc 44).
+   As --variáveis são as cores com nome do libadwaita: trocando aqui, muda em todos os apps. */
+:root {
+    --window-bg-color: rgba($rgbs, $COR_ALFA);
+    --headerbar-bg-color: rgba($rgbs, $COR_ALFA);
+    --headerbar-backdrop-color: rgba($rgbs, $COR_ALFA);
+    --sidebar-bg-color: rgba($rgbs, $COR_ALFA);
+    --sidebar-backdrop-color: rgba($rgbs, $COR_ALFA);
+    --dialog-bg-color: rgb($rgbs);   /* SÓLIDO: janelinhas DENTRO de um app não têm desfoque atrás (doc 37) */
+    --popover-bg-color: rgb($rgbs);   /* SÓLIDO: popups sem desfoque + transparência = texto "fantasma" de trás (doc 35) */
+}
+/* Janelinhas DENTRO de um app (Adw.Dialog): o "sheet" delas usa a cor de JANELA (com transparência),
+   e dentro do app não existe desfoque: a página de trás aparecia por baixo. Sólidas (doc 37). */
+floating-sheet > sheet, bottom-sheet > sheet { background-color: var(--dialog-bg-color); }
+/* Cor de destaque (Settings → Appearance → Accent color) */
+:root { --accent-bg-color: #$DEST; --accent-color: #$DEST; --accent-fg-color: #$DEST_FG; }
+/* Interruptor ligado: a bolinha na cor do TEXTO do destaque (no "mono" o fundo é branco/preto e a
+   bolinha branca sumiria). Campos em foco: contorno do destaque + halo de contraste (doc 42). */
+switch:checked > slider { background-color: var(--accent-fg-color); }
+entry:focus-within, spinbutton:focus-within { box-shadow: 0 0 0 1px var(--accent-color), 0 0 0 3px $HALO; }
+EOF
+    else
+        [ "$tema" = escuro ] && barra="rgba(242424e6)" || barra="rgba(f2f2f2e6)"
+        printf '%s\n' "/* COR_SINC=0: apps GTK4 com as cores padrão do tema (só a cor de destaque é nossa). */" \
+            ":root { --accent-bg-color: #$DEST; --accent-color: #$DEST; --accent-fg-color: #$DEST_FG; }" \
+            > "$HOME/.config/gtk-4.0/cores-tema.css"
+    fi
+    # 3b) Apps GTK3 (Thunar, pavucontrol...): mesmas cores, pelo jeito antigo do GTK3 (@define-color)
+    gerar_gtk3 "$tema" "$rgbs"
+    [ "$tema" = escuro ] && textoh="rgba(ffffffdd)" || textoh="rgba(1e1e1edd)"
+    local destaque kitty_barra
+    [ "$tema" = escuro ] && kitty_barra="rgba(1e1e1eff)" || kitty_barra="rgba(f6f6f6ff)"   # = "background" do kitty
+    if [ "$COR_DESTAQUE" = mono ]; then
+        [ "$tema" = escuro ] && destaque="rgba(3a3a3aff)" || destaque="rgba(d4d4d4ff)"
+    else
+        [ "$tema" = escuro ] && destaque="rgba(1c2a3ce6)" || destaque="rgba(dce8f8e6)"
+    fi
+    # Botões da barra de título: SÍMBOLOS monocromáticos na cor do texto (doc 42), em vez de bolinhas
+    #   fonte Aero Symbols (doc 49): U+F8F0 fechar · U+F8F1 maximizar/restaurar · U+F8F2 minimizar · U+F8F3 sempre visível
+    #   (os 4 com a mesma caixa e centralizados na linha; tamanho 22 = fonte de 13,6 px)
+    local icone; [ "$tema" = escuro ] && icone="rgba(f0f0f0ff)" || icone="rgba(1e1e1eff)"
+    local B="$HOME/.local/bin/hypr-barra"
+    # O Hyprland só conhece as fontes que existiam quando ELE começou. Se a Aero Symbols é mais nova que
+    # este Hyprland, ela apareceria como quadradinhos: usa os símbolos comuns até o próximo login (doc 49).
+    local s_fechar s_max s_min s_vis tam fonte_sym="$HOME/.local/share/fonts/AeroSymbols.ttf" hpid
+    hpid=$(pgrep -xo Hyprland || pgrep -xo hyprland)
+    if [ -f "$fonte_sym" ] && [ -n "$hpid" ] && [ "$(stat -c %Y "/proc/$hpid")" -gt "$(stat -c %Y "$fonte_sym")" ]; then
+        s_fechar=""; s_max=""; s_min=""; s_vis=""; tam=22
+    else
+        s_fechar="✖"; s_max="▲"; s_min="▼"; s_vis="●"; tam=15
+    fi
+    cat > "$HOME/.config/hypr/tema-atual.conf" <<EOF
+# Gerado pelo hypr-tema (tema $tema). Não editar: é reescrito a cada troca de tema/cor.
+plugin {
+    hyprbars {
+        bar_color = $barra
+        col.text = $textoh
+        hyprbars-button = rgba(00000000), $tam, $s_fechar, $B fechar, $icone
+        hyprbars-button = rgba(00000000), $tam, $s_max, $B maximizar, $icone
+        hyprbars-button = rgba(00000000), $tam, $s_min, $B minimizar, $icone
+        hyprbars-button = rgba(00000000), $tam, $s_vis, $B visivel, $icone
+    }
+}
+# Terminal (kitty) e Thunar: barra SÓLIDA na cor do tema, pra barra e janela virarem uma peça só
+# (semitransparente, dava pra ler o texto da janela de trás através dela)
+windowrule = hyprbars:bar_color $kitty_barra, match:class ^(kitty|[Tt]hunar)$
+# Janelas "sempre visível": barra de título com outro tom, pra saber que está ligado
+windowrule = hyprbars:bar_color $destaque, match:tag sempre-visivel
+EOF
+    # Os botões da barra só trocam de cor recarregando o Hyprland (só acontece quando o tema/cor muda)
+    if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
+        hyprctl reload >/dev/null
+    fi
+
+    # 4) Notificações (mako): modo padrão = escuro, modo "claro" = claro
+    local fundo_escuro fundo_claro
+    if [ "$COR_SINC" = 1 ]; then
+        fundo_escuro="#${COR_ESCURA}${ah}"; fundo_claro="#${COR_CLARA}${ah}"
+    else
+        fundo_escuro="#1e1e1ecc"; fundo_claro="#f6f6f6cc"
+    fi
+    cat > "$HOME/.config/mako/config" <<EOF
+# Gerado pelo hypr-tema (cores do tema). O modo "claro" é ativado com: makoctl mode -s claro
+anchor=top-right
+margin=12
+padding=12,16
+width=320
+border-radius=22
+border-size=0
+background-color=$fundo_escuro
+text-color=#f0f0f0
+font=Inter 11
+default-timeout=4000
+# Histórico (central de notificações, doc 25): guarda as 50 últimas
+max-history=50
+# Clique esquerdo = abre o que a notificação oferece (ex: a conversa no Discord); direito = fecha
+on-button-left=invoke-default-action
+on-button-right=dismiss
+
+# Urgentes (bateria acabando...): ficam até você fechar, com uma faixa vermelha
+[urgency=critical]
+default-timeout=0
+border-size=2
+border-color=#e01b24
+
+# "Não perturbe": esconde tudo... menos as urgentes
+[mode=dnd]
+invisible=1
+[mode=dnd urgency=critical]
+invisible=0
+
+[app-name=teclado]
+default-timeout=1500
+
+[mode=claro]
+background-color=$fundo_claro
+text-color=#1e1e1e
+EOF
+    makoctl reload >/dev/null 2>&1
+    pkill -SIGUSR2 -x waybar    # SIGUSR2 = "waybar, recarregue o visual"
+}
+
+aplicar_tema() {
+    local tema=$1 mako
+    # ORDEM IMPORTA (doc 42): primeiro escrever TODAS as cores novas, só depois avisar os apps da troca
+    # (gsettings). Os apps GTK recarregam o visual no instante do aviso; antes, eles liam as cores VELHAS
+    # (o Thunar trocava pro claro com o menu e a barra de baixo pretos).
+    # Super Menu e barra: trocam o arquivo de cores (ln -sf = atalho apontando pro arquivo certo)
+    ln -sf "style-$tema.css" "$HOME/.config/wofi/style.css"
+    ln -sf "cores-$tema.css" "$HOME/.config/waybar/cores.css"
+    gerar_cores "$tema"
+    # Firefox (textfox): as duas paletas do sistema; claro/escuro troca sozinho, cor nova vale ao reabrir
+    [ -x "$HOME/.local/bin/firefox-tema" ] && "$HOME/.local/bin/firefox-tema" >/dev/null 2>&1 &
+    # Tema do sistema: ArchAeroX16 (claro) / ArchAeroX16-Dark (escuro), em ~/.local/share/themes (doc 46).
+    local nome escuro_ini
+    if [ "$tema" = escuro ]; then
+        nome=ArchAeroX16-Dark; escuro_ini=true
+        gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+        mako=default
+    else
+        nome=ArchAeroX16; escuro_ini=false
+        gsettings set org.gnome.desktop.interface color-scheme prefer-light
+        mako=claro
+    fi
+    gsettings set org.gnome.desktop.interface gtk-theme "$nome"
+    # o mesmo nome nos arquivos que alguns programas leem em vez do gsettings (GTK2, GTK3/4 sem sessão, fastfetch...)
+    for v in 3.0 4.0; do
+        mkdir -p "$HOME/.config/gtk-$v"
+        printf '[Settings]\ngtk-theme-name=%s\ngtk-application-prefer-dark-theme=%s\n' "$nome" "$escuro_ini" \
+            > "$HOME/.config/gtk-$v/settings.ini"
+    done
+    printf '# Gerado pelo hypr-tema (doc 46)\ngtk-theme-name="%s"\n' "$nome" > "$HOME/.gtkrc-2.0"
+    # -a/-r (acrescentar/tirar) em vez de -s (substituir tudo): assim o "dnd" (Não perturbe) sobrevive
+    if [ "$mako" = claro ]; then makoctl mode -a claro >/dev/null 2>&1
+    else makoctl mode -r claro >/dev/null 2>&1; fi
+    echo "$tema" > "$ESTADO/tema"
+    echo "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE" > "$ESTADO/cores"
+}
+
+aplicar_filtro() {
+    local temp=$1
+    # hyprsunset é o filtro de luz azul do Hyprland; precisa estar rodando pra receber comandos
+    pgrep -x hyprsunset >/dev/null || { hyprctl dispatch exec hyprsunset >/dev/null; sleep 1; }
+    if [ "$temp" = 0 ]; then
+        hyprctl hyprsunset identity >/dev/null          # cores normais
+    else
+        hyprctl hyprsunset temperature "$temp" >/dev/null  # menos azul (K = kelvin; menor = mais quente)
+    fi
+    echo "$temp" > "$ESTADO/filtro"
+}
+
+aplicar() {
+    # Valores padrão; o painel.conf sobrescreve
+    TEMA_MODO=auto; TEMA_CLARO=07:00; TEMA_ESCURO=18:00
+    FILTRO_MODO=auto; FILTRO_INICIO=19:00; FILTRO_FIM=07:00; FILTRO_TEMP=4500
+    COR_CLARA=f6f6f6; COR_ESCURA=1e1e1e; COR_ALFA=0.80; COR_SINC=1; COR_DESTAQUE=3584e4
+    . "$HOME/.local/share/aero-shell/painel.sh" && ler_painel   # lê sem executar (painel.sh)
+
+    local agora tema filtro
+    agora=$(minutos "$(date +%H:%M)")
+
+    case "$TEMA_MODO" in
+        claro|escuro) tema=$TEMA_MODO ;;
+        *) dentro "$agora" "$(minutos "$TEMA_CLARO")" "$(minutos "$TEMA_ESCURO")" && tema=claro || tema=escuro ;;
+    esac
+    case "$FILTRO_MODO" in
+        ligado) filtro=$FILTRO_TEMP ;;
+        desligado) filtro=0 ;;
+        *) dentro "$agora" "$(minutos "$FILTRO_INICIO")" "$(minutos "$FILTRO_FIM")" && filtro=$FILTRO_TEMP || filtro=0 ;;
+    esac
+
+    if [ "$1" = --forcar ] || [ "$tema" != "$(cat "$ESTADO/tema" 2>/dev/null)" ] ||
+       [ "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE" != "$(cat "$ESTADO/cores" 2>/dev/null)" ]; then
+        aplicar_tema "$tema"
+    fi
+    if [ "$1" = --forcar ] || [ "$filtro" != "$(cat "$ESTADO/filtro" 2>/dev/null)" ]; then aplicar_filtro "$filtro"; fi
+}
+
+# O Hyprland que me iniciou ainda está vivo?
+# Cada sessão do Hyprland tem a sua pasta: $XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/
+# (a "assinatura" é herdada por tudo que o Hyprland inicia). Lá, a 1ª linha do hyprland.lock é o
+# PID do Hyprland: é assim que o próprio "hyprctl instances" sabe quais sessões estão vivas.
+# Não basta ver se o .socket.sock existe: quando o Hyprland TRAVA (crash), a pasta e o socket
+# ficam para trás. E um "hyprctl reload" não muda o PID, então recarregar a config não engana o teste.
+# /proc/PID/comm = o nome do programa com esse PID (confere que o número não foi reaproveitado).
+# grep -i = tanto faz maiúscula ou minúscula: digitar "hyprland" no TTY abre o mesmo programa
+# (é um atalho pro Hyprland), só que aí o nome do processo fica "hyprland", tudo minúsculo.
+hyprland_vivo() {
+    [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || return 0     # iniciado fora do Hyprland: não tem o que conferir
+    local pid
+    pid=$(head -n1 "${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hyprland.lock" 2>/dev/null)
+    [ -n "$pid" ] && grep -qix hyprland "/proc/$pid/comm" 2>/dev/null
+}
+
+if [ "$1" = --loop ]; then
+    aplicar --forcar
+    # A cada minuto, ANTES de aplicar: se o meu Hyprland morreu (travou e você entrou de novo), saio.
+    # Sem isso, esta cópia "fantasma" rodava para sempre ao lado da cópia da sessão nova, e podia
+    # anotar no ~/.cache/hypr-tema uma troca (filtro, tema) que nunca chegou à sessão nova.
+    # O teste vem DEPOIS do sleep de propósito: no login, o hyprland.lock só aparece uns 2 segundos
+    # depois de o Hyprland iniciar os exec-once (testar logo no começo daria "morto" por engano).
+    while sleep 60; do
+        hyprland_vivo || exit 0
+        aplicar
+    done
+else
+    aplicar "$1"
+fi

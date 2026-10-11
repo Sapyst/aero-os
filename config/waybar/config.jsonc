@@ -1,0 +1,133 @@
+// Barra superior (waybar), feita para o Hyprland. Visual em style.css; cores em cores-*.css.
+// Documentação dos módulos: man 5 waybar   (ex: man 5 waybar-clock)
+{
+    "layer": "top",
+    "position": "top",
+    "height": 34,
+    "margin-top": 8,
+    "margin-left": 12,
+    "margin-right": 12,
+    "spacing": 6,
+
+    "modules-left": ["hyprland/workspaces", "custom/minimizados"],
+    "modules-center": ["clock"],
+    "modules-right": ["hyprland/language", "pulseaudio", "network", "bluetooth", "battery", "custom/notificacoes", "custom/settings", "custom/espaco-bandeja", "custom/central"],
+
+    // Áreas de trabalho como pontinhos (doc 25): sempre as 5, a ativa vira uma pílula.
+    // Clique = ir pra ela; rolar o mouse em cima = anterior/próxima.
+    "hyprland/workspaces": {
+        "format": "{icon}",
+        "format-icons": { "default": "" },
+        // lista explícita: nesta versão da waybar, "*": 5 criava as áreas 6 a 10
+        "persistent-workspaces": { "1": [], "2": [], "3": [], "4": [], "5": [] },
+        "sort-by": "number",
+        "on-click": "activate",
+        "on-scroll-up": "hyprctl dispatch workspace r-1",
+        "on-scroll-down": "hyprctl dispatch workspace r+1"
+    },
+
+    // Contador de janelas minimizadas (some quando é 0). Clique = escolher qual restaurar.
+    "custom/minimizados": {
+        "exec": "~/.local/bin/hypr-minimizados --contar",
+        "return-type": "json",
+        "interval": 2,
+        "on-click": "~/.local/bin/hypr-minimizados"
+    },
+
+    "clock": {
+        "format": "{:%a %d %b   %H:%M}",
+        "tooltip-format": "<tt>{calendar}</tt>",
+        "on-click": "~/.local/bin/som notificacoes abrir"    // como no Windows/macOS: relógio abre as notificações
+    },
+
+
+    // Layout do teclado (br/us). Clique = trocar (igual Super+Espaço)
+    "hyprland/language": {
+        "format": "{short}",
+        "on-click": "hyprctl switchxkblayout all next"
+    },
+
+    // Sininho: clique = central de notificações (últimas, Clear all, Do not disturb). Doc 25.
+    "custom/notificacoes": {
+        "exec": "~/.local/bin/notificacoes-estado",
+        "return-type": "json",
+        "interval": "once",
+        "signal": 10,
+        "tooltip": false,
+        "on-click": "~/.local/bin/som notificacoes abrir"
+    },
+
+    "pulseaudio": {
+        "format": "{icon}  {volume}%",
+        "format-muted": "  muted",
+        "format-icons": { "default": ["\uf026", "\uf027", "\uf028"] },
+        // clique = janelinha com o volume; direito = + saídas, microfones e "Sound settings" (doc 23)
+        "on-click": "~/.local/bin/som popup simples",
+        "on-click-right": "~/.local/bin/som popup completo",
+        "on-click-middle": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+        "tooltip": false,
+        "scroll-step": 5
+    },
+
+    "network": {
+        "format-wifi": "  {essid}",
+        "format-ethernet": "  Wired",
+        "format-disconnected": "  Offline",
+        "tooltip-format": "{ifname}: {ipaddr}",
+        // clique = central rápida (doc 30); direito = página do Settings
+        "on-click": "~/.local/bin/som central abrir",
+        "on-click-right": "CONFIG_ABA=rede ~/.local/bin/configuracoes"
+    },
+
+    "bluetooth": {
+        "format": "\uf293",
+        "format-disabled": "\uf293",
+        "format-off": "\uf293",
+        "format-connected": "\uf293  {num_connections}",
+        // passar o mouse: aparelhos conectados e a bateria deles (doc 25)
+        "tooltip-format": "Bluetooth: {status}",
+        "tooltip-format-connected": "{device_enumerate}",
+        "tooltip-format-enumerate-connected": "{device_alias}",
+        "tooltip-format-enumerate-connected-battery": "{device_alias}  ·  {device_battery_percentage}%",
+        // clique = central rápida (doc 30); direito = página do Settings
+        "on-click": "~/.local/bin/som central abrir",
+        "on-click-right": "CONFIG_ABA=bluetooth ~/.local/bin/configuracoes"
+    },
+
+    "battery": {
+        "format": "{icon}  {capacity}%",
+        "format-charging": "  {capacity}%",
+        "format-icons": ["\uf244", "\uf243", "\uf242", "\uf241", "\uf240"],
+        "states": { "warning": 25, "critical": 12 },
+        // passar o mouse: quanto tempo falta e quantos watts está gastando; clique = Settings → Power
+        "tooltip-format": "{timeTo}  ·  {power:.1f} W",
+        // clique = central rápida (doc 30); direito = página do Settings
+        "on-click": "~/.local/bin/som central abrir",
+        "on-click-right": "CONFIG_ABA=energia ~/.local/bin/configuracoes"
+    },
+
+
+    // Espaço reservado pra bandeja (ícones dos apps). Quem desenha os ícones é ~/.local/bin/bandeja,
+    // por cima deste espaço; ela escreve quantos ícones há e manda o sinal 9 pra waybar reler.
+    // Central rápida (doc 30): SEMPRE no canto extremo direito. A bandeja fica logo à esquerda dela
+    // (bandeja.py desconta a largura deste botão: 40 px, do #custom-central no style.css).
+    "custom/central": {
+        "format": "\uf1de",
+        "tooltip": false,
+        "on-click": "~/.local/bin/som central abrir",
+        "on-click-right": "~/.local/bin/configuracoes"
+    },
+
+    "custom/espaco-bandeja": {
+        "exec": "cat ~/.cache/aero-shell/bandeja.json 2>/dev/null",
+        "return-type": "json",
+        "interval": "once",
+        "signal": 9
+    },
+
+    "custom/settings": {
+        "format": "\uf013",
+        "tooltip-format": "Settings",
+        "on-click": "~/.local/bin/configuracoes"
+    }
+}

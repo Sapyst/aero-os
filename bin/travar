@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Trava a tela (Super+L). Doc 25.
+if command -v hyprlock >/dev/null; then
+    pidof hyprlock >/dev/null || exec hyprlock     # já travada? não abre outra
+else
+    notify-send -a Lock -i system-lock-screen-symbolic "Screen lock not installed" \
+        "Run in a terminal: sudo pacman -S hyprlock hypridle"
+fi

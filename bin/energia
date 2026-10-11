@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Pergunta antes de sair/reiniciar/desligar. Código: ~/.local/share/aero-shell/energia.py (doc 23)
+exec python3 "$HOME/.local/share/aero-shell/energia.py" "$@"

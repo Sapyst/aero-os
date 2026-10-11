@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Gerenciador de arquivos (EZ File Manager, doc 43). O app mora em ~/.local/share/ez-fm (cópia nossa,
+# revisada e com correções de segurança). Uso: ez-fm [pasta]   (sem pasta = a sua pasta pessoal)
+# GDK_WAYLAND_DISABLE não afeta (Electron não é GTK4); o run-electron.sh liga o modo Wayland.
+exec "$HOME/.local/share/ez-fm/scripts/run-electron.sh" "$@"

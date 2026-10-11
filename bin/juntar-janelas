@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# juntar-janelas [ÁREA] — manda TODAS as janelas (de todas as áreas de trabalho) para uma só.
+# Sem argumento usa a área 1. Janelas minimizadas (special:*) ficam como estão.
+# Atalho: Super+Shift+A (junta na área 1).
+set -u
+destino="${1:-1}"
+case "$destino" in ''|*[!0-9]*) echo "uso: juntar-janelas [número da área]" >&2; exit 2 ;; esac
+hyprctl clients -j | python3 -I -c '
+import json, sys
+for c in json.load(sys.stdin):
+    if c["mapped"] and c["workspace"]["id"] > 0 and str(c["workspace"]["id"]) != sys.argv[1]:
+        print(c["address"])' "$destino" |
+while read -r endereco; do
+    hyprctl dispatch movetoworkspacesilent "$destino,address:$endereco" >/dev/null
+done
+hyprctl dispatch workspace "$destino" >/dev/null

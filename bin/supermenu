@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Super Menu: abre/fecha. "--daemon" = só carregar em segundo plano (no login).
+# LD_PRELOAD: a biblioteca de "camadas" (layer-shell) precisa ser carregada antes do GTK.
+LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 "$HOME/.local/share/aero-shell/supermenu.py" "$@"

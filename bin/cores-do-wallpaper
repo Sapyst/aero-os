@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+cores-do-wallpaper — a cor da barra e do sistema combinando com o papel de parede (doc 21).
+
+É a opção Settings → Appearance → Theme color → "Wallpaper color scheme" (chave WALL_CORES no
+painel.conf). DESLIGADA por padrão: o Aero gosta do branco 80% dele (COR_CLARA=f6f6f6).
+
+Uso:
+  cores-do-wallpaper --ligar             guarda as cores do Aero e passa a usar as do wallpaper
+  cores-do-wallpaper --desligar          devolve as cores guardadas
+  cores-do-wallpaper --aplicar ARQUIVO   recalcula (só faz algo se a opção estiver ligada);
+                                         o papel-de-parede chama isto a cada troca de wallpaper
+  cores-do-wallpaper --calcular ARQUIVO  só mostra as cores que sairiam (pra testar)
+
+Como escolhemos as cores:
+  1) a imagem é reduzida pra 64x64 (4096 pixels bastam pra saber a "cara" dela);
+  2) cada pixel vira matiz/saturação/luminosidade (HLS). Matiz = "qual cor" (0-360°: vermelho,
+     amarelo, verde, azul...). Contamos qual matiz aparece mais, dando mais peso aos pixels
+     coloridos (cinza não diz nada sobre a cor);
+  3) com essa matiz montamos DUAS cores suaves: uma bem clara (luminosidade 94%) pro tema claro e
+     uma bem escura (12%) pro escuro. Tem que ser clara/escura assim porque o texto do sistema é
+     sempre preto no tema claro e branco no escuro (o hypr-tema não muda a cor do texto).
+     Wallpaper em preto e branco = cores neutras (cinzas).
+  A transparência (COR_ALFA, 0.80) não muda.
+"""
+import colorsys
+import math
+import os
+import re
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf  # noqa: E402
+
+PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
+CONF_HYPRPAPER = os.path.expanduser("~/.config/hypr/hyprpaper.conf")
+PADRAO = {"COR_CLARA": "f6f6f6", "COR_ESCURA": "1e1e1e"}
+
+
+def ler_painel():
+    valores = {}
+    try:
+        with open(PAINEL) as f:
+            for linha in f:
+                linha = linha.strip()
+                if "=" in linha and not linha.startswith("#"):
+                    k, v = linha.split("=", 1)
+                    valores[k] = v.strip('"')
+    except FileNotFoundError:
+        pass
+    return valores
+
+
+def atualizar_painel(**chaves):
+    """Muda SÓ as chaves pedidas e mantém o resto (mesma ideia do comum.py do Settings)."""
+    try:
+        with open(PAINEL) as f:
+            linhas = f.read().splitlines()
+    except FileNotFoundError:
+        linhas = []
+    faltando = dict(chaves)
+    for i, linha in enumerate(linhas):
+        k = linha.split("=", 1)[0].strip()
+        if not linha.startswith("#") and k in faltando:
+            linhas[i] = f"{k}={faltando.pop(k)}"
+    linhas += [f"{k}={v}" for k, v in faltando.items()]
+    with open(PAINEL + ".tmp", "w") as f:
+        f.write("\n".join(linhas) + "\n")
+    os.replace(PAINEL + ".tmp", PAINEL)
+
+
+def wallpaper_atual():
+    try:
+        with open(CONF_HYPRPAPER) as f:
+            m = re.search(r"^\s*path\s*=\s*(.+)$", f.read(), flags=re.M)
+            return m.group(1).strip() if m else None
+    except OSError:
+        return None
+
+
+def hexa(r, g, b):
+    return "".join(f"{round(max(0, min(1, c)) * 255):02x}" for c in (r, g, b))
+
+
+def calcular(arquivo):
+    """Devolve (cor_clara, cor_escura) em hexadecimal, sem o #."""
+    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(arquivo, 64, 64, True)
+    dados, canais, passo = pb.get_pixels(), pb.get_n_channels(), pb.get_rowstride()
+    # 36 "gavetas" de matiz (10° cada): somamos o "peso de cor" de cada pixel na gaveta dele
+    gavetas = [0.0] * 36
+    sx, sy = [0.0] * 36, [0.0] * 36       # pra fazer a média da matiz dentro da gaveta (em círculo)
+    sat_soma = [0.0] * 36
+    total = 0.0
+    for y in range(pb.get_height()):
+        for x in range(pb.get_width()):
+            i = y * passo + x * canais
+            r, g, b = dados[i] / 255, dados[i + 1] / 255, dados[i + 2] / 255
+            h, l, s = colorsys.rgb_to_hls(r, g, b)
+            # "croma": quanto o pixel é colorido de verdade (cinza, preto e branco = 0)
+            peso = s * (1 - abs(2 * l - 1))
+            total += 1
+            if peso < 0.04:
+                continue
+            k = int(h * 36) % 36
+            gavetas[k] += peso
+            sx[k] += peso * math.cos(h * 2 * math.pi)
+            sy[k] += peso * math.sin(h * 2 * math.pi)
+            sat_soma[k] += peso * s
+    k = max(range(36), key=lambda j: gavetas[j])
+    colorido = gavetas[k] / max(total, 1)          # que fração da imagem tem essa cor
+    if gavetas[k] == 0 or colorido < 0.01:
+        h, s = 0.0, 0.0                            # imagem sem cor (preto e branco): cinzas neutros
+    else:
+        h = (math.atan2(sy[k], sx[k]) / (2 * math.pi)) % 1
+        s = sat_soma[k] / gavetas[k]
+    clara = colorsys.hls_to_rgb(h, 0.94, min(s, 0.6) * 0.55)    # pastel bem clarinho
+    escura = colorsys.hls_to_rgb(h, 0.12, min(s, 0.6) * 0.45)   # quase preto, puxado pra cor
+    return hexa(*clara), hexa(*escura)
+
+
+def aplicar_tema():
+    subprocess.run([os.path.expanduser("~/.local/bin/hypr-tema"), "--forcar"])
+
+
+def main():
+    acao = sys.argv[1] if len(sys.argv) > 1 else ""
+    painel = ler_painel()
+    if acao == "--calcular" and len(sys.argv) > 2:
+        print(*calcular(sys.argv[2]))
+    elif acao == "--ligar":
+        if painel.get("WALL_CORES") != "1":
+            # Guarda as cores escolhidas pelo Aero, pra devolver quando desligar
+            atualizar_painel(COR_CLARA_MANUAL=painel.get("COR_CLARA", PADRAO["COR_CLARA"]),
+                             COR_ESCURA_MANUAL=painel.get("COR_ESCURA", PADRAO["COR_ESCURA"]))
+        atualizar_painel(WALL_CORES="1")
+        arquivo = wallpaper_atual()
+        if arquivo and os.path.isfile(arquivo):
+            clara, escura = calcular(arquivo)
+            atualizar_painel(COR_CLARA=clara, COR_ESCURA=escura)
+            print("cores do wallpaper:", clara, escura)
+        aplicar_tema()
+    elif acao == "--desligar":
+        atualizar_painel(WALL_CORES="0",
+                         COR_CLARA=painel.get("COR_CLARA_MANUAL", painel.get("COR_CLARA", PADRAO["COR_CLARA"])),
+                         COR_ESCURA=painel.get("COR_ESCURA_MANUAL", painel.get("COR_ESCURA", PADRAO["COR_ESCURA"])))
+        aplicar_tema()
+    elif acao == "--aplicar" and len(sys.argv) > 2:
+        if painel.get("WALL_CORES") != "1":
+            return                                   # opção desligada: não mexe em nada
+        clara, escura = calcular(sys.argv[2])
+        atualizar_painel(COR_CLARA=clara, COR_ESCURA=escura)
+        print("cores do wallpaper:", clara, escura)
+        aplicar_tema()
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

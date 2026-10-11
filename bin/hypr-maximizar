@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""
+hypr-maximizar [ENDEREÇO] — maximizar/restaurar NATIVO do Hyprland ("fullscreen 1"): a janela ocupa a área útil
+e continua do MOSAICO (regra do Aero, 10/10/2026: nenhum botão tira janela do tile; só Super+V).
+
+Antes (doc 29) este script soltava a janela e a redimensionava "na mão". Isso quebrava o mosaico: a janela
+voltava flutuante. Agora é só o dispatcher nativo, na janela pedida (foca antes: o "fullscreen" age na ativa).
+Sem argumento age na janela ativa. Quem chama: a bolinha verde da barra (hypr-barra), o duplo clique na barra,
+os botões dos próprios apps (hypr-botoes), Super+↑, o menu de janela (som.py) e o Settings (comum.py).
+"""
+import json
+import subprocess
+import sys
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+alvo = sys.argv[1] if len(sys.argv) > 1 else json.loads(hyprctl("activewindow", "-j") or "{}").get("address")
+if not alvo:
+    sys.exit(0)
+c = next((c for c in json.loads(hyprctl("clients", "-j") or "[]") if c["address"] == alvo), None)
+if c is None:
+    sys.exit(0)
+if c.get("fullscreen", 0) == 2:                      # tela cheia de verdade (jogo, vídeo): só desfaz
+    hyprctl("--batch", f"dispatch focuswindow address:{alvo} ; dispatch fullscreenstate 0 0")
+else:                                                # alterna o maximizar nativo (modo 1)
+    hyprctl("--batch", f"dispatch focuswindow address:{alvo} ; dispatch fullscreen 1")

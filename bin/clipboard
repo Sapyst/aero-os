@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Histórico da área de transferência (Ctrl+Shift+V). Código: ~/.local/share/aero-shell/clipboard.py (doc 22)
+# Uso: clipboard           abre/fecha a janelinha
+#      clipboard --daemon  só carrega em segundo plano (o Hyprland faz isso ao ligar)
+if [ "$1" != --daemon ]; then
+    # Caminho rápido: pede pelo D-Bus pro programa que já está rodando executar a ação "alternar"
+    gdbus call --session --dest com.aero.Clipboard --object-path /com/aero/Clipboard \
+        --method org.gtk.Actions.Activate alternar '[]' '{}' >/dev/null 2>&1 && exit 0
+fi
+# Não estava rodando (ou --daemon): inicia o programa
+exec python3 "$HOME/.local/share/aero-shell/clipboard.py" "$@"

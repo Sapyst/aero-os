@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Dock na base da tela (doc 24). Código: ~/.local/share/aero-shell/dock.py
+# O Dock é parte do sistema: sobe sozinho no login (exec-once) e NÃO pode ser desligado.
+# Uso: dock               inicia (se já estiver rodando, não faz nada)
+#      dock --reiniciar   fecha e abre de novo (pra pegar uma mudança no código)
+# Se o Dock fechar (erro, ou alguém matou o processo), este lançador abre de novo em 1 segundo.
+# O registro (o que aconteceu, erros) fica em ~/.cache/aero-shell/dock.log
+mkdir -p "$HOME/.cache/aero-shell"
+LOG="$HOME/.cache/aero-shell/dock.log"
+# 9>&- = o Python não herda a trava (ela é só do laço)
+rodar() { LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$HOME/.local/share/aero-shell/dock.py" "$@" >> "$LOG" 2>&1 9>&-; }
+
+if [ $# -gt 0 ]; then
+    rodar "$@"            # comando pro Dock que já está aberto (o GTK entrega pra ele)
+    exit 0
+fi
+# Este vigia pertence a UMA sessão do Hyprland: a que estava aberta quando ele nasceu. Cada sessão
+# tem a sua pasta em /run/user/1000/hypr/, com o nome da "assinatura" dela (HYPRLAND_INSTANCE_SIGNATURE).
+# Lá dentro, o arquivo hyprland.lock guarda o PID (número do processo) do Hyprland.
+SESSAO="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/$HYPRLAND_INSTANCE_SIGNATURE"
+if [ -z "$HYPRLAND_INSTANCE_SIGNATURE" ] || [ ! -d "$SESSAO" ]; then
+    echo "$(date '+%F %T') fora do Hyprland: o vigia do Dock não começa" >> "$LOG"
+    exit 1
+fi
+# Só um "vigia" (este laço) por SESSÃO: uma trava (flock) num arquivo dentro da pasta da sessão.
+# Se outro vigia desta sessão já tem a trava, sai. (Antes a trava era uma só pra todas as sessões:
+# um vigia "fantasma" de uma sessão que caiu podia segurar a trava e deixar o login novo sem Dock.)
+exec 9> "$SESSAO/aero-dock.trava"
+flock -n 9 || exit 0
+
+# O Hyprland de uma sessão ainda está vivo? ($1 = a pasta da sessão; sem nada = a DESTA sessão.)
+# Lê o PID dele no hyprland.lock e olha o processo em /proc/PID/stat ("PID (nome) estado ..."):
+# tem que se chamar Hyprland e não ser zumbi (Z = já morreu).
+# ${nome,,} = o nome em minúsculas (ele pode ter sido aberto como "Hyprland" ou "hyprland").
+# Pegadinha: não dá pra só ver se o .socket.sock existe. Quando o Hyprland CAI, o arquivo fica lá.
+hyprland_vivo() {
+    local pasta="${1:-$SESSAO}" pid nome estado
+    read -r pid 2>/dev/null < "$pasta/hyprland.lock" || return 1
+    read -r _ nome estado _ 2>/dev/null < "/proc/$pid/stat" || return 1
+    [ "${nome,,}" = "(hyprland)" ] && [ "$estado" != "Z" ]
+}
+# Já tem um Dock "de verdade" aberto? Pega os "python3 .../dock.py", lê a assinatura no ambiente de
+# cada um (/proc/PID/environ) e só conta o Dock se o Hyprland DELE ainda está vivo:
+# - Dock "fantasma" de uma sessão que caiu: não conta (abrimos um novo).
+# - Dock desta sessão, ou de outra sessão VIVA (ex: um Hyprland aberto dentro de outro, pra testes):
+#   conta. Ele segura o nome com.aero.Dock, então um Dock novo não abriria; tentar de novo a cada
+#   segundo só gastaria CPU e encheria o log.
+dock_rodando() {
+    local pid assinatura
+    for pid in $(ps -eo pid=,args= | awk '$2=="python3" && $3 ~ /dock\.py$/ {print $1}'); do
+        assinatura=$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | sed -n 's/^HYPRLAND_INSTANCE_SIGNATURE=//p')
+        [ -n "$assinatura" ] && hyprland_vivo "${SESSAO%/*}/$assinatura" && return 0
+    done
+    return 1
+}
+while true; do
+    if dock_rodando; then           # um Dock aberto por fora deste laço: só espera ele fechar
+        sleep 2
+    else
+        rodar
+        sleep 1
+        hyprland_vivo && echo "$(date '+%F %T') o Dock fechou; abrindo de novo" >> "$LOG"
+    fi
+    # O Hyprland desta sessão acabou (caiu, ou você saiu)? Então o vigia para também: abrir o Dock
+    # agora seria abrir numa sessão morta. O próximo login (exec-once) começa um vigia novo.
+    if ! hyprland_vivo; then
+        echo "$(date '+%F %T') o Hyprland desta sessão acabou; o vigia do Dock parou" >> "$LOG"
+        exit 0
+    fi
+done

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+clipboard-guardar — guarda no histórico tudo que é copiado (texto, imagem, arquivos...).
+
+Quem chama: o Hyprland, ao ligar, roda
+    wl-paste --watch ~/.local/bin/clipboard-guardar
+O "wl-paste --watch" fica de olho na área de transferência e roda este script A CADA cópia.
+
+Como funciona:
+- Quem copia "oferece" o conteúdo em um ou mais formatos (tipos MIME): text/plain, image/png,
+  text/uri-list (arquivos copiados no Thunar)... `wl-paste --list-types` mostra a lista.
+- Escolhemos o formato mais útil, salvamos o conteúdo num arquivo e anotamos no índice.
+- O histórico mora em ~/.local/share/aero-clipboard/ (índice.json + um arquivo por item).
+- Máximo de itens: CLIP_MAX no painel.conf (padrão 50). Os mais antigos saem.
+- Copiou de novo algo que já está no histórico: ele só volta pro topo (não duplica).
+- Senhas copiadas de gerenciadores de senha NÃO são guardadas (eles marcam com um tipo especial).
+"""
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+PASTA = os.path.expanduser("~/.local/share/aero-clipboard")
+INDICE = os.path.join(PASTA, "indice.json")
+PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
+LIMITE_BYTES = 30 * 1024 * 1024     # itens maiores que 30 MB não são guardados
+
+# Ordem de preferência dos formatos (o primeiro que o app oferecer, ganha)
+PREFERIDOS = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "image/svg+xml",
+              "text/uri-list",
+              "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"]
+# Gerenciadores de senha (KeePassXC, Bitwarden...) marcam a cópia com este tipo: não guardar
+SEGREDO = {"x-kde-passwordManagerHint"}
+
+
+def ler_max():
+    try:
+        with open(PAINEL) as f:
+            for linha in f:
+                if linha.startswith("CLIP_MAX="):
+                    return max(5, int(linha.split("=", 1)[1].strip().strip('"')))
+    except (OSError, ValueError):
+        pass
+    return 50
+
+
+def main():
+    sys.stdin.buffer.read()       # o wl-paste manda o conteúdo aqui; lemos pra ele não travar
+    tipos = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True).stdout.split()
+    if not tipos or SEGREDO & set(tipos):
+        return
+    tipo = next((t for t in PREFERIDOS if t in tipos), None)
+    if tipo is None:
+        tipo = next((t for t in tipos if "/" in t), None)   # qualquer outro formato com nome MIME
+        if tipo is None:
+            return
+    dados = subprocess.run(["wl-paste", "--no-newline", "--type", tipo], capture_output=True).stdout
+    if not dados or len(dados) > LIMITE_BYTES or (tipo.startswith("text") and not dados.strip()):
+        return
+
+    os.umask(0o077)                      # o histórico é só seu: pasta 0700, arquivos 0600
+    os.makedirs(PASTA, mode=0o700, exist_ok=True)
+    os.chmod(PASTA, 0o700)
+    resumo = hashlib.sha1(dados).hexdigest()     # "impressão digital" do conteúdo
+    # Trava o índice: duas cópias rápidas seguidas não podem gravar ao mesmo tempo
+    with open(INDICE + ".trava", "w") as trava:
+        fcntl.flock(trava, fcntl.LOCK_EX)
+        try:
+            with open(INDICE) as f:
+                itens = json.load(f)
+        except (OSError, ValueError):
+            itens = []
+        antigo = next((i for i in itens if i["hash"] == resumo), None)
+        if antigo:
+            itens.remove(antigo)
+            antigo["quando"] = time.time()
+            itens.insert(0, antigo)             # já existia: só volta pro topo
+        else:
+            arquivo = resumo + (".bin" if not tipo.startswith("text") else ".txt")
+            with open(os.path.join(PASTA, arquivo), "wb") as f:
+                f.write(dados)
+            item = {"hash": resumo, "tipo": tipo, "arquivo": arquivo, "quando": time.time(),
+                    "tamanho": len(dados)}
+            if tipo.startswith("text") or tipo in ("UTF8_STRING", "STRING", "TEXT"):
+                item["previa"] = dados[:400].decode("utf-8", "replace")
+            itens.insert(0, item)
+        # Corta o excesso (os mais antigos) e apaga os arquivos deles
+        for velho in itens[ler_max():]:
+            try:
+                os.remove(os.path.join(PASTA, velho["arquivo"]))
+            except OSError:
+                pass
+        itens = itens[:ler_max()]
+        with open(INDICE + ".tmp", "w") as f:
+            json.dump(itens, f, ensure_ascii=False)
+        os.replace(INDICE + ".tmp", INDICE)      # troca de uma vez: quem lê nunca vê arquivo pela metade
+
+
+if __name__ == "__main__":
+    main()

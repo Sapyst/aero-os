@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Seletor de emojis (Super+.). Código: ~/.local/share/aero-shell/emojis.py (doc 23)
+exec python3 "$HOME/.local/share/aero-shell/emojis.py" "$@"
