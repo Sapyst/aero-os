@@ -1,0 +1,70 @@
+#version 300 es
+// Transição de área de trabalho (Aero): glitch pixelado + ASCII, puxado para o lado da área nova.
+// Arquivos gerados por gerar.sh: DIR = +1 (indo para a direita) / -1; FORCA = 0..1; SEMENTE = quadro.
+precision highp float;
+in vec2 v_texcoord;
+uniform sampler2D tex;
+out vec4 fragColor;
+
+const float DIR = 1.0;
+const float FORCA = 0.45;
+const float SEMENTE = 159.0;   // muda a cada quadro gerado (sem o uniform time: não exige desligar o damage tracking)
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+// caractere 5x5 codificado em 25 bits (a técnica clássica de "ASCII shader")
+float caractere(int n, vec2 p) {
+    p = floor(p * vec2(-4.0, 4.0) + 2.5);
+    if (clamp(p.x, 0.0, 4.0) == p.x && clamp(p.y, 0.0, 4.0) == p.y) {
+        int a = int(round(p.x) + 5.0 * round(p.y));
+        if (((n >> a) & 1) == 1) return 1.0;
+    }
+    return 0.0;
+}
+
+int glifo(float l) {            // escuro -> claro:  . : * o & 8 @ #
+    if (l > 0.80) return 11512810;
+    if (l > 0.70) return 13199452;
+    if (l > 0.60) return 15252014;
+    if (l > 0.50) return 13121101;
+    if (l > 0.40) return 15255086;
+    if (l > 0.30) return 163153;
+    if (l > 0.20) return 65600;
+    return 4096;
+}
+
+void main() {
+    vec2 tam = vec2(textureSize(tex, 0));
+    vec2 uv = v_texcoord;
+    float quadro = SEMENTE;                                  // cada arquivo .frag = um quadro do ruído
+
+    // fatias horizontais sorteadas que escorregam para o lado da nova área
+    float fatia = floor(uv.y * 34.0);
+    float sorteio = hash(vec2(fatia, quadro));
+    bool falha = sorteio < 0.42 * FORCA;
+    float desloca = falha ? DIR * (0.015 + 0.09 * hash(vec2(quadro, fatia))) * FORCA : 0.0;
+    vec2 p = vec2(uv.x - desloca, uv.y);
+
+    // separação de cor (RGB) na direção do movimento
+    float rgb = 0.006 * FORCA;
+    vec3 cor = vec3(texture(tex, p + vec2(DIR * rgb, 0.0)).r,
+                    texture(tex, p).g,
+                    texture(tex, p - vec2(DIR * rgb, 0.0)).b);
+
+    if (falha && hash(vec2(fatia * 7.0, quadro)) < 0.55) {
+        // nas fatias com falha: pixelado + desenhado em ASCII
+        vec2 celula = vec2(10.0, 14.0);
+        vec2 px = p * tam;
+        vec2 base = (floor(px / celula) * celula + celula * 0.5) / tam;
+        vec3 media = texture(tex, base).rgb;
+        float luz = dot(media, vec3(0.299, 0.587, 0.114));
+        vec2 dentro = mod(px, celula) / celula * 2.0 - 1.0;
+        float letra = caractere(glifo(luz), dentro * vec2(1.15, 1.0));
+        vec3 ascii = mix(media * 0.25, media * 1.35 + 0.08, letra);
+        cor = mix(cor, ascii, 0.85 * FORCA);
+    }
+
+    // linhas de varredura bem leves
+    cor *= 1.0 - 0.06 * FORCA * step(0.5, fract(uv.y * tam.y * 0.5));
+    fragColor = vec4(cor, 1.0);
+}

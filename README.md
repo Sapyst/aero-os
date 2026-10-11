@@ -34,6 +34,10 @@ Code comments are in Portuguese; everything on screen is in English.
 
 ![Arrange mode](screenshots/widgets-arrange.png)
 
+**Workspace switch glitch**: for 0.38 s the whole screen slices toward the side of the new workspace,
+splits RGB and redraws blocks as ASCII glyphs (a Hyprland screen shader, no `time` uniform, so damage tracking stays on).
+Edit `shell/glitch/glitch.frag.in`, run `gerar.sh`; `TRANSICAO_GLITCH=0` in `painel.conf` turns it off.
+
 **Settings → Widgets**: add, remove, arrange, scale, pick the glass surface.
 
 ![Settings: widgets](screenshots/settings-widgets.png)
