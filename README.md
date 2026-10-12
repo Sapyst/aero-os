@@ -18,8 +18,8 @@
 | Folder | What it is | Installs to |
 |---|---|---|
 | `shell/` | the desktop shell (Python + GTK4 + layer-shell): dock, Super menu, Alt+Tab, tray, sound/quick center, clipboard history, emoji picker, power menu and the **widgets** | `~/.local/share/aero-shell` |
-| `settings/` | the **Settings** app (libadwaita): display, power, sound, bluetooth, network, location, theme, dock, widgets, keyboard, mouse, updates | `~/.local/share/aero-settings` |
-| `bin/` | small commands the desktop calls (maximize/minimize to the dock, theme switcher, wallpaper, screenshots, pokefetch...) | `~/.local/bin` |
+| `settings/` | the **Settings** app (libadwaita): theme, icons, dock, widgets, workspaces and transitions, display, sound, keyboard, mouse, screen recording, network, bluetooth, power, location, updates | `~/.local/share/aero-settings` |
+| `bin/` | small commands the desktop calls (maximize/minimize to the dock, theme switcher, wallpaper, screenshots, screen recording, pokefetch...) | `~/.local/bin` |
 | `config/` | Hyprland, Waybar, kitty, mako, wofi, GTK overrides | `~/.config` |
 | `file-manager/` | a modified fork of [EZ File Manager](https://github.com/TechyTechster/ez-fm) (MIT), also used as the system **file picker** through xdg-desktop-portal | `~/.local/share/ez-fm` |
 | `music/` | TerMusic / YTMusic: a YouTube Music engine (mpv + ytmusicapi) with a terminal UI and a GTK app | `~/.local/share/ytmotor` |
@@ -30,41 +30,53 @@ Code comments are in Portuguese; everything on screen is in English.
 
 ## Tour
 
-**Widgets.** Clock, System (a live fetch), Resources (rings, gauges, network curves), Processes (a live top), Weather (7 days), and an endless **Pokémon auto-battle** with type chart, crits and a scoreboard. They sit on the wallpaper inside Hyprland's own gaps, share the windows' glass, and cost almost no CPU when idle. Each one has a *Private* switch for screenshots.
+![Switching workspaces](screenshots/workspaces.gif)
 
-![Arrange mode](screenshots/widgets-arrange.png)
+**Workspaces with a personality.** Each of the 5 workspaces can have its own wallpaper and its own widgets
+(**Settings → Workspaces**), and switching plays a transition: glitch, ASCII, pixelate or flash, with speed,
+strength and tint (`shell/transitions/<effect>/`, run by `bin/hypr-transitions`; Hyprland screen shaders with no
+`time` uniform, so damage tracking stays on).
 
-**Workspace switch glitch**: for 0.38 s the whole screen slices toward the side of the new workspace,
-splits RGB and redraws blocks as ASCII glyphs (a Hyprland screen shader, no `time` uniform, so damage tracking stays on).
-Edit `shell/glitch/glitch.frag.in`, run `gerar.sh`; `TRANSICAO_GLITCH=0` in `painel.conf` turns it off.
+**Widgets.** Clock, System (a live fetch), Resources (rings, gauges, network curves), Processes (a live top),
+Weather (7 days) and an endless **Pokémon auto-battle** with type chart, crits and a scoreboard. They sit inside
+Hyprland's own gaps, share the windows' glass and cost almost no CPU when idle. Each has a *Private* switch for screenshots.
+
+![Desktop](screenshots/desktop.png)
+
+**Super menu**: pinned, recent, categories, search, and the weather on top of the wallpaper.
+
+![Super menu](screenshots/supermenu.png)
+
+![Super menu, closer](screenshots/supermenu-focus.png)
+
+**ASCII icons.** One switch turns every app icon (menu, dock, Alt+Tab) into a monochrome ASCII tile with a
+phosphor glow. It runs once, remembers what it did, converts new apps at login and restores the originals when
+turned off. **Settings → Icons** also picks the icon pack underneath, installs packs (folders or archives of any
+size) and gives any single app its own image (`shell/icones.py`, command `aero-icones`).
+
+![Settings: icons](screenshots/settings-icons.png)
+
+![Settings: workspaces](screenshots/settings-workspaces.png)
 
 **Settings → Widgets**: add, remove, arrange, scale, pick the glass surface.
 
 ![Settings: widgets](screenshots/settings-widgets.png)
 
-**Super menu**: pinned, recent, categories, search.
-
-![Super menu](screenshots/supermenu.png)
+**Screen recording**: Ctrl+Shift+Print pops a card: **1** for the whole screen or **2** to drag an area; the same
+shortcut stops it. Ctrl+Print goes straight to the area. NVENC when available, computer sound and/or microphone,
+24/30/60 fps; **Settings → Screen recording** has quality, format, countdown and the folder.
 
 **Files** with big thumbnails (Ctrl + scroll), a resizable preview pane, and the same window as the system file picker.
 
 ![File manager](screenshots/file-manager.png)
 
-**Alt+Tab** like Windows, with live thumbnails.
+![Terminal and files](screenshots/workflow.png)
 
-![Alt+Tab](screenshots/alttab.png)
+**Also:** Alt+Tab like Windows with live thumbnails, a dock with intellihide, a wave effect and minimize-to-icon
+animations, one theme color for the whole system with light/dark by time.
 
-**Theme**: one color for the whole system (bar, title bars, menus, apps), light/dark by time, accent, glass level, animation speed.
-
-![Settings: theme](screenshots/settings-theme.png)
-
-**Dock** with intellihide, a wave effect and minimize-to-icon animations.
-
-![Settings: dock](screenshots/settings-dock.png)
-
-![Terminal, files and widgets](screenshots/workflow.png)
-
-<sub>Screenshots: wallpapers from [ascii-walls](https://github.com/Sapyst/ascii-walls). Personal windows, process names and places are blurred.</sub>
+<sub>Screenshots and GIF: wallpapers from [ascii-walls](https://github.com/Sapyst/ascii-walls). Process names,
+places and personal items are blurred.</sub>
 
 ## Principles
 

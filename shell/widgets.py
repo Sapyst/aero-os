@@ -23,7 +23,9 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
+import threading
 import time
 
 import cairo
@@ -118,6 +120,15 @@ def hypr(comando):
         return b"".join(partes).decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def wallpaper_padrao():
+    """O wallpaper "normal" do sistema (o que o papel-de-parede gravou no hyprpaper.conf)."""
+    try:
+        m = re.search(r"^\s*path\s*=\s*(.+)$", open(os.path.expanduser("~/.config/hypr/hyprpaper.conf")).read(), re.M)
+        return os.path.expanduser(m.group(1).strip()) if m else None
+    except OSError:
+        return None
 
 
 def hypr_json(comando, padrao):
@@ -870,6 +881,8 @@ class Desktop(Gtk.Window):
 
     def widget_em(self, x, y):
         for w in reversed(self.app.widgets):
+            if not w.get_visible():
+                continue                         # widget de outra área de trabalho
             wx, wy, ww, wh = w.retangulo()
             if wx <= x <= wx + ww and wy <= y <= wy + wh:
                 return w
@@ -925,6 +938,8 @@ class Desktop(Gtk.Window):
         cr.fill()
         cor = cor_texto(area)
         for wd in self.app.widgets:
+            if not wd.get_visible():
+                continue
             x, y, ww, wh = wd.retangulo()
             retangulo_redondo(cr, x + 0.5, y + 0.5, ww - 1, wh - 1, RAIO)
             cr.set_source_rgba(*cor[:3], 0.9)
@@ -961,6 +976,8 @@ class App(Adw.Application):
         self.config = None
         self.desktop = None
         self.monitor = None
+        self.area = None            # área de trabalho na tela (Settings → Workspaces: widgets e wallpaper por área)
+        self.wall_area = None       # wallpaper que ESTE daemon pôs por causa da área
 
     def do_command_line(self, linha):
         args = linha.get_arguments()[1:]
@@ -985,6 +1002,7 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.monitor = monitor_focado()
+        self.area = hypr_json("activeworkspace", {}).get("id")
         self.config = Config()
         self.acoes()
         self.desktop = Desktop(self)
@@ -997,6 +1015,58 @@ class App(Adw.Application):
         self.vigia_cores = Gio.File.new_for_path(CORES_BARRA).monitor_file(Gio.FileMonitorFlags.NONE, None)
         self.vigia_cores.connect("changed", lambda *_: GLib.timeout_add(300, lambda: ([w.ao_tema() for w in self.widgets], False)[1]))
         GLib.timeout_add_seconds(20, self.vigiar_hyprland)
+        threading.Thread(target=self.ouvir_areas, daemon=True).start()
+        self.aplicar_wallpaper()
+
+    # ---- por área de trabalho: cada widget pode ter "areas": [1, 3]; sem a chave = todas ----
+    def visivel_aqui(self, reg):
+        areas = reg.get("areas")
+        return not areas or self.area in areas
+
+    def ouvir_areas(self):
+        """Eventos do Hyprland (socket2), numa thread: só repassa a troca de área pro GTK."""
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(os.path.join(HYPR, ".socket2.sock"))
+        except OSError:
+            return
+        buf = b""
+        while (dados := s.recv(4096)):
+            buf += dados
+            *linhas, buf = buf.split(b"\n")
+            for linha in linhas:
+                evento, _, valor = linha.decode(errors="replace").partition(">>")
+                if evento == "workspacev2":
+                    try:
+                        area = int(valor.split(",", 1)[0])
+                    except ValueError:
+                        continue
+                    if area > 0:
+                        GLib.idle_add(self.mudar_area, area)
+
+    def mudar_area(self, area):
+        if area != self.area:
+            self.area = area
+            for w in self.widgets:
+                w.set_visible(self.visivel_aqui(w.registro))
+            self.aplicar_wallpaper()
+            self.desktop.fundo.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    def aplicar_wallpaper(self):
+        """Wallpaper da área (por_area no widgets.json). Áreas sem um usam o wallpaper normal (hyprpaper.conf).
+        Se nenhuma área tem wallpaper próprio, não mexe em nada."""
+        por_area = self.config.d.get("por_area") or {}
+        if not any(v.get("wallpaper") for v in por_area.values()):
+            self.wall_area = None
+            return
+        alvo = (por_area.get(str(self.area)) or {}).get("wallpaper")
+        if not alvo or not os.path.isfile(alvo) or "," in alvo:
+            alvo = wallpaper_padrao()
+        if alvo and alvo != self.wall_area:
+            self.wall_area = alvo
+            threading.Thread(target=lambda: subprocess.run(["hyprctl", "hyprpaper", "wallpaper", f",{alvo},cover"],
+                                                           capture_output=True), daemon=True).start()
 
     def vigiar_hyprland(self):
         if not hyprland_vivo():
@@ -1040,10 +1110,14 @@ class App(Adw.Application):
                     w.mover(reg["x"], reg["y"])
                 if (dict(w.opcoes_padrao) | dict(reg.get("opcoes") or {})) != w.opcoes:
                     w.atualizar_opcoes(reg.get("opcoes"))
+            if w.get_visible() != self.visivel_aqui(reg):
+                w.set_visible(self.visivel_aqui(reg))
         for wid, w in atuais.items():
             if wid not in vistos:
                 w.fechar()
                 self.widgets.remove(w)
+        if self.area is not None:
+            self.aplicar_wallpaper()
         if getattr(self, "_vidro", None) != self.config.d.get("vidro"):     # opacidade do vidro mudou
             self._vidro = self.config.d.get("vidro")
             for w in self.widgets:

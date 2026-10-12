@@ -106,7 +106,6 @@
         "on-click-right": "CONFIG_ABA=energia ~/.local/bin/configuracoes"
     },
 
-
     // Espaço reservado pra bandeja (ícones dos apps). Quem desenha os ícones é ~/.local/bin/bandeja,
     // por cima deste espaço; ela escreve quantos ícones há e manda o sinal 9 pra waybar reler.
     // Central rápida (doc 30): SEMPRE no canto extremo direito. A bandeja fica logo à esquerda dela

@@ -52,7 +52,7 @@ class Amostrador:
         self.bateria = next((f"/sys/class/power_supply/{b}" for b in sorted(os.listdir("/sys/class/power_supply"))
                              if b.startswith("BAT")), None) if os.path.isdir("/sys/class/power_supply") else None
         self.discos = [("/", "/")]
-        for m in (os.environ.get("AERO_DADOS", "/mnt/data"), "/home"):     # AERO_DADOS = segundo disco
+        for m in (os.environ.get("AERO_DADOS", "/mnt/data"), "/home"):
             if os.path.ismount(m):
                 self.discos.append((m, m))
         self.discos_info = []

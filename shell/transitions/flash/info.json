@@ -1,0 +1,2 @@
+{"name": "Flash", "icon": "weather-clear-symbolic", "description": "A quick flash of the tint colour (or a dip to black)",
+ "curve": [1.0, 0.7, 0.45, 0.25, 0.1], "frame_ms": 50, "order": 4}

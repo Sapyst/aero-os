@@ -4,6 +4,7 @@
 #   TEMA_MODO=auto|claro|escuro      TEMA_CLARO=07:00  TEMA_ESCURO=18:00
 #   FILTRO_MODO=auto|ligado|desligado FILTRO_INICIO=19:00 FILTRO_FIM=07:00 FILTRO_TEMP=4500
 #   COR_CLARA=f6f6f6  COR_ESCURA=1e1e1e  COR_ALFA=0.80   cor da barra (taskbar) em cada tema
+#   BAR_ALPHA=0.45   opacity of the taskbar alone (frosted: Hyprland blurs what is behind it)
 #   COR_SINC=1   1 = todo o sistema usa a cor da barra; 0 = só a barra, o resto com as cores padrão
 #   COR_DESTAQUE=3584e4   cor de destaque (seleção, interruptores, links): vale sempre, com ou sem sincronia
 #   COR_DESTAQUE=mono     destaque MONOCROMÁTICO (doc 42): no escuro quase branco com texto escuro e sombra
@@ -88,8 +89,8 @@ gerar_cores() {
 
     # 1) Barra de cima (waybar): sempre a cor escolhida. É ela a referência.
     cat > "$HOME/.config/waybar/cores-$tema.css" <<EOF
-/* Gerado pelo hypr-tema a partir de COR_$( [ "$tema" = escuro ] && echo ESCURA || echo CLARA ) e COR_ALFA (painel.conf). */
-@define-color fundo rgba($rgbs, $COR_ALFA);
+/* Gerado pelo hypr-tema a partir de COR_$( [ "$tema" = escuro ] && echo ESCURA || echo CLARA ) e BAR_ALPHA (painel.conf). */
+@define-color fundo rgba($rgbs, $BAR_ALPHA);
 @define-color fundo-solido #$hex;
 @define-color texto #$texto;
 @define-color destaque #$DEST;
@@ -259,7 +260,7 @@ aplicar_tema() {
     if [ "$mako" = claro ]; then makoctl mode -a claro >/dev/null 2>&1
     else makoctl mode -r claro >/dev/null 2>&1; fi
     echo "$tema" > "$ESTADO/tema"
-    echo "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE" > "$ESTADO/cores"
+    echo "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" > "$ESTADO/cores"
 }
 
 aplicar_filtro() {
@@ -279,6 +280,7 @@ aplicar() {
     TEMA_MODO=auto; TEMA_CLARO=07:00; TEMA_ESCURO=18:00
     FILTRO_MODO=auto; FILTRO_INICIO=19:00; FILTRO_FIM=07:00; FILTRO_TEMP=4500
     COR_CLARA=f6f6f6; COR_ESCURA=1e1e1e; COR_ALFA=0.80; COR_SINC=1; COR_DESTAQUE=3584e4
+    BAR_ALPHA=0.45     # taskbar only: see-through enough for Hyprland's blur behind it to show
     . "$HOME/.local/share/aero-shell/painel.sh" && ler_painel   # lê sem executar (painel.sh)
 
     local agora tema filtro
@@ -295,7 +297,7 @@ aplicar() {
     esac
 
     if [ "$1" = --forcar ] || [ "$tema" != "$(cat "$ESTADO/tema" 2>/dev/null)" ] ||
-       [ "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE" != "$(cat "$ESTADO/cores" 2>/dev/null)" ]; then
+       [ "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" != "$(cat "$ESTADO/cores" 2>/dev/null)" ]; then
         aplicar_tema "$tema"
     fi
     if [ "$1" = --forcar ] || [ "$filtro" != "$(cat "$ESTADO/filtro" 2>/dev/null)" ]; then aplicar_filtro "$filtro"; fi

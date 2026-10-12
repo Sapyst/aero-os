@@ -55,6 +55,9 @@ CSS_DESTAQUES = "".join(f".bolinha-{n} {{ background: #{h}; min-width: 22px; min
 CANTOS = [("Round", "2"), ("Smooth (Apple-like)", "3.5")]
 ESMAECER = [("Off", "0"), ("Subtle", "0.08"), ("Medium", "0.15"), ("Strong", "0.25")]
 OPACIDADE = [("70%", "0.70"), ("80%", "0.80"), ("90%", "0.90"), ("100%", "1.0")]
+# taskbar: below ~35% Hyprland stops blurring it (ignore_alpha 0.3 in aparencia.conf)
+BAR_OPACITY = [("35%", "0.35"), ("45%", "0.45"), ("60%", "0.60"), ("80%", "0.80"), ("100%", "1.0")]
+WALL_ALVO = [("The workspace you are on", "workspace"), ("All workspaces", "all")]
 VIDRO = [("Off (solid windows)", "desligado"), ("Subtle", "leve"), ("Medium", "media"), ("Strong", "forte")]
 TEXTO = [("100%", "1.0"), ("110%", "1.1"), ("125%", "1.25"), ("150%", "1.5")]
 # Horários de meia em meia hora: ("07:30", "07:30")
@@ -69,6 +72,8 @@ ANIMACOES = [("windowsIn", 4, "mola", "popin 85%"), ("windowsOut", 3, "suave", "
              ("windowsMove", 4, "suave", ""), ("fade", 3, "suave", ""),
              ("layersIn", 3, "suave", "fade"), ("layersOut", 2, "suave", "fade"),
              ("workspaces", 5, "suave", "slidefade 15%"), ("specialWorkspace", 4, "suave", "slidevert")]
+# Workspace movement (Hyprland's own animation), chosen in Workspaces → Transition (TRANS_MOVE)
+MOVIMENTO_AREAS = {"slidefade": "slidefade 15%", "slide": "slide", "vertical": "slidevert", "fade": "fade", "none": None}
 MARCA_INICIO = "# >>> animações (gerado pelo Settings → Appearance → Motion; não editar à mão)"
 MARCA_FIM = "# <<< animações"
 
@@ -80,8 +85,14 @@ def gerar_animacoes(ligado=True, velocidade="normal"):
     bloco = [MARCA_INICIO, "animations {", f"    enabled = {'true' if ligado else 'false'}",
              "    bezier = suave, 0.25, 1, 0.5, 1",
              "    bezier = mola, 0.34, 1.4, 0.64, 1"]
+    mov = ler_painel().get("TRANS_MOVE", "slidefade")
     for nome, tempo, curva, estilo in ANIMACOES:
         tempo = max(1, round(tempo * fator))
+        if nome == "workspaces":
+            if mov in MOVIMENTO_AREAS and MOVIMENTO_AREAS[mov] is None:
+                bloco.append("    animation = workspaces, 0")
+                continue
+            estilo = MOVIMENTO_AREAS.get(mov, estilo)
         bloco.append(f"    animation = {nome}, 1, {tempo}, {curva}" + (f", {estilo}" if estilo else ""))
     bloco += ["    animation = border, 0", "}", MARCA_FIM]
     with open(APARENCIA) as f:
@@ -175,6 +186,7 @@ class SecaoAparencia(Secao):
         self.cor_clara = self.linha_cor("Light theme color")
         self.cor_escura = self.linha_cor("Dark theme color")
         self.opacidade = combo("Opacity", OPACIDADE, 1)
+        self.bar_opacity = combo("Taskbar opacity", BAR_OPACITY, 1, "Frosted: the taskbar blurs what is behind it")
         # Cor de destaque: vale na hora (sem Apply). Seleções, interruptores, Alt+Tab, print...
         self.linha_destaque = Adw.ActionRow(use_markup=False, title="Accent color")
         caixa = Gtk.Box(spacing=8, valign=Gtk.Align.CENTER)
@@ -186,7 +198,7 @@ class SecaoAparencia(Secao):
             self.bolinhas[nome] = b
             caixa.append(b)
         self.linha_destaque.add_suffix(caixa)
-        for r in (self.sinc, self.cores_wall, self.cor_clara.linha, self.cor_escura.linha, self.opacidade,
+        for r in (self.sinc, self.cores_wall, self.cor_clara.linha, self.cor_escura.linha, self.opacidade, self.bar_opacity,
                   self.linha_destaque):
             cor.add(r)
         self.grupo_cor = cor
@@ -209,7 +221,7 @@ class SecaoAparencia(Secao):
         self.botoes_sw = Adw.SwitchRow(
             title="Window buttons",
             subtitle="Off = pure Hyprland, keyboard only: Super+↓ minimize · Super+↑ maximize · "
-                     "Super+C close · Super+F fullscreen · Super+M minimized windows")
+                     "Super+C quit app · Alt+F4 close window · Super+F fullscreen · Super+M minimized windows")
         self.botoes_sw.connect("notify::active", self.ao_trocar_botoes)
         self.mexendo_botoes = False
         self.vidro = combo("Glass effect", VIDRO, 2)
@@ -261,10 +273,25 @@ class SecaoAparencia(Secao):
         self.wall_linha.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
         self.wall_linha.connect("activated", lambda *_: self.abrir_wallpapers())
         papel.add(self.wall_linha)
+        # where a new wallpaper goes, from anywhere (this browser, Thunar, clipboard): papel-de-parede
+        self.wall_alvo = combo("New wallpapers go to", WALL_ALVO, 0,
+                               "Each workspace can also have its own: Workspaces → Choose…")
+        self.wall_alvo.connect("notify::selected", lambda *_: self.carregando_alvo or
+                               atualizar_painel(WALL_TARGET=valor_de(self.wall_alvo, WALL_ALVO)))
+        self.carregando_alvo = False
+        papel.add(self.wall_alvo)
         self.secao_wall = None
 
-        for g in (papel, tema, cor, vidro, fontes, filtro, movimento, grupo_botao_aplicar(self.aplicar), avancado):
+        aplicar = grupo_botao_aplicar(self.aplicar)
+        for g in (papel, tema, cor, vidro, fontes, filtro, movimento, aplicar, avancado):
             conteudo.add(g)
+        # Theme in the sidebar tree: each sub-page shows only its groups of this one page
+        self.subs = {"colors": ("Colors and mode", [tema, cor, filtro, aplicar]),
+                     "wallpaper": ("Wallpaper", [papel]),
+                     "glass": ("Glass and windows", [vidro, aplicar]),
+                     "text": ("Text and motion", [fontes, movimento, aplicar, avancado])}
+        self.todos_grupos = (papel, tema, cor, vidro, fontes, filtro, movimento, aplicar, avancado)
+        self.conteudo = conteudo
         self.pagina = pagina(self.titulo, conteudo)
 
     def linha_cor(self, titulo):
@@ -334,9 +361,23 @@ class SecaoAparencia(Secao):
             self.secao_wall = SecaoWallpapers(self.janela)
         self.janela.empilhar(self.secao_wall.pagina)
         self.secao_wall.ao_mostrar()
+        return self.secao_wall
 
     def mostrar_wallpaper(self, p):
-        atual = str(p.get("WALL_ORIGINAL", "")).strip('"')
+        self.carregando_alvo = True
+        self.wall_alvo.set_selected(indice(WALL_ALVO, p.get("WALL_TARGET", "workspace"), 0))
+        self.carregando_alvo = False
+        # the workspace you are on: its own wallpaper, if it has one
+        from sec_areas import area_ativa
+        from sec_widgets import ler as ler_widgets
+        area = area_ativa()
+        propria = ((ler_widgets().get("por_area") or {}).get(str(area)) or {}).get("wallpaper")
+        if propria and os.path.isfile(propria):
+            self.wall_linha.set_subtitle(f"Workspace {area}'s own wallpaper · browse your folder and GitHub collections")
+            atual = propria
+        else:
+            self.wall_linha.set_subtitle(f"System wallpaper (workspace {area} and every one without its own)")
+            atual = str(p.get("WALL_ORIGINAL", "")).strip('"')
         if not os.path.isfile(atual):
             try:
                 with open(os.path.expanduser("~/.config/hypr/hyprpaper.conf")) as f:
@@ -359,6 +400,13 @@ class SecaoAparencia(Secao):
             [os.path.expanduser("~/.local/bin/botoes-de-janela"), "on" if ligar else "off"]))
         __import__("comum").mostrar_bolinhas(ligar)      # as bolinhas deste Settings, na hora
         self.janela.avisar("Window buttons on" if ligar else "Window buttons off: use Super+↑ ↓ and Super+C")
+
+    def abrir_sub(self, sub):
+        titulo, grupos = self.subs.get(sub) or ("Theme", self.todos_grupos)
+        for g in self.todos_grupos:
+            g.set_visible(g in grupos)
+        self.pagina.set_title(titulo)
+        self.conteudo.scroll_to_top()
 
     def ao_mostrar(self):
         p = ler_painel()
@@ -387,6 +435,7 @@ class SecaoAparencia(Secao):
         self.mudando_cores_wall = False
         self.mostrar_cores(p)
         self.opacidade.set_selected(indice(OPACIDADE, p.get("COR_ALFA", "0.80"), 1))
+        self.bar_opacity.set_selected(indice(BAR_OPACITY, p.get("BAR_ALPHA", "0.45"), 1))
         fator = rodar(["gsettings", "get", "org.gnome.desktop.interface", "text-scaling-factor"]).stdout.strip()
         self.texto.set_selected(min(range(len(TEXTO)),
                                     key=lambda i: abs(float(TEXTO[i][1]) - float(fator or 1))))
@@ -453,7 +502,7 @@ class SecaoAparencia(Secao):
             FILTRO_INICIO=valor_de(self.inicio, HORAS), FILTRO_FIM=valor_de(self.fim, HORAS),
             FILTRO_TEMP=valor_de(self.calor, CALOR), VIDRO=vidro, ESMAECER=valor_de(self.esmaecer, ESMAECER),
             COR_SINC="1" if self.sinc.get_active() else "0", COR_CLARA=self.para_hex(self.cor_clara),
-            COR_ESCURA=self.para_hex(self.cor_escura), COR_ALFA=valor_de(self.opacidade, OPACIDADE),
+            COR_ESCURA=self.para_hex(self.cor_escura), COR_ALFA=valor_de(self.opacidade, OPACIDADE), BAR_ALPHA=valor_de(self.bar_opacity, BAR_OPACITY),
             CANTOS=valor_de(self.cantos, CANTOS), CURSOR_TEMA=valor_de(self.cursor_tema, self.temas_cursor),
             CURSOR_TAM=valor_de(self.cursor_tam, TAMANHO_CURSOR), ANIM="1" if self.animar.get_active() else "0", ANIM_VEL=valor_de(self.velocidade, VELOCIDADE))
         gerar_aparencia(vidro, valor_de(self.esmaecer, ESMAECER), valor_de(self.cantos, CANTOS))

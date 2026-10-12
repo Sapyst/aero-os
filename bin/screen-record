@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# screen-record — grava a tela com o wf-recorder. O mesmo atalho começa e para.
+# As opções vêm do painel.conf (Settings → Screen recording), chaves REC_*.
+#
+# Uso: screen-record pick     (pergunta: 1 Full screen / 2 Area)    Ctrl+Shift+Print
+#      screen-record          (direto: escolhe a área com o mouse)    Ctrl+Print
+#      screen-record screen   (direto: o monitor onde está o mouse)
+#      screen-record stop     (só para, se estiver gravando)
+# Apertar qualquer um dos atalhos de novo, gravando, para a gravação.
+
+pid_arq="${XDG_RUNTIME_DIR:-/tmp}/screen-record.pid"
+mix_arq="${XDG_RUNTIME_DIR:-/tmp}/screen-record.mix"
+
+# já gravando? então para (SIGINT faz o wf-recorder fechar o arquivo direitinho)
+if [ -f "$pid_arq" ] && kill -0 "$(cat "$pid_arq")" 2>/dev/null; then
+    kill -INT "$(cat "$pid_arq")"
+    exit 0
+fi
+[ "$1" = stop ] && exit 0
+
+# Ctrl+Shift+Print: a janelinha de escolha (ela chama este script de novo com start-screen/start-area)
+if [ "$1" = pick ]; then
+    LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 "$HOME/.local/share/aero-shell/recording_picker.py"
+fi
+case "$1" in start-screen) set -- screen ;; start-area) set -- area ;; esac
+
+# ---------- opções (padrões = o que vale sem nunca abrir a aba) ----------
+REC_AUDIO=desktop; REC_MIC=default; REC_QUALITY=balanced; REC_FPS=60; REC_ENCODER=auto
+REC_FORMAT=mp4; REC_COUNTDOWN=0; REC_AFTER=notify; REC_DIR=""
+while IFS='=' read -r k v; do
+    case "$k" in REC_*) printf -v "$k" '%s' "$v" ;; esac
+done < <(grep '^REC_' "$HOME/.config/hypr/painel.conf" 2>/dev/null)
+
+pasta="${REC_DIR:-$(xdg-user-dir VIDEOS 2>/dev/null || echo "$HOME/Videos")/Recordings}"
+pasta="${pasta/#\~/$HOME}"
+mkdir -p "$pasta"
+arquivo="$pasta/recording-$(date +%Y-%m-%d_%H-%M-%S).$REC_FORMAT"
+
+# ---------- o que gravar ----------
+if [ "$1" = screen ]; then
+    alvo=(-o "$(hyprctl monitors -j | python3 -c 'import sys,json;print([m["name"] for m in json.load(sys.stdin) if m["focused"]][0])')")
+else
+    destaque=$(cat "$HOME/.cache/hypr-tema/destaque" 2>/dev/null); destaque=${destaque:-3584e4}
+    area=$(slurp -d -b 00000066 -c "${destaque}ff" -w 2) || exit 0     # Esc cancela
+    alvo=(-g "$area")
+fi
+
+# ---------- vídeo: encoder e qualidade ----------
+case "$REC_QUALITY" in small) q=28 ;; high) q=18 ;; *) q=23 ;; esac
+usa_gpu=0
+if [ "$REC_ENCODER" = gpu ] || { [ "$REC_ENCODER" = auto ] && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc && nvidia-smi -L >/dev/null 2>&1; }; then
+    usa_gpu=1
+fi
+if [ $usa_gpu = 1 ]; then
+    video=(-c h264_nvenc -p preset=p4 -p rc=vbr -p cq=$q)
+else
+    video=(-c libx264 -p preset=veryfast -p crf=$q)
+fi
+case "$REC_FPS" in 24|30|60) ;; *) REC_FPS=60 ;; esac
+video+=(-r "$REC_FPS")
+
+# ---------- áudio ----------
+saida="$(pactl get-default-sink 2>/dev/null).monitor"
+mic="$REC_MIC"; [ "$mic" = default ] && mic="$(pactl get-default-source 2>/dev/null)"
+audio=()
+case "$REC_AUDIO" in
+    desktop) audio=(--audio="$saida") ;;
+    mic)     audio=(--audio="$mic") ;;
+    both)    # junta os dois num "cabo" virtual e grava a saída dele; desfeito ao terminar
+        m1=$(pactl load-module module-null-sink sink_name=screenrec_mix sink_properties=device.description=Screen-recording-mix)
+        m2=$(pactl load-module module-loopback source="$saida" sink=screenrec_mix latency_msec=20)
+        m3=$(pactl load-module module-loopback source="$mic" sink=screenrec_mix latency_msec=20)
+        echo "$m3 $m2 $m1" > "$mix_arq"
+        audio=(--audio=screenrec_mix.monitor) ;;
+esac
+desfazer_mix() {
+    [ -f "$mix_arq" ] || return
+    for m in $(cat "$mix_arq"); do pactl unload-module "$m" 2>/dev/null; done
+    rm -f "$mix_arq"
+}
+trap desfazer_mix EXIT
+
+# ---------- contagem ----------
+if [ "${REC_COUNTDOWN:-0}" -gt 0 ] 2>/dev/null; then
+    for ((i = REC_COUNTDOWN; i > 0; i--)); do
+        notify-send -a "Screen recorder" -i media-record -t 900 -h string:x-canonical-private-synchronous:screenrec "Recording in $i…"
+        sleep 1
+    done
+fi
+
+wf-recorder "${alvo[@]}" "${video[@]}" "${audio[@]}" -f "$arquivo" >/dev/null 2>&1 &
+echo $! > "$pid_arq"
+notify-send -a "Screen recorder" -i media-record -t 2500 -h string:x-canonical-private-synchronous:screenrec \
+    "Recording" "Press Ctrl+Print or Ctrl+Shift+Print again to stop."
+wait $!
+rm -f "$pid_arq"
+desfazer_mix
+
+if [ ! -s "$arquivo" ]; then
+    rm -f "$arquivo"
+    notify-send -a "Screen recorder" -i dialog-error "Recording failed" "Nothing was saved."
+    exit 1
+fi
+case "$REC_AFTER" in
+    video)  xdg-open "$arquivo" ;;
+    folder) xdg-open "$pasta" ;;
+    copy)   printf 'file://%s\n' "$arquivo" | wl-copy -t text/uri-list
+            notify-send -a "Screen recorder" -i video-x-generic "Recording saved and copied" "Paste it straight into a chat." ;;
+    *)      acao=$(notify-send -a "Screen recorder" -i video-x-generic -A abrir=Open -A pasta="Open folder" \
+                   "Recording saved" "$(basename "$arquivo")")
+            case "$acao" in abrir) xdg-open "$arquivo" ;; pasta) xdg-open "$pasta" ;; esac ;;
+esac

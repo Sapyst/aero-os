@@ -1,7 +1,21 @@
 [
-  { "tipo": "app", "id": "firefox.desktop" },
-  { "tipo": "app", "id": "kitty.desktop" },
-  { "tipo": "app", "id": "ez-fm.desktop" },
-  { "tipo": "separador" },
-  { "tipo": "app", "id": "com.aero.Settings.desktop" }
+  {
+    "tipo": "app",
+    "id": "firefox.desktop"
+  },
+  {
+    "tipo": "app",
+    "id": "kitty.desktop"
+  },
+  {
+    "tipo": "app",
+    "id": "ez-fm.desktop"
+  },
+  {
+    "tipo": "separador"
+  },
+  {
+    "tipo": "app",
+    "id": "com.aero.Settings.desktop"
+  }
 ]

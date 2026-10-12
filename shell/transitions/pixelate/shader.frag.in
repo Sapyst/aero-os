@@ -1,0 +1,24 @@
+#version 300 es
+// Aero workspace transition: big pixels that sharpen into the new workspace.
+precision highp float;
+in vec2 v_texcoord;
+uniform sampler2D tex;
+out vec4 fragColor;
+
+const float DIR = @DIR@;          // +1 = going right, -1 = left
+const float FORCE = @FORCE@;      // 1 at the start of the transition, falling to 0
+const float SEED = @SEED@;        // one value per frame (no "time" uniform: keeps damage tracking on)
+const vec3 TINT = @TINT@;
+const float TINT_AMT = @TINT_AMT@;
+
+void main() {
+    vec2 size = vec2(textureSize(tex, 0));
+    float block = 1.0 + 46.0 * FORCE * FORCE;
+    vec2 px = v_texcoord * size;
+    vec2 uv = (floor(px / block) * block + block * 0.5) / size;
+    uv.x -= DIR * 0.02 * FORCE;
+    vec3 c = texture(tex, uv).rgb;
+    float light = dot(c, vec3(0.299, 0.587, 0.114));
+    c = mix(c, TINT * (0.2 + light), TINT_AMT * FORCE);
+    fragColor = vec4(c, 1.0);
+}

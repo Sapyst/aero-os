@@ -1,0 +1,52 @@
+#version 300 es
+// Aero workspace transition: the whole screen turns into ASCII characters, then comes back.
+precision highp float;
+in vec2 v_texcoord;
+uniform sampler2D tex;
+out vec4 fragColor;
+
+const float DIR = @DIR@;          // +1 = going right, -1 = left
+const float FORCE = @FORCE@;      // 1 at the start of the transition, falling to 0
+const float SEED = @SEED@;        // one value per frame (no "time" uniform: keeps damage tracking on)
+const vec3 TINT = @TINT@;
+const float TINT_AMT = @TINT_AMT@;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+// 5x5 character packed in 25 bits (the classic "ASCII shader" trick)
+float glyph(int n, vec2 p) {
+    p = floor(p * vec2(-4.0, 4.0) + 2.5);
+    if (clamp(p.x, 0.0, 4.0) == p.x && clamp(p.y, 0.0, 4.0) == p.y) {
+        int a = int(round(p.x) + 5.0 * round(p.y));
+        if (((n >> a) & 1) == 1) return 1.0;
+    }
+    return 0.0;
+}
+
+int code(float l) {             // dark -> light:  . : * o & 8 @ #
+    if (l > 0.80) return 11512810;
+    if (l > 0.70) return 13199452;
+    if (l > 0.60) return 15252014;
+    if (l > 0.50) return 13121101;
+    if (l > 0.40) return 15255086;
+    if (l > 0.30) return 163153;
+    if (l > 0.20) return 65600;
+    return 4096;
+}
+
+void main() {
+    vec2 size = vec2(textureSize(tex, 0));
+    vec2 px = v_texcoord * size;
+    vec2 cell = vec2(9.0, 13.0);
+    vec2 centre = (floor(px / cell) * cell + cell * 0.5) / size;
+    vec3 avg = texture(tex, centre).rgb;
+    float light = dot(avg, vec3(0.299, 0.587, 0.114));
+    vec2 inside = mod(px, cell) / cell * 2.0 - 1.0;
+    float on = glyph(code(light), inside * vec2(1.15, 1.0));
+    vec3 ink = mix(avg * 1.3 + 0.05, TINT * (0.35 + light), TINT_AMT);
+    vec3 ascii = mix(vec3(0.0), ink, on);
+    // cells come back to the picture at random moments, pushed along the direction of travel
+    float when = hash(floor(px / cell)) * 0.7 + 0.3 * (DIR > 0.0 ? 1.0 - v_texcoord.x : v_texcoord.x);
+    float k = step(1.0 - FORCE, when);
+    fragColor = vec4(mix(texture(tex, v_texcoord).rgb, ascii, k), 1.0);
+}

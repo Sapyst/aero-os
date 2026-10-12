@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Ícones do Aero (iconizador ASCII + packs + ícone por app). Código e ajuda: ~/.local/share/aero-shell/icones.py
+exec python3 -I "$HOME/.local/share/aero-shell/icones.py" "$@"

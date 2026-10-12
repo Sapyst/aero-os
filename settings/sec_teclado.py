@@ -31,7 +31,7 @@ def descrever(b):
         for trecho, texto in (("papel-de-parede", "Set copied image as wallpaper"), ("hypr-encaixar left", "Snap window to the left half"), ("hypr-encaixar right", "Snap window to the right half"),
                               ("hypr-area-de-trabalho", "Show desktop"), ("emojis", "Emoji picker"),
                               ("energia logout", "Log out (asks first)"), ("alttab overview", "All windows (overview)"), ("alttab next", "Switch windows (Alt+Tab)"), ("clipboard", "Clipboard history"), ("alttab prev", "Switch windows, backwards"),
-                              ("hypr-minimizar", "Minimize window"), ("hypr-sempre-visivel", "Always visible (no dim)"),
+                              ("hypr-quit", "Quit app (all its windows)"), ("hypr-minimizar", "Minimize window"), ("hypr-sempre-visivel", "Always visible (no dim)"),
                               ("supermenu", "Open Super Menu"), ("hypr-minimizados", "Restore a minimized window"), ("wofi", "Open Super Menu"), ("kitty", "Open terminal"),
                               ("thunar", "Open Files"), ("configuracoes", "Open Settings"),
                               ("print-area", "Screenshot of an area")):

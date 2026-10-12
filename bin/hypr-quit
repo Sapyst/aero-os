@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+hypr-quit — Super+C: quits the WHOLE app of the focused window, not just that window (doc 53).
+
+"killactive" only closes one window. An app with another window (even a minimized one) or a tray
+icon (Discord, Steam...) keeps running after that and keeps its RAM. This:
+  1. asks EVERY window of the same process to close, like a normal close (the app saves its things,
+     and can still ask "save changes?");
+  2. waits up to 3 s. If the process is still alive with NO windows left (it went to the tray), it
+     sends SIGTERM = "please quit" (the polite signal: the app still saves and exits by itself).
+     If a window is still open (a "save changes?" question, for example), it does nothing more.
+
+Never forced to quit (only the window closes, as before):
+  - terminals: each window is its own job;
+  - the Claude app: its agents keep working in the background;
+  - the system's own pieces (aero-shell, Settings) and Xwayland.
+Alt+F4 still closes only the window.
+
+Use: hypr-quit [window address]   (no address = the focused window)
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+WINDOW_ONLY_CLASSES = ("kitty", "foot", "alacritty", "org.wezfurlong.wezterm", "claude", "termusic")
+OWN_PIECES = ("/.local/share/aero-", "/.local/bin/")
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def clients():
+    try:
+        return json.loads(hyprctl("clients", "-j"))
+    except ValueError:
+        return []
+
+
+def command_line(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def alive(pid):
+    return os.path.exists(f"/proc/{pid}")
+
+
+def main():
+    if len(sys.argv) > 1:
+        target = next((c for c in clients() if c["address"] == sys.argv[1]), None)
+    else:
+        try:
+            target = json.loads(hyprctl("activewindow", "-j"))
+        except ValueError:
+            target = None
+    if not target or not target.get("address"):
+        return
+    pid, cls = target.get("pid", 0), (target.get("class") or "").lower()
+    cmd = command_line(pid)
+
+    window_only = (pid <= 1 or "xwayland" in cmd.lower() or cls.startswith(WINDOW_ONLY_CLASSES)
+                   or "claude-desktop" in cmd or any(p in cmd for p in OWN_PIECES))
+    if window_only:
+        hyprctl("dispatch", "closewindow", f"address:{target['address']}")
+        return
+
+    if cls == "steam":                                    # the Steam client itself (not a game)
+        subprocess.Popen(["steam", "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)   # Steam has its own clean exit
+        return
+
+    for c in clients():                                   # 1. every window of the same process
+        if c.get("pid") == pid:
+            hyprctl("dispatch", "closewindow", f"address:{c['address']}")
+
+    deadline = time.time() + 3                            # 2. give it time to close by itself
+    while time.time() < deadline:
+        time.sleep(0.2)
+        if not alive(pid):
+            return
+    if any(c.get("pid") == pid for c in clients()):       # still has a window: it is asking something
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)                      # no window, still running: tray/background
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    main()

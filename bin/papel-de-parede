@@ -9,6 +9,12 @@
 #   papel-de-parede --url URL [PAG]  baixa uma imagem da internet (PAG = página, vira o "Referer")
 #   papel-de-parede --cores          só refaz as cores do tema a partir do wallpaper atual
 #
+# PARA QUAL ÁREA (doc 57). Antes do pedido, opcional:
+#   --area N    só na área de trabalho N (vai pro widgets.json, "por_area"; o resto fica como está)
+#   --all       em todas: vira o wallpaper do sistema e as áreas perdem o wallpaper próprio
+#   (nenhum)    segue WALL_TARGET no painel.conf: "workspace" (padrão) = a área em que você está agora;
+#               "all" = em todas. Settings → Theme → Wallpaper → "New wallpapers go to".
+#
 # Quem chama: o Thunar (botão direito numa imagem → "Set as wallpaper"), o histórico do clipboard
 # (Ctrl+Shift+V → botão direito numa imagem → "Set as Wallpaper"), o atalho Super+Shift+W e o
 # exec-once do hyprland.conf (sem argumentos, no login).
@@ -66,6 +72,24 @@ cores_do_wallpaper() {
 }
 
 # ---------- 1. ler o pedido ----------
+WIDGETS="$HOME/.config/aero-shell/widgets.json"
+ALVO=""
+while :; do
+    case "${1:-}" in
+        --area) ALVO="${2:-}"; shift 2 ;;
+        --all)  ALVO=all; shift ;;
+        *)      break ;;
+    esac
+done
+case "$ALVO" in ""|all|[1-9]|[1-9][0-9]) ;; *) echo "--area precisa de um número" >&2; exit 2 ;; esac
+area_ativa() { hyprctl activeworkspace -j 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("id", 0))' 2>/dev/null; }
+if [ -z "$ALVO" ] && [ -n "${1:-}" ]; then
+    if grep -qx 'WALL_TARGET=all' "$PAINEL" 2>/dev/null; then ALVO=all
+    else
+        ALVO="$(area_ativa)"
+        [[ "$ALVO" =~ ^[1-9][0-9]?$ ]] || ALVO=all       # área especial / sem Hyprland: todas
+    fi
+fi
 MODO="" ORIGEM="" PAGINA=""
 case "${1:-}" in
     "")           iniciar_hyprpaper; exit 0 ;;
@@ -228,7 +252,41 @@ GdkPixbuf.Pixbuf.new_from_file(sys.argv[1]).savev(sys.argv[2], "png", [], [])' \
     fi
 fi
 
+# ---------- 6a. só numa área: grava no widgets.json; o widgets.py troca ao entrar nela ----------
+if [[ "$ALVO" =~ ^[0-9]+$ ]]; then
+    python3 -I - "$WIDGETS" "$ALVO" "$FINAL" <<'PY' || { avisar_erro "Can't save the workspace wallpaper in $WIDGETS"; exit 5; }
+import json, os, sys
+caminho, area, arquivo = sys.argv[1:]
+try:
+    d = json.load(open(caminho))
+except (OSError, ValueError):
+    d = {}
+d.setdefault("por_area", {}).setdefault(area, {})["wallpaper"] = arquivo
+with open(caminho + ".tmp", "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(caminho + ".tmp", caminho)
+PY
+    [ "$(area_ativa)" = "$ALVO" ] && hyprpaper_rodando && hyprctl hyprpaper wallpaper ",$FINAL,cover" >/dev/null
+    registrar "definido na área $ALVO: $FINAL"
+    notify-send -a "Wallpaper" -i "$FINAL" "Wallpaper set for workspace $ALVO" "$(basename "$FINAL")"
+    exit 0
+fi
+
 # ---------- 6. definir como papel de parede (passo 3 do Aero) ----------
+# "Em todas": as áreas deixam de ter wallpaper próprio (o resto do tema delas fica)
+python3 -I - "$WIDGETS" <<'PY' 2>/dev/null || true
+import json, os, sys
+caminho = sys.argv[1]
+d = json.load(open(caminho))
+por_area = d.get("por_area") or {}
+for a in list(por_area):
+    (por_area[a] or {}).pop("wallpaper", None)
+    if not por_area[a]:
+        por_area.pop(a)
+with open(caminho + ".tmp", "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(caminho + ".tmp", caminho)
+PY
 #  a) persistir: no hyprpaper.conf, a linha "path = ..." passa a apontar pro arquivo guardado.
 #     A versão anterior fica em hyprpaper.conf.anterior (pra desfazer).
 #  b) trocar ao vivo: "hyprctl hyprpaper wallpaper 'MONITOR,ARQUIVO,AJUSTE'" conversa com o

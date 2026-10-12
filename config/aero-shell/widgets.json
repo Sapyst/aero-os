@@ -25,7 +25,7 @@
       "id": "processos-1",
       "tipo": "processos",
       "x": 12,
-      "y": 692,
+      "y": 696,
       "ativo": true,
       "opcoes": {}
     },
@@ -48,8 +48,8 @@
     {
       "id": "clima-1",
       "tipo": "clima",
-      "x": 2002,
-      "y": 502,
+      "x": 1000,
+      "y": 1104,
       "ativo": true,
       "opcoes": {}
     }

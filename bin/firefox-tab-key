@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# firefox-tab-key N — Ctrl+1..9 escolhe a aba no Firefox (no Linux o Firefox usa Alt+1..9).
+# No Firefox: manda Alt+N pra ele. Em qualquer outra janela: repassa o Ctrl+N normal, nada muda.
+n="$1"
+classe=$(hyprctl activewindow -j | python3 -c 'import sys,json;print(json.load(sys.stdin).get("class",""))' 2>/dev/null)
+case "$classe" in
+    firefox|firefox-esr|librewolf) hyprctl dispatch sendshortcut "ALT, $n, activewindow" >/dev/null ;;
+    *)                             hyprctl dispatch sendshortcut "CTRL, $n, activewindow" >/dev/null ;;
+esac

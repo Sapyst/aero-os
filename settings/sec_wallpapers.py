@@ -13,6 +13,8 @@ Como funciona:
   - Miniaturas: baixa a imagem, reduz com GdkPixbuf e guarda só a miniatura no cache.
   - Clicar numa miniatura chama `papel-de-parede --url URL`, o mesmo comando do resto do sistema
     (guarda em ~/Pictures/Wallpapers, troca o wallpaper, refaz as cores se estiver ligado). Doc 21.
+  - "Apply to" (doc 57): a área em que você está (padrão), todas, ou uma área escolhida. Aberto pelo
+    Workspaces → Choose…, já vem na área que você estava editando. "From file…" usa uma imagem do disco.
 """
 import hashlib
 import json
@@ -208,6 +210,16 @@ class SecaoWallpapers(Secao):
                                    tooltip_text="Hide small files (they are usually low resolution)")
         self.minimo.connect("notify::selected", lambda *_: self.desenhar())
         topo.append(self.minimo)
+        # para onde vai o wallpaper escolhido (papel-de-parede --area N / --all)
+        self.alvo = Gtk.DropDown(model=Gtk.StringList.new(["This workspace", "All workspaces"] +
+                                                          [f"Workspace {n}" for n in range(1, 6)]),
+                                 tooltip_text="Where the wallpaper you pick goes")
+        self.alvo_fixo = False
+        topo.append(Gtk.Label(label="Apply to"))
+        topo.append(self.alvo)
+        do_disco = Gtk.Button(label="From file…", tooltip_text="Use an image from your computer")
+        do_disco.connect("clicked", lambda *_: self.escolher_arquivo())
+        topo.append(do_disco)
 
         # --- esquerda: árvore ---
         self.selecao = Gtk.SingleSelection()
@@ -329,8 +341,73 @@ class SecaoWallpapers(Secao):
     # --- carregar lista de arquivos ---
 
     def ao_mostrar(self):
+        if not self.alvo_fixo:
+            from comum import ler_painel
+            self.alvo.set_selected(1 if ler_painel().get("WALL_TARGET") == "all" else 0)
+            self.pagina.set_title(self.titulo)
+        self.alvo_fixo = False
         if not self.carregou:
             self.carregar()
+
+    def para_area(self, area):
+        """Aberto por Workspaces → Choose…: o próximo wallpaper vai pra essa área."""
+        self.alvo.set_selected(area + 1)
+        self.alvo_fixo = True
+        self.pagina.set_title(f"Wallpaper for workspace {area}")
+
+    def args_alvo(self):
+        i = self.alvo.get_selected()
+        if i == 1:
+            return ["--all"], "all workspaces"
+        if i >= 2:
+            return ["--area", str(i - 1)], f"workspace {i - 1}"
+        import json
+        import subprocess
+        try:
+            a = json.loads(subprocess.run(["hyprctl", "activeworkspace", "-j"], capture_output=True, text=True).stdout)["id"]
+        except (ValueError, KeyError):
+            a = 0
+        return (["--area", str(a)], f"workspace {a}") if a > 0 else (["--all"], "all workspaces")
+
+    def aplicar(self, pedido, nome):
+        args, onde = self.args_alvo()
+
+        def trabalho():
+            r = rodar([os.path.expanduser("~/.local/bin/papel-de-parede"), *args, *pedido])
+            if r.returncode != 0:
+                raise RuntimeError(f"papel-de-parede exited with code {r.returncode} (see its log)")
+            return nome
+
+        def depois(r):
+            self.janela.avisar(f"Couldn't set wallpaper: {r}" if isinstance(r, Exception)
+                               else f"Wallpaper set for {onde}: {r}")
+            if not isinstance(r, Exception) and hasattr(self.janela, "atualizar_secoes"):
+                self.janela.atualizar_secoes()
+        em_segundo_plano(trabalho, depois)
+
+    def escolher_arquivo(self):
+        dialogo = Gtk.FileDialog(title="Choose a wallpaper")
+        filtro = Gtk.FileFilter(name="Images")
+        filtro.add_pixbuf_formats()
+        filtros = Gio.ListStore.new(Gtk.FileFilter)
+        filtros.append(filtro)
+        dialogo.set_filters(filtros)
+        pasta = os.path.expanduser("~/Pictures/Wallpapers")
+        if os.path.isdir(pasta):
+            dialogo.set_initial_folder(Gio.File.new_for_path(pasta))
+
+        def pronto(dlg, res):
+            try:
+                arquivo = dlg.open_finish(res)
+            except GLib.Error:
+                return
+            caminho = arquivo.get_path() if arquivo else None
+            if caminho and "," in caminho:
+                self.janela.avisar("That file name has a comma; rename it first")
+            elif caminho:
+                self.janela.avisar("Setting wallpaper…")
+                self.aplicar([caminho], os.path.basename(caminho))
+        dialogo.open(self.janela, None, pronto)
 
     def carregar(self, forcar=False):
         fonte = self.fonte
@@ -484,14 +561,4 @@ class SecaoWallpapers(Secao):
         url = url_raw(self.fonte, caminho)
         pagina_web = f"https://github.com/{self.fonte['owner']}/{self.fonte['repo']}"
         self.janela.avisar("Downloading wallpaper…")
-
-        def trabalho():
-            r = rodar([os.path.expanduser("~/.local/bin/papel-de-parede"), "--url", url, pagina_web])
-            if r.returncode != 0:
-                raise RuntimeError(f"papel-de-parede exited with code {r.returncode} (see its log)")
-            return os.path.basename(caminho)
-
-        def depois(r):
-            self.janela.avisar(f"Couldn't set wallpaper: {r}" if isinstance(r, Exception)
-                               else f"Wallpaper set: {r}")
-        em_segundo_plano(trabalho, depois)
+        self.aplicar(["--url", url, pagina_web], os.path.basename(caminho))

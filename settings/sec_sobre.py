@@ -9,7 +9,6 @@ Quase tudo vem de arquivos que o kernel expõe:
 """
 import json
 import os
-import re
 import platform
 import shutil
 
@@ -29,14 +28,14 @@ def ler_arquivo(caminho, padrao=""):
 
 
 def placas_de_video():
-    """Placas de vídeo pelo lspci (ex.: "AMD Radeon 890M + NVIDIA GeForce RTX 5070")."""
-    r = rodar(["lspci"])
+    """Placas de vídeo pelo lspci (o nome comercial vem no último [...])."""
+    import re as _re
     nomes = []
-    for linha in (r.stdout or "").splitlines():
+    for linha in (rodar(["lspci"]).stdout or "").splitlines():
         if " VGA " in linha or " 3D " in linha or " Display " in linha:
             nome = linha.split(": ", 1)[-1]
-            colchetes = re.findall(r"\[([^\]]+)\]", nome)       # o nome comercial vem no último [...]
-            nomes.append(colchetes[-1] if colchetes else re.sub(r"\s*\(rev [^)]*\)$", "", nome))
+            c = _re.findall(r"\[([^\]]+)\]", nome)
+            nomes.append(c[-1] if c else nome)
     return " + ".join(nomes) or "Unknown"
 
 
@@ -110,7 +109,6 @@ class SecaoSobre(Secao):
         GLib.timeout_add_seconds(3, self.atualizar_nvidia)   # repete a cada 3 s
 
         discos = Adw.PreferencesGroup(title="Storage")
-        # AERO_DADOS = ponto de montagem de um segundo disco (opcional)
         for titulo, ponto in (("System and home", "/"), ("Data disk", os.environ.get("AERO_DADOS", "/mnt/data"))):
             if not os.path.ismount(ponto):
                 continue
@@ -129,7 +127,7 @@ class SecaoSobre(Secao):
         for titulo, sub, caminho, icone in (
                 ("Hyprland config files", "~/.config/hypr", "~/.config/hypr", "folder-symbolic"),
                 ("Prints", "Print key: drag an area; it goes to Ctrl+V and to this folder",
-                 os.path.join(imagens, "Prints"), "camera-photo-symbolic")):
+                 os.path.join(imagens, "Prints"), "camera-photo-symbolic"),):
             pastas.add(linha_app(titulo, sub, ["thunar", os.path.expanduser(caminho)], icone))
 
         for g in (aparelho, gpu, discos, pastas):

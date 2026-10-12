@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""hypr-transitions: the effect played when you switch workspace (replaces hypr-glitch).
+
+Each transition is a folder in ~/.local/share/aero-shell/transitions/<id>/:
+  info.json        name, icon, description, "curve" (strength of each frame, 1 -> 0) and "frame_ms"
+  shader.frag.in   a Hyprland screen shader with @DIR@ @FORCE@ @SEED@ @TINT@ @TINT_AMT@ to fill in
+On a switch, the frames (one .frag per curve step and side) are switched on one after another through
+decoration:screen_shader, then the shader you had before comes back. No "time" uniform: Hyprland would
+need damage tracking off (GPU busy all the time). New transition = new folder; Settings lists it by itself.
+
+Settings (painel.conf, written by Settings → Workspaces → Transition):
+  TRANS_EFFECT=glitch|ascii|pixelate|flash|none   TRANS_STRENGTH=0.6|1.0|1.4   TRANS_SPEED=1.5|1.0|0.7
+  TRANS_TINT=none|wallpaper|white
+Per workspace (widgets.json, "por_area": {"2": {"transition": "ascii"}}): overrides the effect there.
+kill -USR1 <pid> plays the current workspace's transition (the Preview button).
+"""
+import colorsys
+import hashlib
+import json
+import os
+import signal
+import socket
+import threading
+import time
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+SIG = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
+HOME = os.path.expanduser("~")
+PASTA = f"{HOME}/.local/share/aero-shell/transitions"
+CACHE = f"{HOME}/.cache/aero-transitions"
+PAINEL = f"{HOME}/.config/hypr/painel.conf"
+WIDGETS = f"{HOME}/.config/aero-shell/widgets.json"
+
+
+def hypr(cmd):
+    """A command straight into Hyprland's socket (faster than calling hyprctl)."""
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(f"{RUN}/hypr/{SIG}/.socket.sock")
+        s.sendall(cmd.encode())
+        return s.recv(65536).decode(errors="replace")
+    finally:
+        s.close()
+
+
+def painel():
+    v = {}
+    try:
+        for linha in open(PAINEL):
+            if "=" in linha and not linha.startswith("#"):
+                k, x = linha.rstrip("\n").split("=", 1)
+                v[k.strip()] = x.strip().strip('"')
+    except OSError:
+        pass
+    return v
+
+
+def por_area():
+    try:
+        return json.load(open(WIDGETS)).get("por_area") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+_tons = {}
+
+
+def tom_do_wallpaper(caminho):
+    """The wallpaper's vivid colour, bright (a grey picture gives near-white). Cached per file."""
+    chave = (caminho, os.path.getmtime(caminho) if os.path.isfile(caminho) else 0)
+    if chave in _tons:
+        return _tons[chave]
+    cor = (0.92, 0.92, 0.92)
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(caminho, 48, 48, True)
+        n, st, px = pb.get_n_channels(), pb.get_rowstride(), pb.get_pixels()
+        soma, peso = [0.0] * 3, 0.0
+        for y in range(pb.get_height()):
+            for x in range(pb.get_width()):
+                i = y * st + x * n
+                rgb = [px[i + k] / 255 for k in range(3)]
+                _, s, v = colorsys.rgb_to_hsv(*rgb)
+                w = (s * v) ** 2
+                peso += w
+                for k in range(3):
+                    soma[k] += rgb[k] * w
+        if peso > pb.get_width() * pb.get_height() * 0.01:
+            h, s, _ = colorsys.rgb_to_hsv(*[c / peso for c in soma])
+            cor = colorsys.hsv_to_rgb(h, min(s, 0.75), 1.0)
+    except Exception:  # noqa: BLE001 — no picture = near-white
+        pass
+    _tons[chave] = cor
+    return cor
+
+
+def config(area):
+    """What to play when arriving at [area]: (effect, strength, speed, tint colour, tint amount)."""
+    p = painel()
+    efeito = p.get("TRANS_EFFECT") or ("none" if p.get("TRANSICAO_GLITCH") == "0" else "glitch")
+    reg = por_area().get(str(area)) or {}
+    efeito = reg.get("transition") or efeito
+    forca = float(p.get("TRANS_STRENGTH") or 1.0)
+    vel = float(p.get("TRANS_SPEED") or 1.0)
+    tint = p.get("TRANS_TINT") or "none"
+    if tint == "wallpaper":
+        cor = tom_do_wallpaper(reg.get("wallpaper") or p.get("WALL_ORIGINAL", ""))
+        return efeito, forca, vel, cor, 0.85
+    if tint == "white":
+        return efeito, forca, vel, (0.95, 0.95, 0.95), 0.85
+    return efeito, forca, vel, (0.0, 0.0, 0.0), 0.0
+
+
+def quadros(efeito, forca, cor, amt):
+    """Writes (once, cached) the frames of this effect with these settings. Returns (info, folder)."""
+    pasta = os.path.join(PASTA, efeito)
+    try:
+        info = json.load(open(os.path.join(pasta, "info.json")))
+        modelo = open(os.path.join(pasta, "shader.frag.in")).read()
+    except (OSError, ValueError):
+        return None, None
+    curva = info.get("curve") or [1.0, 0.7, 0.4, 0.15]
+    chave = hashlib.sha1(json.dumps([efeito, forca, cor, amt, modelo, curva]).encode()).hexdigest()[:12]
+    saida = os.path.join(CACHE, f"{efeito}-{chave}")
+    if not os.path.isdir(saida):
+        os.makedirs(saida + ".tmp", exist_ok=True)
+        for lado, d in (("left", -1.0), ("right", 1.0)):
+            for i, c in enumerate(curva):
+                txt = (modelo.replace("@DIR@", f"{d:.1f}").replace("@FORCE@", f"{min(1.0, c * forca):.3f}")
+                       .replace("@SEED@", f"{i * 37 + 11}.0").replace("@TINT_AMT@", f"{amt:.2f}")
+                       .replace("@TINT@", "vec3({:.3f}, {:.3f}, {:.3f})".format(*cor)))
+                with open(os.path.join(saida + ".tmp", f"{lado}-{i}.frag"), "w") as f:
+                    f.write(txt)
+        os.replace(saida + ".tmp", saida)
+    return info, saida
+
+
+class Efeito:
+    def __init__(self):
+        self.geracao = 0
+        self.trava = threading.Lock()
+        self.anterior = None          # the shader you had before the effect
+
+    def disparar(self, area, lado):
+        efeito, forca, vel, cor, amt = config(area)
+        if efeito == "none":
+            return
+        info, pasta = quadros(efeito, forca, cor, amt)
+        if not pasta:
+            return
+        with self.trava:
+            self.geracao += 1
+            g = self.geracao
+            if self.anterior is None:
+                atual = hypr("getoption decoration:screen_shader").splitlines()[0].removeprefix("str: ").strip()
+                self.anterior = "" if atual in ("", "[[EMPTY]]") or atual.startswith(CACHE) else atual
+        passo = info.get("frame_ms", 60) / 1000 * vel
+        n = len(info.get("curve") or [0] * 4)
+        threading.Thread(target=self.rodar, args=(g, pasta, lado, n, passo), daemon=True).start()
+
+    def rodar(self, g, pasta, lado, n, passo):
+        inicio = time.monotonic()
+        for i in range(n):
+            time.sleep(max(0.0, inicio + i * passo - time.monotonic()))
+            if g != self.geracao:
+                return                          # another switch started: it takes over
+            hypr(f"keyword decoration:screen_shader {pasta}/{lado}-{i}.frag")
+        time.sleep(max(0.0, inicio + n * passo - time.monotonic()))
+        with self.trava:
+            if g != self.geracao:
+                return
+            hypr(f"keyword decoration:screen_shader {self.anterior or '[[EMPTY]]'}")
+            self.anterior = None
+
+
+def area_ativa():
+    try:
+        return int(hypr("j/activeworkspace").split('"id":', 1)[1].split(",", 1)[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def main():
+    efeito = Efeito()
+    signal.signal(signal.SIGUSR1, lambda *_: efeito.disparar(area_ativa(), "right"))
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(f"{RUN}/hypr/{SIG}/.socket2.sock")
+    atual = area_ativa()
+    buf = b""
+    while True:
+        try:
+            dados = s.recv(4096)
+        except InterruptedError:
+            continue
+        if not dados:
+            break
+        buf += dados
+        *linhas, buf = buf.split(b"\n")
+        for linha in linhas:
+            evento, _, valor = linha.decode(errors="replace").partition(">>")
+            if evento != "workspacev2":
+                continue
+            try:
+                novo = int(valor.split(",", 1)[0])
+            except ValueError:
+                continue
+            if novo < 0 or novo == atual:       # special workspaces (minimized...) don't animate
+                continue
+            lado = "right" if atual is None or novo > atual else "left"
+            atual = novo
+            efeito.disparar(novo, lado)
+
+
+if __name__ == "__main__":
+    main()
