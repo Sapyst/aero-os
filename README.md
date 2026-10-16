@@ -49,6 +49,11 @@ Hyprland's own gaps, share the windows' glass and cost almost no CPU when idle. 
 
 ![Super menu, closer](screenshots/supermenu-focus.png)
 
+**Settings → Theme**: the whole look at once. Two visuals, **AeroTerm** (terminal, OLED black, ASCII and glitch)
+and **AerOS** (light pastel glass, soft corners); each remembers its own settings, so switching back restores everything.
+
+![Settings: theme](screenshots/settings-theme.png)
+
 **ASCII icons.** One switch turns every app icon (menu, dock, Alt+Tab) into a monochrome ASCII tile with a
 phosphor glow. It runs once, remembers what it did, converts new apps at login and restores the originals when
 turned off. **Settings → Icons** also picks the icon pack underneath, installs packs (folders or archives of any
