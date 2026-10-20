@@ -12,6 +12,9 @@ Usa o pactl (a interface "PulseAudio" do PipeWire):
 (um lado mais alto abaixo de 100%, ou voltam zerados ao reconectar). Ligado, o volume passa a ser
 feito em software e o volume interno do aparelho fica preso em 100% — quem faz isso é o
 componente do sistema `aero-audio` (~/.local/bin/aero-audio + aero-audio-guard.service).
+
+"Switch to new devices": ao conectar um fone/caixa USB ou Bluetooth, o som passa para ele sozinho
+(como no celular); ao desconectar, volta para o anterior. Também é o aero-audio que faz.
 """
 import json
 import re
@@ -139,7 +142,18 @@ class SecaoSom(Secao):
                 fixo.connect("notify::active", self.ao_fixo, cartao, tipo, grupo)
                 grupo.add(fixo)
                 self.linhas[tipo].append(fixo)
-        elif not itens:
+        if not entrada and os.path.exists(AERO_AUDIO):
+            try:
+                ligado = "switch_to_new=off" not in open(os.path.expanduser("~/.config/aero/audio.conf")).read()
+            except FileNotFoundError:
+                ligado = True
+            troca = Adw.SwitchRow(title="Switch to new devices",
+                                  subtitle="When a headset or speaker connects (USB or Bluetooth), sound moves to it",
+                                  active=ligado)
+            troca.connect("notify::active", lambda r, *_: self.atualizando or rodar([AERO_AUDIO, "switch", "on" if r.get_active() else "off"]))
+            grupo.add(troca)
+            self.linhas[tipo].append(troca)
+        if not itens:
             vazio = Adw.ActionRow(use_markup=False, title="No devices found")
             grupo.add(vazio)
             self.linhas[tipo].append(vazio)

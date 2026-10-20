@@ -9,9 +9,12 @@ volume pinned at 100%, so the system volume is always the real volume.
   aero-audio list              devices with fixed volume
   aero-audio set CARD on|off   add or remove a card (its PipeWire name, alsa_card.…)
   aero-audio apply             write the WirePlumber rule from the list and reload
-  aero-audio guard             keep listed devices at 100% (run by aero-audio-guard.service)
+  aero-audio guard             keep listed devices at 100%, and switch the output to devices as
+                               they connect (run by aero-audio-guard.service)
+  aero-audio switch on|off     switch the output to a headset/speaker when it connects (like a phone)
 
 The list lives in ~/.config/aero/fixed-volume.list, one card name per line.
+Preferences live in ~/.config/aero/audio.conf (switch_to_new=on|off).
 """
 import json
 import os
@@ -23,6 +26,26 @@ import time
 LIST = os.path.expanduser("~/.config/aero/fixed-volume.list")
 RULE = os.path.expanduser("~/.config/wireplumber/wireplumber.conf.d/51-aero-fixed-volume.conf")
 SERVICE = "aero-audio-guard.service"
+PREFS = os.path.expanduser("~/.config/aero/audio.conf")
+
+
+def prefs():
+    p = {"switch_to_new": "on"}
+    try:
+        for line in open(PREFS):
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                p[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return p
+
+
+def save_prefs(p):
+    os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+    with open(PREFS, "w") as f:
+        f.write("# Aero OS sound (written by aero-audio and Settings)\n")
+        f.writelines(f"{k}={v}\n" for k, v in p.items())
 
 
 def run(cmd):
@@ -101,7 +124,57 @@ def watch(name, card, stop):
     p.kill()
 
 
+# ---------- trocar a saída para o aparelho que acabou de conectar (como no celular) ----------
+# Vale para fones e caixas USB e Bluetooth. Fica de fora: HDMI (o monitor "reconecta" toda vez que
+# acorda), microfones USB que também têm saída (fifine) e webcams. Só a SAÍDA muda: trocar o
+# microfone para um fone Bluetooth derruba a qualidade do som dele (perfil de chamada).
+
+def sinks():
+    r = run(["pactl", "-f", "json", "list", "sinks"])
+    return {s["name"]: s for s in json.loads(r.stdout)} if r.returncode == 0 else {}
+
+
+def is_personal(sink):
+    p = sink.get("properties", {})
+    return p.get("device.bus") in ("usb", "bluetooth") and p.get("device.form_factor") not in ("microphone", "webcam")
+
+
+def audio_age():
+    """Seconds since PipeWire's session manager (re)started: right after it, every device 'appears'."""
+    r = run(["systemctl", "--user", "show", "wireplumber.service", "-p", "ActiveEnterTimestampMonotonic", "--value"])
+    try:
+        return time.monotonic() - int(r.stdout.strip()) / 1e6
+    except ValueError:
+        return 999.0
+
+
+def switcher():
+    known = set(sinks())
+    p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    for line in p.stdout:
+        if "'new' on sink" not in line and "'remove' on sink" not in line:
+            continue
+        time.sleep(0.8)  # deixa o aparelho terminar de aparecer (nome, perfil)
+        now = sinks()
+        new = [n for n in now if n not in known]
+        known = set(now)
+        if not new or prefs().get("switch_to_new") != "on" or audio_age() < 8 or len(new) > 2:
+            continue
+        for name in new:
+            if is_personal(now[name]):
+                run(["pactl", "set-default-sink", name])
+                desc = now[name].get("description", name)
+                run(["notify-send", "-a", "Sound", "-i", "audio-headphones", "Sound output", desc])
+                break
+    p.kill()
+
+
 def guard():
+    def keep_switching():
+        while True:          # se o PipeWire reiniciar, o pactl subscribe cai: começa de novo
+            switcher()
+            time.sleep(2)
+    threading.Thread(target=keep_switching, daemon=True).start()
     running = {}  # card name -> (alsa number, thread, stop flag)
     while True:
         want = set(listed())
@@ -137,6 +210,10 @@ def main():
         main_apply()
     elif args[0] == "guard":
         guard()
+    elif args[0] == "switch" and len(args) == 2 and args[1] in ("on", "off"):
+        p = prefs()
+        p["switch_to_new"] = args[1]
+        save_prefs(p)
     else:
         print(__doc__)
         sys.exit(2)

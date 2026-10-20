@@ -44,7 +44,7 @@ clipboard history, sound/quick center. Review it before logging in with it.
   cp config/systemd/user/aero-bluetooth.service ~/.config/systemd/user/
   systemctl --user daemon-reload && systemctl --user enable --now aero-bluetooth.service
   ```
-- **Fixed device volume** (Settings → Sound): for USB headsets whose own volume misbehaves (one side
+- **Fixed device volume** (Settings → Sound): and **Switch to new devices** (sound moves to a headset or speaker when it connects, like a phone). Fixed volume is for USB headsets whose own volume misbehaves (one side
   louder below 100%, or silent after reconnecting). Needs `alsa-utils`; turn on the guard once:
   ```bash
   cp config/systemd/user/aero-audio-guard.service ~/.config/systemd/user/
