@@ -1,0 +1,36 @@
+// Aero OS boot splash: the ASCII Venus de Milo looping (frames from boot/make-frames.py) on black.
+// The same animation carries on in the login screen, so boot and login look like one thing.
+
+Window.SetBackgroundTopColor(0, 0, 0);
+Window.SetBackgroundBottomColor(0, 0, 0);
+
+n = 40;
+h = Window.GetHeight() * 0.62;
+for (i = 0; i < n; i++) {
+    if (i < 10) name = "frame-0" + i + ".png";
+    else name = "frame-" + i + ".png";
+    raw = Image(name);
+    frames[i] = raw.Scale(raw.GetWidth() * h / raw.GetHeight(), h);
+}
+
+sprite = Sprite(frames[0]);
+sprite.SetX(Window.GetX() + (Window.GetWidth() - frames[0].GetWidth()) / 2);
+sprite.SetY(Window.GetY() + (Window.GetHeight() - frames[0].GetHeight()) / 2);
+
+tick = 0;
+fun refresh() {
+    // Plymouth calls this 50 times a second; the frames run at 25.
+    tick++;
+    sprite.SetImage(frames[Math.Int(tick / 2) % n]);
+}
+Plymouth.SetRefreshFunction(refresh);
+
+// Messages (for example a disk check) at the bottom, small and grey.
+msg = Sprite();
+fun message(text) {
+    img = Image.Text(text, 0.6, 0.6, 0.6);
+    msg.SetImage(img);
+    msg.SetX(Window.GetX() + (Window.GetWidth() - img.GetWidth()) / 2);
+    msg.SetY(Window.GetY() + Window.GetHeight() * 0.92);
+}
+Plymouth.SetMessageFunction(message);

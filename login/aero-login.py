@@ -49,7 +49,17 @@ def encaixe():
     except OSError:
         pass
     return "crop"
-SESSAO = ["start-hyprland"]          # o mesmo que digitar "Hyprland" no terminal (com o vigia dele)
+# O mesmo que digitar "Hyprland" no terminal (com o vigia dele), mas sem mostrar NADA no terminal
+# (ver aero-session). Tem de ser UM programa: o greetd não repassa "sh -c ..." do jeito esperado,
+# e a sessão abria e fechava na hora (o login voltava sozinho).
+SESSAO = ["/etc/greetd/aero-login/aero-session"]
+
+# A animação de início do Aero OS (a mesma do boot e do desktop), se estiver instalada.
+sys.path.insert(0, "/usr/share/aero/venus")
+try:
+    from venus import Venus
+except (ImportError, OSError):
+    Venus = None
 
 CSS = """
 window { background: black; }
@@ -181,6 +191,19 @@ class Login(Adw.Application):
             energia.append(b)
         camadas.add_overlay(energia)
 
+        # A Vênus do boot continua aqui por um instante e se desfaz revelando a tela de login.
+        self.camadas = camadas
+        self.venus = None
+        if Venus and not TESTE:
+            try:
+                self.venus = Venus()
+                self.venus.loop()
+                camadas.add_overlay(self.venus)
+                self.venus.set_can_target(False)          # nunca pega clique nem foco
+                GLib.timeout_add(900, lambda: self.venus.leave(0.8, self.sem_venus) and False)
+            except Exception:  # noqa: BLE001 — sem animação, o login funciona igual
+                self.venus = None
+
         self.janela.set_child(camadas)
         if not TESTE:
             self.janela.fullscreen()
@@ -188,6 +211,11 @@ class Login(Adw.Application):
             self.janela.set_default_size(1280, 720)
         self.janela.present()
         self.senha.grab_focus()            # o perfil já vem escolhido: é só digitar a senha
+
+    def sem_venus(self):
+        if self.venus:
+            self.camadas.remove_overlay(self.venus)
+            self.venus = None
 
     def tique(self):
         agora = GLib.DateTime.new_now_local()
@@ -233,6 +261,16 @@ class Login(Adw.Application):
             if r.get("type") == "success":
                 r = g.pedir({"type": "start_session", "cmd": SESSAO, "env": []})
                 if r.get("type") == "success":
+                    # A Vênus volta com glitch e para; o desktop começa com essa mesma imagem.
+                    if Venus and not TESTE:
+                        try:
+                            v = Venus()
+                            v.set_can_target(False)
+                            self.camadas.add_overlay(v)
+                            v.enter(0.7, self.quit, fade_backdrop=True)
+                            return
+                        except Exception:  # noqa: BLE001
+                            pass
                     self.quit()             # o greetd abre o Hyprland do usuário
                     return
             g.pedir({"type": "cancel_session"})

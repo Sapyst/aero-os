@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# aero-intro: o primeiro segundo do desktop (a Vênus em ASCII sai com glitch e mostra o desktop pronto).
+# Código: ~/.local/share/aero-shell/intro.py. Precisa do gtk4-layer-shell carregado antes de tudo.
+export LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so
+exec python3 "$HOME/.local/share/aero-shell/intro.py" "$@"   # in the repo: boot/intro.py

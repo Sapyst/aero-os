@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Aero
+Description=Aero OS: the Venus de Milo in ASCII, with a wave and a glitch
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/aero
+ScriptFile=/usr/share/plymouth/themes/aero/aero.script

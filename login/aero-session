@@ -1,0 +1,6 @@
+#!/bin/sh
+# aero-session: abre o desktop (Hyprland) do usuário depois do login, sem mostrar nada no terminal.
+# Limpa a tela, esconde o cursor e manda as mensagens do Hyprland para o registro dele
+# ($XDG_RUNTIME_DIR/hypr). Chamado pela tela de login (aero-login.py) via greetd.
+printf '\033[2J\033[H\033[?25l'
+exec start-hyprland >/dev/null 2>&1
