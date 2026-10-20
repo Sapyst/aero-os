@@ -1,0 +1,10 @@
+workspace>>2
+activewindow>>firefox,Some page, with a comma
+openwindow>>55800f619320,1,comfyui,ComfyUI
+openwindow>>55800f5407b0,2,firefox,Title, with, commas >> and arrows
+windowtitlev2>>55800f619320,ComfyUI - workflow
+openwindow>>zz-not-hex,1,comfyui,bad address
+openwindow>>abc
+closewindow>>55800f5407b0
+closewindow>>55800f619320
+no separator here

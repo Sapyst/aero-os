@@ -1,0 +1,11 @@
+Name:	waybar
+Umask:	0022
+State:	S (sleeping)
+Tgid:	1399
+Pid:	1399
+PPid:	1310
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+VmRSS:	   81920 kB
+VmSwap:	    2048 kB
+Threads:	12

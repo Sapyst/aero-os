@@ -30,6 +30,7 @@ from sec_dock import SecaoDock
 from sec_energia import SecaoEnergia
 from sec_icones import SecaoIcones
 from sec_local import SecaoLocal
+from sec_memoria import SecaoMemoria
 from sec_mouse import SecaoMouse
 from sec_rede import SecaoRede
 from sec_recording import SecaoGravacao
@@ -55,8 +56,8 @@ ARVORE = [
     ("Screen recording", "media-record-symbolic", SecaoGravacao),
     ("Connections", "network-wireless-symbolic", [("Network", SecaoRede, None), ("Bluetooth", SecaoBluetooth, None)]),
     ("System", "emblem-system-symbolic", [
-        ("Power", SecaoEnergia, None), ("Location", SecaoLocal, None), ("Updates", SecaoAtualizacoes, None),
-        ("About", SecaoSobre, None)]),
+        ("Power", SecaoEnergia, None), ("Memory", SecaoMemoria, None), ("Location", SecaoLocal, None),
+        ("Updates", SecaoAtualizacoes, None), ("About", SecaoSobre, None)]),
 ]
 # Animações da árvore (doc 57): filhos deslizam (Gtk.Revealer), a seta gira, a linha clareia ao passar
 CSS_ARVORE = """

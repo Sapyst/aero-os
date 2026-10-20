@@ -1,0 +1,2119 @@
+#!/usr/bin/env python3
+"""aero-memory-agent: Aero OS memory helper for your session (runs as you, never as root).
+
+Frees what ComfyUI holds when you are done with it, and tells you what the memory guard
+(aero-memory, the root service) did:
+
+  - The last ComfyUI window closes (Super+C, Alt+F4, its own close button, Ctrl+Q, tray "quit") or the
+    app process ends: 5 s later, if the ComfyUI server is still running, its queue is empty and nothing
+    else is using it (a browser tab, for example), it is ended (SIGTERM, SIGKILL after 10 s). Then its
+    model files are dropped from the page cache, so that RAM is really free again. A server that is
+    still working is left to finish its queue first (then the orphan rule below takes over).
+  - A server the ComfyUI app left behind (orphan) is ended the same way once it has been idle and
+    unused for 2 minutes. A server the app never ran with (started by a script, a service or another
+    launcher) and a server you started from a terminal are never ended.
+  - Models are unloaded after N idle minutes (empty queue), when another app (a game) starts using
+    the NVIDIA GPU, and when the memory guard reports memory pressure (once until ComfyUI works again).
+  - nvidia-smi only runs when the NVIDIA GPU is already awake. The unload request itself touches the
+    GPU, so with the GPU asleep it is only sent when the server's RAM shows models are loaded.
+  - Notifications from the guard: what it paused or closed (only your own apps), "back to normal" only
+    when memory really is (not on a reload or a service stop), and when the kernel itself had to close
+    an app. Events from a guard in --dry-run are ignored.
+
+  aero-memory-agent             run (aero-memory-agent.service)
+  aero-memory-agent --check     one-shot report; changes nothing
+  aero-memory-agent --dry-run   run, but only log what it would do (no stop, no unload, no notification)
+
+For tests: --config FILE, --events FILE, --state FILE.
+Preferences: ~/.config/aero/memory-agent.conf (key=value, written by Settings → Memory; SIGHUP rereads it).
+State for Settings: $XDG_RUNTIME_DIR/aero-memory-agent.json (numbers and process names only).
+"""
+import sys
+
+# Rodando como script: tira a pasta do próprio script (~/.local/bin) da busca de módulos, pra nenhum
+# arquivo .py esquecido ali tomar o lugar de um módulo do Python (json.py, socket.py...).
+if __name__ == "__main__" and not getattr(sys.flags, "safe_path", False) and sys.path:
+    del sys.path[0]
+
+import argparse
+import collections
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import tempfile
+import time
+import zlib
+
+PROC = "/proc"
+SYSFS_PCI = "/sys/bus/pci/devices"
+EVENTS_FILE = "/run/aero-memory/events.jsonl"
+
+DEFAULTS = {
+    "comfy_free_on_close": 1,
+    "comfy_idle_unload_min": 15,
+    "comfy_free_for_games": 1,
+    "comfy_port": 8188,
+    "comfy_window_class": "comfyui",
+    "notify": 1,
+}
+BOOL_KEYS = ("comfy_free_on_close", "comfy_free_for_games", "notify")
+BOOL_VALUES = {"1": 1, "0": 0, "on": 1, "off": 0, "yes": 1, "no": 0, "true": 1, "false": 0}
+CLASS_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+SIG_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+ADDR_RE = re.compile(r"[0-9a-f]{1,16}")
+NUM_RE = re.compile(r"[0-9]{1,5}")      # só dígitos ASCII ("²".isdigit() é True, mas int("²") quebra)
+NAME_BAD = re.compile(r"[^A-Za-z0-9 ._+:/()-]")
+
+MODEL_EXT = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".sft", ".onnx")
+MAX_MODEL_FILES = 500          # arquivos de modelo lembrados por servidor
+MAX_SEEN_PATHS = 2000          # caminhos já conferidos (pra não repetir stat a cada 30 s)
+MAX_WINDOWS = 64
+MAX_APPS = 8
+MAX_NOTIFIERS = 4
+
+CLOSE_GRACE_S = 5              # depois da última janela: tempo do próprio Electron encerrar
+ORPHAN_AFTER_S = 120           # servidor sem app nenhum por esse tempo = órfão
+STOP_WAIT_S = 10               # SIGTERM -> espera isso -> SIGKILL
+KILL_WAIT_S = 3
+TICK_S = 2                     # eventos do aero-memory, filhos do notify-send
+BACKEND_EVERY_S = 10           # quem escuta na porta
+QUEUE_EVERY_S = 30             # GET /queue
+GPU_FAST_S = 10                # nvidia-smi quando um jogo pode precisar da VRAM
+GPU_SLOW_S = 30
+RESYNC_EVERY_S = 60            # confere a lista de janelas (caso um evento tenha se perdido)
+GONE_KEEP_S = 600              # quanto tempo lembrar os arquivos de um servidor que já fechou
+CPU_BUSY_S = 3.0               # CPU gasta entre duas olhadas na fila que conta como "trabalhando"
+YOUNG_S = 120                  # servidor que acabou de abrir: a RAM dele agora é o "vazio"
+GAMES_VRAM_MB = 300            # outro app usando isso de VRAM a mais = jogo
+MODEL_VRAM_MB = 1024           # servidor com isso de VRAM = tem modelo carregado
+MODEL_RAM_MB = 1024            # RAM do servidor acima do "vazio" = tem modelo carregado
+SLEEPING_RSS_MB = 2048         # GPU dormindo e servidor menor que isso: nada que valha descarregar
+NOTIFY_EVERY_S = 30            # uma notificação por tipo a cada 30 s
+FREE_EVERY_S = 60              # um POST /free por motivo a cada 60 s
+FREE_CHECK_S = 5               # o ComfyUI descarrega em segundo plano: confere o que saiu depois disso
+FREED_MIN_MB = 256             # menos que isso liberado (sem certeza de modelo carregado) = sem aviso
+SMI_TIMEOUT_S = 3
+SMI_PAUSE_S = 600              # nvidia-smi travou (driver preso): não chama de novo por 10 min
+HTTP_TIMEOUT_S = 2
+HTTP_MAX_BYTES = 2 * 1024 * 1024
+HTTP_HEAD_CAP = 16384
+HTTP_HOSTS = ("127.0.0.1", "::1")
+LISTEN_LOCAL = ("127.0.0.1", "0.0.0.0", "::1", "::")
+FREE_BODY = b'{"unload_models": true, "free_memory": true}'
+HTTP_PATHS = {"/queue": None, "/free": FREE_BODY}
+
+READ_CAP = 1024 * 1024
+MAPS_CAP = 16 * 1024 * 1024
+TCP_CAP = 8 * 1024 * 1024
+HYPR_REPLY_CAP = 4 * 1024 * 1024
+HYPR_LINE_CAP = 4096
+EVENTS_READ_CAP = 256 * 1024
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+FRIENDLY = {"fossilize_replay": "Steam shader compilation"}
+# o comm do kernel tem no máximo 15 letras ("fossilize_repla"): procura pelo começo do nome
+FRIENDLY_15 = {k[:15]: v for k, v in FRIENDLY.items()}
+
+
+def log(msg):
+    """Só pro journal (stderr). Nunca caminhos, linhas de comando, títulos de janela ou endereços."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+def read_text(path, cap=READ_CAP):
+    """Lê no máximo `cap` bytes. None se não der (sumiu, sem permissão...)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(cap).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def fmt_size(mb):
+    mb = max(0, mb or 0)
+    return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{int(mb)} MB"
+
+
+# ---------------------------------------------------------------- configuração
+
+def parse_config(text):
+    """key=value -> dict com os padrões; valor fora do formato é ignorado (fica o padrão)."""
+    conf = dict(DEFAULTS)
+    for line in (text or "").splitlines()[:500]:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = (s.strip() for s in line.split("=", 1))
+        v = v.split("#", 1)[0].strip()
+        if k in BOOL_KEYS:
+            if v.lower() in BOOL_VALUES:
+                conf[k] = BOOL_VALUES[v.lower()]
+        elif k == "comfy_idle_unload_min":
+            if NUM_RE.fullmatch(v) and int(v) <= 1440:
+                conf[k] = int(v)
+        elif k == "comfy_port":
+            if NUM_RE.fullmatch(v) and 1 <= int(v) <= 65535:
+                conf[k] = int(v)
+        elif k == "comfy_window_class":
+            if CLASS_RE.fullmatch(v):
+                conf[k] = v.lower()
+    return conf
+
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "aero", "memory-agent.conf")
+
+
+def runtime_dir():
+    """$XDG_RUNTIME_DIR, só se for mesmo nosso e fechado (0700). Senão None."""
+    d = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    try:
+        st = os.stat(d)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None
+    return d
+
+
+# ---------------------------------------------------------------- Hyprland (socket2)
+
+def valid_sig(sig):
+    return bool(sig) and SIG_RE.fullmatch(sig) is not None and sig not in (".", "..")
+
+
+def order_instances(env_sig, found):
+    """found = [(nome, mtime do socket)]. Mais nova primeiro; a do ambiente (se ainda existe) na frente."""
+    names = [n for n, _ in sorted(found, key=lambda x: x[1], reverse=True)]
+    if env_sig in names:
+        names.remove(env_sig)
+        names.insert(0, env_sig)
+    return names
+
+
+def hypr_instances(runtime, env_sig, uid):
+    """Pastas de instância do Hyprland com um .socket2.sock nosso, na ordem de tentativa."""
+    if not runtime:
+        return []
+    base = os.path.join(runtime, "hypr")
+    try:
+        names = os.listdir(base)[:64]
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not valid_sig(name):
+            continue
+        try:
+            st = os.stat(os.path.join(base, name, ".socket2.sock"))
+        except OSError:
+            continue
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == uid:
+            found.append((name, st.st_mtime))
+    env_sig = env_sig if valid_sig(env_sig) else None
+    return [os.path.join(base, n) for n in order_instances(env_sig, found)]
+
+
+def norm_addr(addr):
+    """Endereço de janela -> "0x55..." (o socket2 manda sem 0x, o hyprctl com). None se não for hex."""
+    a = (addr or "").strip().lower()
+    a = a[2:] if a.startswith("0x") else a
+    return "0x" + a if ADDR_RE.fullmatch(a) else None
+
+
+def parse_hypr_line(line):
+    """'evento>>dados' -> (evento, dados), ou None."""
+    ev, sep, data = line.partition(">>")
+    if not sep or not ev:
+        return None
+    return ev.strip(), data.rstrip("\r\n")
+
+
+def parse_openwindow(data):
+    """'ENDEREÇO,ÁREA,CLASSE,TÍTULO' -> (endereço, classe). O título (pode ter vírgula) é jogado fora."""
+    parts = data.split(",", 3)
+    if len(parts) < 3:
+        return None
+    addr = norm_addr(parts[0])
+    if addr is None:
+        return None
+    return addr, parts[2].strip()
+
+
+def comfy_windows(clients, cls):
+    """Lista do `hyprctl clients -j` -> {endereço: pid} das janelas do ComfyUI."""
+    out = {}
+    if not isinstance(clients, list):
+        return out
+    for c in clients:
+        if not isinstance(c, dict):
+            continue
+        names = {str(c.get("class") or "").lower(), str(c.get("initialClass") or "").lower()}
+        if cls not in names:
+            continue
+        addr = norm_addr(str(c.get("address") or ""))
+        pid = c.get("pid")
+        if addr and len(out) < MAX_WINDOWS:
+            out[addr] = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 else None
+    return out
+
+
+class LineBuffer:
+    """Junta os pedaços que chegam do socket em linhas. Linha gigante: fica só o começo (limite fixo)."""
+
+    def __init__(self, cap=HYPR_LINE_CAP):
+        self.cap = cap
+        self.buf = bytearray()
+        self.skip = False
+
+    def feed(self, data):
+        out = []
+        self.buf += data
+        while True:
+            i = self.buf.find(b"\n")
+            if i < 0:
+                if len(self.buf) > self.cap:
+                    if not self.skip:
+                        out.append(bytes(self.buf[:self.cap]).decode("utf-8", "replace"))
+                        self.skip = True
+                    del self.buf[:]
+                return out
+            line = bytes(self.buf[:i])
+            del self.buf[:i + 1]
+            if self.skip:                       # resto de uma linha gigante que já saiu cortada
+                self.skip = False
+                continue
+            out.append(line[:self.cap].decode("utf-8", "replace"))
+
+
+def hypr_request(inst_dir, cmd=b"j/clients", timeout=3.0):
+    """Pergunta ao Hyprland pelo socket de comandos (é o que o `hyprctl -j clients` faz). None se falhar."""
+    if not inst_dir:
+        return None
+    deadline = time.monotonic() + timeout
+    chunks, total = [], 0
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(os.path.join(inst_dir, ".socket.sock"))
+            s.sendall(cmd)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                s.settimeout(left)
+                b = s.recv(65536)
+                if not b:
+                    break
+                total += len(b)
+                if total > HYPR_REPLY_CAP:
+                    return None
+                chunks.append(b)
+        return json.loads(b"".join(chunks))
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- /proc/net/tcp
+
+def hex_to_ip(h):
+    """Endereço do /proc/net/tcp(6) -> texto. IPv4 dentro de IPv6 (::ffff:a.b.c.d) vira IPv4."""
+    if len(h) == 8:
+        return socket.inet_ntop(socket.AF_INET, struct.pack("=I", int(h, 16)))
+    if len(h) == 32:
+        raw = struct.pack("=4I", *(int(h[i:i + 8], 16) for i in range(0, 32, 8)))
+        if raw[:12] == b"\0" * 10 + b"\xff\xff":
+            return socket.inet_ntop(socket.AF_INET, raw[12:])
+        return socket.inet_ntop(socket.AF_INET6, raw)
+    raise ValueError("bad address")
+
+
+TcpEntry = collections.namedtuple("TcpEntry", "laddr lport raddr rport state uid inode")
+TCP_ESTABLISHED = 0x01
+TCP_LISTEN = 0x0A
+
+
+def parse_proc_net_tcp(text):
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) < 10:
+            continue
+        try:
+            la, _, lp = f[1].partition(":")
+            ra, _, rp = f[2].partition(":")
+            out.append(TcpEntry(hex_to_ip(la), int(lp, 16), hex_to_ip(ra), int(rp, 16),
+                                int(f[3], 16), int(f[7]), int(f[9])))
+        except (ValueError, OSError):
+            continue
+    return out
+
+
+def read_tcp(proc=PROC):
+    entries = []
+    for name in ("tcp", "tcp6"):
+        entries += parse_proc_net_tcp(read_text(os.path.join(proc, "net", name), TCP_CAP))
+    return entries
+
+
+def local_listen_ok(ip):
+    """Só servidor desta máquina que dá pra perguntar em 127.0.0.1 ou ::1: 127.0.0.1, ::1 ou "todas"
+    (0.0.0.0 / ::). Outro 127.x fica de fora: o pedido HTTP iria pra outro endereço que não o dele."""
+    return ip in LISTEN_LOCAL
+
+
+def listen_addrs(entries, port, uid):
+    """{inode: endereço} dos sockets em LISTEN na porta, do nosso usuário, num endereço local."""
+    return {e.inode: e.laddr for e in entries
+            if e.state == TCP_LISTEN and e.lport == port and e.uid == uid and e.inode and local_listen_ok(e.laddr)}
+
+
+def listen_inodes(entries, port, uid):
+    return sorted(listen_addrs(entries, port, uid))
+
+
+def http_host(addrs):
+    """Onde perguntar ao servidor: 127.0.0.1 se ele escuta em IPv4, senão ::1 (só IPv6)."""
+    return "127.0.0.1" if any(":" not in a for a in addrs) else "::1"
+
+
+def count_external_clients(entries, port, ignore_inodes):
+    """Conexões abertas (ESTABLISHED) ao servidor cujo lado cliente não é do próprio servidor nem do app
+    do ComfyUI. Cliente de outra máquina, de outro usuário ou sem dono conhecido também conta (melhor
+    deixar o servidor vivo do que derrubar quem está usando).
+    Obs.: só vale pra servidor que sobrevive ao app (app travou ou servidor órfão); no fechamento normal
+    o próprio app do ComfyUI já mata o servidor antes dos 5 s de espera."""
+    clients = {}
+    for e in entries:
+        if e.state == TCP_ESTABLISHED and e.rport == port and e.lport != port:
+            clients[(e.laddr, e.lport)] = e
+    n = 0
+    for e in entries:
+        if e.state != TCP_ESTABLISHED or e.lport != port:
+            continue
+        c = clients.get((e.raddr, e.rport))
+        if c is None or not c.inode or c.inode not in ignore_inodes:
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------- processos
+
+def parse_stat(text):
+    """/proc/PID/stat -> dict. O nome (comm) pode ter espaço e parêntese: corta no último ')'."""
+    if not text:
+        return None
+    head, sep, rest = text.rpartition(")")
+    if not sep or "(" not in head:
+        return None
+    pid_s, _, comm = head.partition("(")
+    f = rest.split()
+    if len(f) < 20:
+        return None
+    try:
+        return {"pid": int(pid_s), "comm": comm, "state": f[0], "ppid": int(f[1]), "tty": int(f[4]),
+                "cpu": int(f[11]) + int(f[12]), "start": int(f[19])}
+    except ValueError:
+        return None
+
+
+def parse_status(text):
+    """/proc/PID/status -> uids (real, efetivo, salvo, fs) e memória em MB."""
+    out = {"uids": None, "rss_mb": 0.0, "anon_mb": 0.0, "shmem_mb": 0.0}
+    keys = {"VmRSS:": "rss_mb", "RssAnon:": "anon_mb", "RssShmem:": "shmem_mb"}
+    for line in (text or "").splitlines():
+        f = line.split()
+        if not f:
+            continue
+        if f[0] == "Uid:" and len(f) >= 5:
+            try:
+                out["uids"] = tuple(int(x) for x in f[1:5])
+            except ValueError:
+                pass
+        elif f[0] in keys and len(f) >= 2 and f[1].isdigit():
+            out[keys[f[0]]] = int(f[1]) / 1024
+    return out
+
+
+def proc_stat(pid, proc=PROC):
+    return parse_stat(read_text(f"{proc}/{pid}/stat", 4096))
+
+
+def proc_status(pid, proc=PROC):
+    text = read_text(f"{proc}/{pid}/status", 16384)
+    return parse_status(text) if text else None
+
+
+def proc_start(pid, proc=PROC):
+    st = proc_stat(pid, proc)
+    return st["start"] if st and st["state"] not in ("Z", "X") else None
+
+
+def proc_cmdline(pid, proc=PROC):
+    try:
+        with open(f"{proc}/{pid}/cmdline", "rb") as f:
+            raw = f.read(65536)
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a][:256]
+
+
+def proc_cwd(pid, proc=PROC):
+    try:
+        return os.readlink(f"{proc}/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def same_user(status, uid):
+    """Real e efetivo do processo = nós (nunca mexe em processo de outro usuário ou com setuid)."""
+    return bool(status and status["uids"] and status["uids"][0] == uid and status["uids"][1] == uid)
+
+
+def is_terminal_tty(tty_nr):
+    """O terminal de controle é um pseudo-terminal (kitty, foot, tmux, ssh: /dev/pts/N, major 136-143)?
+    O console de texto (/dev/ttyN) não conta: com o Hyprland aberto pelo login no tty1, TODO app da
+    sessão herda o tty1, e aí nada seria "do app"."""
+    return bool(tty_nr) and 136 <= os.major(tty_nr) <= 143
+
+
+def comfy_layout(d):
+    """A pasta tem a cara do ComfyUI (a pasta comfy/ e o execution.py ao lado do main.py)?"""
+    return os.path.isdir(os.path.join(d, "comfy")) and os.path.isfile(os.path.join(d, "execution.py"))
+
+
+def looks_like_comfy(comm, argv, cwd, layout=False):
+    """Um Python que é o ComfyUI: "comfy" na linha de comando ou na pasta, ou um main.py rodando numa
+    pasta com a cara do ComfyUI (layout). Um "python main.py" qualquer não conta.
+    (Outro programa na mesma porta nunca é encerrado.)"""
+    exe = os.path.basename(argv[0]) if argv else ""
+    if not (comm.lower().startswith("python") or exe.lower().startswith("python")):
+        return False
+    if any("comfy" in a.lower() for a in argv) or "comfy" in os.path.basename(cwd.rstrip("/")).lower():
+        return True
+    return bool(layout) and any(os.path.basename(a) == "main.py" for a in argv[1:4])
+
+
+def is_app_comm(comm, cls):
+    """O processo do app (Electron) do ComfyUI: "electron", ou o próprio nome da classe da janela."""
+    c = (comm or "").lower()
+    return c.startswith("electron") or (bool(cls) and c == cls[:15])
+
+
+def own_pids(uid, proc=PROC, skip=()):
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if not n.isdigit() or int(n) in skip:
+            continue
+        try:
+            if os.stat(f"{proc}/{n}").st_uid == uid:
+                out.append(int(n))
+        except OSError:
+            pass
+    return out
+
+
+def socket_inodes(pid, proc=PROC, cap=65536):
+    """Inodes dos sockets abertos por um processo (links socket:[N] em /proc/PID/fd)."""
+    out = set()
+    try:
+        fds = os.listdir(f"{proc}/{pid}/fd")
+    except OSError:
+        return out
+    for fd in fds[:cap]:
+        try:
+            link = os.readlink(f"{proc}/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if link.startswith("socket:[") and link.endswith("]") and link[8:-1].isdigit():
+            out.add(int(link[8:-1]))
+    return out
+
+
+def find_inode_owners(inodes, uid, proc=PROC, skip=()):
+    """{inode: pid} entre os NOSSOS processos. Para quando achou todos."""
+    want, found = set(inodes), {}
+    for pid in own_pids(uid, proc, skip):
+        hit = socket_inodes(pid, proc) & want
+        for i in hit:
+            found[i] = pid
+        want -= hit
+        if not want:
+            break
+    return found
+
+
+def ppid_map(uid, proc=PROC):
+    out = {}
+    for pid in own_pids(uid, proc):
+        st = proc_stat(pid, proc)
+        if st:
+            out[pid] = st["ppid"]
+    return out
+
+
+def descendants(root, ppids, cap=4096):
+    """Filhos, netos... de root (sem root)."""
+    kids = collections.defaultdict(list)
+    for pid, ppid in ppids.items():
+        kids[ppid].append(pid)
+    out, todo = set(), [root]
+    while todo and len(out) < cap:
+        for k in kids.get(todo.pop(), ()):
+            if k not in out and k != root:
+                out.add(k)
+                todo.append(k)
+    return out
+
+
+def find_app_ancestor(pid, uid, cls, proc=PROC, limit=8):
+    """Sobe pelos pais do servidor até achar o app (Electron) do ComfyUI que abriu ele."""
+    cur = pid
+    for _ in range(limit):
+        st = proc_stat(cur, proc)
+        if not st or st["ppid"] <= 1:
+            return None
+        parent = st["ppid"]
+        pst = proc_stat(parent, proc)
+        if not pst or not same_user(proc_status(parent, proc), uid):
+            return None
+        if is_app_comm(pst["comm"], cls):
+            return parent
+        cur = parent
+    return None
+
+
+def proc_uptime(proc=PROC):
+    try:
+        return float((read_text(f"{proc}/uptime", 256) or "").split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def meminfo_cached_mb(proc=PROC):
+    for line in (read_text(f"{proc}/meminfo", 65536) or "").splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] == "Cached:" and f[1].isdigit():
+            return int(f[1]) / 1024
+    return None
+
+
+# ---------------------------------------------------------------- arquivos de modelo
+
+def is_model_path(path):
+    return path.startswith("/") and path.lower().endswith(MODEL_EXT)
+
+
+def parse_maps_paths(text):
+    """/proc/PID/maps -> caminhos de arquivos de modelo mapeados (sem anônimos, [heap], apagados)."""
+    out = set()
+    for line in (text or "").splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6 or parts[4] == "0":
+            continue
+        path = parts[5]
+        if path.endswith(" (deleted)") or not is_model_path(path):
+            continue
+        out.add(path)
+    return out
+
+
+def fd_model_paths(pid, proc=PROC, cap=8192):
+    out = set()
+    try:
+        fds = os.listdir(f"{proc}/{pid}/fd")
+    except OSError:
+        return out
+    for fd in fds[:cap]:
+        try:
+            link = os.readlink(f"{proc}/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if not link.endswith(" (deleted)") and is_model_path(link):
+            out.add(link)
+    return out
+
+
+def remember_model_files(paths, known, seen, cap=MAX_MODEL_FILES):
+    """Guarda {(dev, inode): (caminho real, tamanho)} só de arquivos comuns; sem repetir; com limite."""
+    for p in sorted(paths):
+        if len(known) >= cap:
+            break
+        if p in seen:
+            continue
+        if len(seen) < MAX_SEEN_PATHS:
+            seen.add(p)
+        try:
+            real = os.path.realpath(p)
+            st = os.stat(real)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISREG(st.st_mode):
+            known.setdefault((st.st_dev, st.st_ino), (real, st.st_size))
+    return known
+
+
+def purge_files(files):
+    """Tira do cache de páginas os arquivos (posix_fadvise DONTNEED). Só arquivo comum que ainda é o
+    MESMO (dev + inode); nunca segue link; nunca apaga nada. -> (quantos, bytes)."""
+    n = size = 0
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | getattr(os, "O_CLOEXEC", 0)
+    for (dev, ino), (path, _) in list(files.items())[:MAX_MODEL_FILES]:
+        try:
+            if not stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode):
+                continue
+            fd = os.open(path, flags)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == (dev, ino):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                n += 1
+                size += st.st_size
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return n, size
+
+
+# ---------------------------------------------------------------- encerrar um processo
+
+def _wait_gone(pidfd, pid, start, timeout, proc):
+    deadline = time.monotonic() + timeout
+    if pidfd is not None:
+        p = select.poll()
+        p.register(pidfd, select.POLLIN)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            if p.poll(int(left * 1000) + 1):
+                return True
+    while time.monotonic() < deadline:
+        if proc_start(pid, proc) != start:
+            return True
+        time.sleep(0.2)
+    return proc_start(pid, proc) != start
+
+
+def stop_process(pid, start, wait=STOP_WAIT_S, kill_wait=KILL_WAIT_S, proc=PROC):
+    """SIGTERM, espera, SIGKILL. Com pidfd o sinal nunca acerta outro processo que herdou o mesmo pid.
+    -> "gone" (já tinha saído / não é mais ele), "terminated", "killed" ou "stuck"."""
+    pidfd = None
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return "gone"
+        except OSError:
+            pidfd = None
+
+    def send(sig):
+        if pidfd is not None:
+            signal.pidfd_send_signal(pidfd, sig)
+        elif proc_start(pid, proc) == start:
+            os.kill(pid, sig)
+        else:
+            raise ProcessLookupError
+
+    try:
+        if proc_start(pid, proc) != start:      # o pid agora é de outro processo
+            return "gone"
+        try:
+            send(signal.SIGTERM)
+        except ProcessLookupError:
+            return "gone"
+        try:
+            send(signal.SIGCONT)                # se estava parado (SIGSTOP), precisa andar pra sair
+        except ProcessLookupError:
+            pass                                # já saiu com o SIGTERM
+        if _wait_gone(pidfd, pid, start, wait, proc):
+            return "terminated"
+        try:
+            send(signal.SIGKILL)
+        except ProcessLookupError:
+            return "terminated"
+        return "killed" if _wait_gone(pidfd, pid, start, kill_wait, proc) else "stuck"
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+# ---------------------------------------------------------------- ComfyUI HTTP (só 127.0.0.1 / ::1)
+
+def parse_http_response(data):
+    """Resposta HTTP inteira (bytes) -> (status, corpo). ValueError se não for HTTP."""
+    end = data.find(b"\r\n\r\n")
+    if end < 0 or end > HTTP_HEAD_CAP:
+        raise ValueError("bad response")
+    parts = data[:data.find(b"\r\n")].split(None, 2)
+    if len(parts) < 2 or not parts[0].startswith(b"HTTP/") or not re.fullmatch(rb"[1-5][0-9]{2}", parts[1]):
+        raise ValueError("bad response")
+    return int(parts[1]), data[end + 4:]
+
+
+def comfy_http(port, path, timeout=HTTP_TIMEOUT_S, host="127.0.0.1"):
+    """Só dois pedidos existem: GET /queue e POST /free com o JSON fixo, só pra 127.0.0.1 ou ::1.
+    HTTP/1.0 num socket simples: o prazo total (2x o timeout) vale de verdade, até contra um servidor que
+    manda um byte por vez. Sem proxy e sem seguir redirecionamento. -> (status, corpo, cortado?)."""
+    if (path not in HTTP_PATHS or host not in HTTP_HOSTS or isinstance(port, bool) or not isinstance(port, int)
+            or not 1 <= port <= 65535):
+        raise ValueError("bad request")
+    body = HTTP_PATHS[path] or b""
+    head = (f"{'POST' if body else 'GET'} {path} HTTP/1.0\r\n"
+            f"Host: {'[::1]' if host == '::1' else host}:{port}\r\nAccept: application/json\r\nConnection: close\r\n")
+    if body:
+        head += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+    deadline = time.monotonic() + timeout * 2
+    buf = bytearray()
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.sendall(head.encode("ascii") + b"\r\n" + body)
+        while len(buf) <= HTTP_HEAD_CAP + HTTP_MAX_BYTES:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("ComfyUI answered too slowly")
+            s.settimeout(left)
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    status, content = parse_http_response(bytes(buf))
+    return status, content[:HTTP_MAX_BYTES], len(content) > HTTP_MAX_BYTES
+
+
+def parse_queue(obj):
+    """Resposta do /queue -> (rodando, esperando). Só conta itens: o conteúdo (os prompts) é seu."""
+    if not isinstance(obj, dict):
+        return None
+    r, p = obj.get("queue_running"), obj.get("queue_pending")
+    if not isinstance(r, list) or not isinstance(p, list):
+        return None
+    return len(r), len(p)
+
+
+def comfy_queue(port, host="127.0.0.1"):
+    try:
+        status, data, cut = comfy_http(port, "/queue", host=host)
+    except (OSError, ValueError):
+        return None
+    if status != 200:
+        return None
+    if cut:                         # fila enorme demais pra ler: certamente não está vazia
+        return 1, 0
+    try:
+        return parse_queue(json.loads(data))
+    except ValueError:
+        return None
+
+
+def comfy_free(port, host="127.0.0.1"):
+    try:
+        status, _, _ = comfy_http(port, "/free", timeout=3, host=host)
+    except (OSError, ValueError):
+        return False
+    return status == 200
+
+
+# ---------------------------------------------------------------- GPU NVIDIA (sem acordar)
+
+def find_nvidia_gpus(sysfs=SYSFS_PCI):
+    """Placas de vídeo NVIDIA (fabricante 0x10de, classe 0x03xxxx). Ler vendor/class não acorda a GPU."""
+    out = []
+    try:
+        names = sorted(os.listdir(sysfs))
+    except OSError:
+        return out
+    for n in names:
+        d = os.path.join(sysfs, n)
+        vendor = (read_text(os.path.join(d, "vendor"), 64) or "").strip().lower()
+        cls = (read_text(os.path.join(d, "class"), 64) or "").strip().lower()
+        if vendor == "0x10de" and cls.startswith("0x03"):
+            out.append(d)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def gpu_states(dirs):
+    return [(read_text(os.path.join(d, "power", "runtime_status"), 64) or "unknown").strip() for d in dirs]
+
+
+def nvidia_awake(states):
+    """nvidia-smi só quando TODAS as NVIDIA já estão acordadas ("active"): ele consulta todas."""
+    return bool(states) and all(s == "active" for s in states)
+
+
+def nvidia_asleep(states):
+    return bool(states) and all(s == "suspended" for s in states)
+
+
+def parse_nvidia_apps(text):
+    """'pid, MiB' por linha -> {pid: MiB} (somado se o processo usa mais de uma GPU)."""
+    out = {}
+    for line in (text or "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 2 and f[0].isdigit() and f[1].isdigit():
+            out[int(f[0])] = out.get(int(f[0]), 0) + int(f[1])
+    return out
+
+
+def parse_nvidia_used(text):
+    vals = [int(x) for x in (line.split(",")[0].strip() for line in (text or "").splitlines()) if x.isdigit()]
+    return sum(vals) if vals else None
+
+
+# ---------------------------------------------------------------- decisões (funções puras)
+
+def close_verdict(enabled, windows, app_alive, backend, has_tty, ext_clients):
+    """Depois que a última janela fecha: o que fazer com o servidor."""
+    if not enabled:
+        return "off"
+    if windows:
+        return "window"          # abriu de novo
+    if app_alive:
+        return "app"             # o app ainda roda (escondido na bandeja?)
+    if not backend:
+        return "gone"            # o próprio app já encerrou: só limpar o cache
+    if has_tty:
+        return "terminal"        # você abriu ele num terminal: é seu
+    if ext_clients:
+        return "clients"         # alguém usa (aba do navegador)
+    return "stop"
+
+
+def unload_worth_it(models_loaded, asleep, ram_mb, floor_mb):
+    """Vale mandar o POST /free? Ele mexe na GPU (CUDA) e acorda uma NVIDIA dormindo: com ela dormindo,
+    só se a RAM do servidor mostra modelo carregado (cresceu 1 GB sobre o "vazio", ou, sem saber o vazio,
+    passa de 2 GB)."""
+    if models_loaded is False:
+        return False
+    if not asleep:
+        return True
+    ram = ram_mb or 0
+    return ram - floor_mb >= MODEL_RAM_MB if floor_mb is not None else ram >= SLEEPING_RSS_MB
+
+
+def orphan_due(now, since, candidate, after=ORPHAN_AFTER_S):
+    """-> (hora de decidir?, desde quando é candidato)."""
+    if not candidate:
+        return False, None
+    if since is None:
+        return False, now
+    return now - since >= after, since
+
+
+def update_busy(now, last_busy, queue, cpu_delta_s, cpu_busy_s=CPU_BUSY_S):
+    """-> (última vez ocupado, ocupado agora? / None = não sei). CPU gasta conta: pega trabalho curto
+    que começou e terminou entre duas olhadas na fila."""
+    if queue is None:
+        return last_busy, None
+    busy = sum(queue) > 0 or cpu_delta_s >= cpu_busy_s
+    return (now if busy else last_busy), busy
+
+
+def idle_unload_due(now, last_busy, minutes, armed, models_loaded):
+    return (minutes > 0 and armed and models_loaded is not False and last_busy is not None
+            and now - last_busy >= minutes * 60)
+
+
+def models_loaded_guess(vram_mb, ram_mb, floor_mb):
+    """True/False/None (não sei). vram_mb: VRAM do servidor (0 com a GPU dormindo; None = não sei).
+    floor_mb: RAM do servidor vazio (None = não sei)."""
+    if vram_mb is not None and vram_mb >= MODEL_VRAM_MB:
+        return True
+    grown = None if floor_mb is None or ram_mb is None else ram_mb - floor_mb >= MODEL_RAM_MB
+    if grown:
+        return True
+    if vram_mb is not None and grown is False:
+        return False
+    return None
+
+
+def games_step(other_mb, baseline_mb, comfy_vram_mb, idle, armed):
+    """Outro app (jogo) começou a usar a VRAM? other_mb = VRAM usada que não é do ComfyUI.
+    A base é o menor "outros" visto (tira o que o sistema sempre usa). -> (liberar?, armado, base)."""
+    base = other_mb if baseline_mb is None else min(baseline_mb, other_mb)
+    extra = other_mb - base
+    if extra < GAMES_VRAM_MB / 2:
+        armed = True                 # o jogo fechou: na próxima vez libera de novo
+    want = armed and bool(idle) and extra >= GAMES_VRAM_MB and comfy_vram_mb >= MODEL_VRAM_MB
+    return want, armed, base
+
+
+# ---------------------------------------------------------------- eventos do aero-memory
+
+MEMORY_KINDS = ("pressure", "paused", "resumed", "killed", "oom_kill")
+# por que o aero-memory retomou o que pausou: só "calm" é "a memória voltou ao normal" (reload = Settings
+# mudou algo, stopping = o serviço parou, disabled = pausa desligada, leftover = sobra de antes de reiniciar)
+RESUME_REASONS = ("calm", "reload", "stopping", "disabled", "leftover")
+
+
+def clean_name(s, cap=32):
+    """Nome de processo vindo de fora: só caracteres simples (sem marcação na notificação)."""
+    return NAME_BAD.sub("?", str(s))[:cap].strip()
+
+
+def parse_memory_event(raw):
+    """Uma linha do events.jsonl -> dict conferido, ou None."""
+    try:
+        ev = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(ev, dict) or ev.get("kind") not in MEMORY_KINDS:
+        return None
+    t = ev.get("t")
+    if isinstance(t, bool) or not isinstance(t, (int, float)):
+        return None
+    if ev.get("dry_run"):
+        # o aero-memory em --dry-run só finge: não descarrega modelo nem avisa de algo que não aconteceu
+        return None
+    out = {"t": float(t), "kind": ev["kind"]}
+    names = ev.get("names")
+    if isinstance(names, list):
+        out["names"] = [n for n in (clean_name(x) for x in names[:20] if isinstance(x, str)) if n]
+    if isinstance(ev.get("name"), str) and clean_name(ev["name"]):
+        out["name"] = clean_name(ev["name"])
+    for k in ("mb", "count", "pid"):
+        v = ev.get(k)
+        if not isinstance(v, bool) and isinstance(v, (int, float)) and 0 <= v < 1e9:
+            out[k] = v
+    uid = ev.get("uid")                    # de quem era o processo (o aero-memory vê todos os usuários)
+    if isinstance(uid, int) and not isinstance(uid, bool) and 0 <= uid < 2 ** 32:
+        out["uid"] = uid
+    r = ev.get("reason")
+    if r is not None:                      # motivo que não conhecemos (versão nova?) = "other": não avisa
+        out["reason"] = r if isinstance(r, str) and r in RESUME_REASONS else "other"
+    return out
+
+
+def friendly(name):
+    return FRIENDLY_15.get(name[:15], name)
+
+
+def friendly_list(names, cap=3):
+    names = list(dict.fromkeys(friendly(n) for n in names))
+    text = ", ".join(names[:cap])
+    return text + (f" and {len(names) - cap} more" if len(names) > cap else "")
+
+
+def event_notification(ev, comfy_pids=()):
+    """Evento do aero-memory -> (tipo, título, texto, ícone, urgência) ou None.
+    comfy_pids: pids dos últimos servidores do ComfyUI (o "python" fechado vira "ComfyUI")."""
+    k = ev["kind"]
+    if k == "paused":
+        what = friendly_list(ev.get("names") or []) or "background work"
+        return ("paused", "Memory is low", f"Paused {what} to keep things smooth",
+                "dialog-information-symbolic", "normal")
+    if k == "resumed":
+        # recarga da config, parada do serviço, pausa desligada, sobra de antes: a memória não "voltou"
+        # (sem motivo nenhum = aero-memory antigo: avisa como antes)
+        if ev.get("reason", "calm") != "calm":
+            return None
+        return ("resumed", "Memory is back to normal", "Paused work is running again",
+                "dialog-information-symbolic", "low")
+    if k == "oom_kill":
+        # o próprio kernel fechou algo (sem nome: o contador do /proc/vmstat só diz quantos)
+        return ("oom_kill", "Memory ran out", "The system closed an app to stop a freeze",
+                "dialog-warning-symbolic", "critical")
+    if k == "killed":
+        name = "ComfyUI" if ev.get("pid") in comfy_pids else friendly(ev.get("name") or "an app")
+        size = f" (it was using {fmt_size(ev['mb'])})" if ev.get("mb") else ""
+        return ("killed", "Memory was almost full", f"Closed {name}{size} to stop the system from freezing",
+                "dialog-warning-symbolic", "critical")
+    return None
+
+
+class EventTail:
+    """Acompanha o events.jsonl (sem inotify: olha o arquivo a cada 2 s). Começa do fim (não repete o
+    passado). Guarda os últimos bytes já lidos como "marca": se o arquivo foi cortado, trocado ou
+    reescrito, a marca não bate, e ele relê do começo pulando o que já viu."""
+
+    MARK = 64
+
+    def __init__(self, path, now=None):
+        self.path = path
+        self.ino = None
+        self.off = 0
+        self.mtime = None
+        self.mark = b""
+        self.last_t = time.time() if now is None else now
+        self.recent = collections.deque(maxlen=128)
+        self.started = False
+
+    def _read(self, start, n):
+        with open(self.path, "rb") as f:
+            f.seek(start)
+            return f.read(max(0, n))
+
+    def poll(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            self.started = True
+            self.ino = None
+            return []
+        if not stat.S_ISREG(st.st_mode):
+            return []
+        try:
+            if not self.started:                 # primeira olhada: pula a história
+                self.started = True
+                self.mark = self._read(max(0, st.st_size - self.MARK), self.MARK)
+                self.ino, self.off, self.mtime = st.st_ino, st.st_size, st.st_mtime_ns
+                return []
+            if st.st_ino == self.ino and st.st_size == self.off and st.st_mtime_ns == self.mtime:
+                return []                        # nada mudou
+            rotated = st.st_ino != self.ino or st.st_size < self.off
+            if not rotated:
+                begin = self.off - len(self.mark)
+                data = self._read(begin, min(st.st_size - begin, EVENTS_READ_CAP + self.MARK))
+                if data.startswith(self.mark):
+                    data = data[len(self.mark):]
+                else:
+                    rotated = True
+            if rotated:
+                self.off, self.mark = 0, b""
+                data = self._read(0, min(st.st_size, EVENTS_READ_CAP))
+        except OSError:
+            return []
+        self.ino, self.mtime = st.st_ino, st.st_mtime_ns
+        cut = data.rfind(b"\n")
+        if cut < 0:                              # linha ainda pela metade
+            if len(data) >= EVENTS_READ_CAP:     # lixo enorme sem fim de linha: pula
+                self.off += len(data)
+                self.mark = data[-self.MARK:]
+            return []
+        chunk = data[:cut + 1]
+        self.off += len(chunk)
+        self.mark = (self.mark + chunk)[-self.MARK:]
+        out = []
+        for raw in chunk.splitlines():
+            if not raw.strip():
+                continue
+            ev = parse_memory_event(raw)
+            if ev is None:
+                continue
+            h = zlib.crc32(raw)
+            if h in self.recent or (rotated and ev["t"] < self.last_t):
+                continue
+            self.recent.append(h)
+            self.last_t = max(self.last_t, ev["t"])
+            out.append(ev)
+        return out
+
+
+class RateLimit:
+    def __init__(self, every, cap=32):
+        self.every, self.cap, self.last = every, cap, {}
+
+    def allow(self, key, now):
+        t = self.last.get(key)
+        if t is not None and now - t < self.every:
+            return False
+        if len(self.last) >= self.cap:
+            self.last = {k: v for k, v in self.last.items() if now - v < self.every}
+            if len(self.last) >= self.cap:
+                return False
+        self.last[key] = now
+        return True
+
+
+def atomic_write_json(path, obj):
+    """Grava sem nunca deixar meio arquivo (temporário 0600 + rename na mesma pasta)."""
+    fd, tmp = tempfile.mkstemp(prefix=".aero-memory-agent.", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------- o agente
+
+class Backend:
+    """O servidor do ComfyUI que está rodando (pid + hora de início = identidade)."""
+
+    def __init__(self, pid, start, inode, comm, has_tty, young, now, host="127.0.0.1"):
+        self.pid, self.start, self.inode, self.comm = pid, start, inode, comm
+        self.host = host               # 127.0.0.1 ou ::1, conforme o socket em que ele escuta
+        self.has_tty = has_tty         # aberto num terminal (fica True de vez se algum dia for visto)
+        self.app_seen = False          # já rodou junto com o app/janela do ComfyUI (só esse vira órfão)
+        self.first_seen = now
+        self.last_busy = now
+        self.idle = None               # True/False na última olhada; None = não sei
+        self.armed_idle = True         # uma descarga por período parado
+        self.pressure_armed = True     # uma descarga por falta de memória até ele trabalhar de novo
+        self.cpu = None
+        self.cpu_at = None
+        self.ram_mb = None             # RssAnon + RssShmem: o que some quando ele sai
+        self.rss_mb = None             # VmRSS (com os modelos mapeados): mede o que um /free soltou
+        self.floor_mb = None           # RAM dele vazio (só se souber)
+        self.floor_trusted = young
+        self.vram_mb = None
+        self.models_loaded = None
+        self.games_armed = True
+        self.other_base = None
+        self.models = {}
+        self.seen = set()
+        self.stuck = False             # não saiu nem com SIGKILL (preso em disco): não insiste
+
+
+class Agent:
+    def __init__(self, conf_path=None, events_path=EVENTS_FILE, state_path=None, dry_run=False, proc=PROC,
+                 sysfs=SYSFS_PCI):
+        self.dry = dry_run
+        self.proc = proc
+        self.uid = os.getuid()
+        self.mypid = os.getpid()
+        self.conf_path = conf_path or config_path()
+        self.conf = self.load_config()
+        self.runtime = runtime_dir()
+        self.state_path = state_path
+        self.sysfs = sysfs
+        self.gpus = find_nvidia_gpus(sysfs)
+        self.smi = shutil.which("nvidia-smi")
+        self.notify_bin = shutil.which("notify-send")
+        self.windows = {}              # endereço -> pid do app
+        self.apps = {}                 # pid do app -> [hora de início, pidfd]
+        self.backend = None
+        self.recent_backends = collections.deque(maxlen=4)    # pids (pra dizer "ComfyUI" num "killed")
+        self.gone = None               # o que sobrou de um servidor que fechou (pra limpar o cache)
+        self.close_at = None
+        self.close_since = None        # quando a última janela/o app sumiu
+        self.close_reason = None
+        self.orphan_since = None
+        self.last_action = None
+        self.free_note = None          # um POST /free feito: confere daqui a pouco o que foi liberado
+        self.smi_parked = None         # nvidia-smi que travou: morto mas ainda não recolhido
+        self.smi_retry_at = 0.0
+        self.hypr_sock = None
+        self.hypr_dir = None
+        self.hypr_buf = LineBuffer()
+        self.hypr_retry_at = 0.0
+        self.hypr_backoff = 1.0
+        self.hypr_since = 0.0
+        self.hypr_missing_logged = False
+        self.poller = select.poll()
+        self.handlers = {}
+        self.notifiers = []
+        self.notify_rate = RateLimit(NOTIFY_EVERY_S)
+        self.free_rate = RateLimit(FREE_EVERY_S)
+        self.err_rate = RateLimit(60)
+        self.hypr_log_rate = RateLimit(60)
+        self.said = set()
+        self.tail = EventTail(events_path)
+        self.ppids_cache = (0.0, {})
+        self.ignored = None            # sockets da porta que já vimos e não são do ComfyUI
+        self.state_key = None
+        self.state_at = -1e9
+        self.state_written = False
+        self.running = True
+        self.reload = False
+        self.wake_r = self.wake_w = None
+        now = time.monotonic()
+        self.t = {"tick": now, "backend": now, "queue": now, "gpu": now, "resync": now + RESYNC_EVERY_S}
+
+    # ---------- utilidades
+    def load_config(self):
+        st = None
+        try:
+            st = os.stat(self.conf_path)
+        except OSError:
+            pass
+        text = read_text(self.conf_path, 65536) if st and stat.S_ISREG(st.st_mode) else None
+        return parse_config(text)
+
+    def say_once(self, key, msg):
+        if key not in self.said:
+            if len(self.said) > 64:
+                self.said.clear()
+            self.said.add(key)
+            log(msg)
+
+    def safe(self, name, fn, *args):
+        """Erro inesperado: registra só o tipo (a mensagem pode ter caminho) e segue sem fazer nada."""
+        try:
+            return fn(*args)
+        except Exception as e:  # o agente nunca pode cair por causa de um passo
+            if self.err_rate.allow(name, time.monotonic()):
+                log(f"error in {name}: {type(e).__name__}")
+            return None
+
+    def act(self, what):
+        """No --dry-run nada acontece: só diz o que faria."""
+        if self.dry:
+            log(f"[dry-run] would {what}")
+        return not self.dry
+
+    # ---------- nvidia-smi (nunca trava o agente)
+    def run_smi(self, args):
+        """Roda o nvidia-smi com limite de verdade. Se ele travar dentro do driver (GPU presa), nem o
+        SIGKILL faz efeito na hora e esperar por ele travaria o agente: mata, NÃO espera, deixa
+        "estacionado" (recolhido depois, sem bloquear) e não chama mais por 10 min. Saída só se deu certo."""
+        self.reap_smi()
+        if not self.smi or self.smi_parked is not None or time.monotonic() < self.smi_retry_at:
+            return None
+        try:
+            p = subprocess.Popen([self.smi] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        try:
+            out, _ = p.communicate(timeout=SMI_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.stdout.close()
+            self.smi_parked = p
+            self.smi_retry_at = time.monotonic() + SMI_PAUSE_S
+            log(f"nvidia-smi did not answer in {SMI_TIMEOUT_S} s (GPU driver stuck?); "
+                f"GPU checks paused for {SMI_PAUSE_S // 60} min")
+            return None
+        return out if p.returncode == 0 else None
+
+    def reap_smi(self):
+        """Recolhe (sem esperar) o nvidia-smi que travou, quando ele finalmente sair."""
+        p = self.smi_parked
+        if p is not None and p.poll() is not None:
+            self.smi_parked = None
+            log("the stuck nvidia-smi ended")
+
+    # ---------- notificações
+    def notify(self, kind, title, body, icon="dialog-information-symbolic", urgency="normal"):
+        if not self.conf["notify"] or not self.notify_rate.allow(kind, time.monotonic()):
+            return
+        if self.dry or not self.notify_bin:
+            log(f"{'[dry-run] would notify' if self.dry else 'notify-send missing'}: {title} | {body}")
+            return
+        self.reap_notifiers()
+        if len(self.notifiers) >= MAX_NOTIFIERS:
+            log("notification skipped: notify-send is not answering")
+            return
+        env = dict(os.environ)
+        if "DBUS_SESSION_BUS_ADDRESS" not in env and self.runtime and os.path.exists(
+                os.path.join(self.runtime, "bus")):
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + os.path.join(self.runtime, "bus")
+        try:
+            p = subprocess.Popen([self.notify_bin, "-a", "Aero", "-i", icon, "-u", urgency, title, body],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env=env)
+        except OSError as e:
+            log(f"notify-send failed: {type(e).__name__}")
+            return
+        self.notifiers.append((p, time.monotonic()))
+
+    def reap_notifiers(self, final=False):
+        """Recolhe os notify-send que acabaram (sem zumbi); o que passou de 5 s é encerrado."""
+        keep = []
+        for p, t0 in self.notifiers:
+            if p.poll() is not None:
+                continue
+            if final:                                  # saindo: deixa a última notificação terminar
+                try:
+                    p.wait(timeout=1)
+                    continue
+                except subprocess.TimeoutExpired:
+                    pass
+            if final or time.monotonic() - t0 > 5:
+                p.kill()
+                try:
+                    p.wait(timeout=1)
+                    continue
+                except subprocess.TimeoutExpired:
+                    pass
+            keep.append((p, t0))
+        self.notifiers = keep
+
+    # ---------- Hyprland
+    def hypr_connect(self):
+        now = time.monotonic()
+        for d in hypr_instances(self.runtime, os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"), self.uid)[:5]:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.settimeout(2)
+                s.connect(os.path.join(d, ".socket2.sock"))
+                s.setblocking(False)
+            except OSError:
+                s.close()
+                continue
+            self.hypr_sock, self.hypr_dir, self.hypr_since = s, d, now
+            self.hypr_buf = LineBuffer()
+            self.poller.register(s.fileno(), select.POLLIN)
+            self.handlers[s.fileno()] = self.on_hypr_readable
+            self.hypr_missing_logged = False
+            if self.hypr_backoff <= 1.0 or self.hypr_log_rate.allow("up", now):    # caindo e voltando: 1/min
+                log("connected to Hyprland events")
+            self.resync_windows()
+            return True
+        if not self.hypr_missing_logged:
+            log("Hyprland not found; will keep trying")
+            self.hypr_missing_logged = True
+        self.hypr_retry_at = now + self.hypr_backoff
+        self.hypr_backoff = min(self.hypr_backoff * 2, 30.0)
+        return False
+
+    def hypr_disconnect(self):
+        s, self.hypr_sock = self.hypr_sock, None
+        if s is None:
+            return
+        fd = s.fileno()
+        self.handlers.pop(fd, None)
+        try:
+            self.poller.unregister(fd)
+        except (KeyError, ValueError):
+            pass
+        s.close()
+        now = time.monotonic()
+        short = now - self.hypr_since <= 10     # aceitou e fechou logo: a espera cresce (1, 2, 4... 30 s)
+        if not short:
+            self.hypr_backoff = 1.0
+        self.hypr_retry_at = now + self.hypr_backoff
+        if short:
+            self.hypr_backoff = min(self.hypr_backoff * 2, 30.0)
+        if not short or self.hypr_log_rate.allow("down", now):
+            log("Hyprland events closed (Hyprland restarted or quit); reconnecting")
+        if self.windows:                        # sem compositor não existe janela
+            self.windows.clear()
+            self.schedule_close("compositor gone")
+
+    def on_hypr_readable(self, revents):
+        data = b""
+        if revents & select.POLLIN:
+            try:
+                data = self.hypr_sock.recv(65536)
+            except BlockingIOError:
+                return
+            except OSError:
+                data = b""
+        if not data:
+            self.hypr_disconnect()
+            return
+        for line in self.hypr_buf.feed(data):
+            self.on_hypr_line(line)
+
+    def on_hypr_line(self, line):
+        p = parse_hypr_line(line)
+        if not p:
+            return
+        ev, data = p
+        cls = self.conf["comfy_window_class"]
+        if ev == "openwindow":
+            w = parse_openwindow(data)
+            if not w:
+                return
+            addr, wcls = w
+            is_comfy = wcls.lower() == cls
+            if self.dry:
+                log(f"[dry-run] event: window opened (ComfyUI: {'yes' if is_comfy else 'no'})")
+            if is_comfy and (addr in self.windows or len(self.windows) < MAX_WINDOWS):
+                pid = comfy_windows(hypr_request(self.hypr_dir), cls).get(addr)
+                self.windows[addr] = pid
+                if pid:
+                    self.track_app(pid)
+                self.close_at = self.orphan_since = None
+                log(f"ComfyUI window opened ({len(self.windows)} open)")
+        elif ev == "closewindow":
+            addr = norm_addr(data)
+            was = addr in self.windows
+            if self.dry:
+                log(f"[dry-run] event: window closed (ComfyUI: {'yes' if was else 'no'})")
+            if was:
+                del self.windows[addr]
+                log(f"ComfyUI window closed ({len(self.windows)} open)")
+                if not self.windows:
+                    self.schedule_close("last window closed")
+
+    def resync_windows(self):
+        """Lista atual de janelas (semente na conexão; conferência a cada minuto). False se não deu."""
+        if self.hypr_sock is None:
+            return False
+        clients = hypr_request(self.hypr_dir)
+        if not isinstance(clients, list):
+            return False
+        had = bool(self.windows)
+        self.windows = comfy_windows(clients, self.conf["comfy_window_class"])
+        for pid in self.windows.values():
+            if pid:
+                self.track_app(pid)
+        if self.dry:
+            log(f"[dry-run] window list: {len(clients)} windows, {len(self.windows)} of ComfyUI")
+        if self.windows:
+            self.close_at = self.orphan_since = None
+        elif had:
+            self.schedule_close("last window closed")
+        return True
+
+    # ---------- o app (Electron)
+    def track_app(self, pid):
+        if pid in self.apps or len(self.apps) >= MAX_APPS or pid <= 1 or pid == self.mypid:
+            return
+        fd = None
+        if hasattr(os, "pidfd_open"):
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError:
+                return
+        start = proc_start(pid, self.proc)            # lido DEPOIS do pidfd: os dois são do mesmo processo
+        if start is None or not same_user(proc_status(pid, self.proc), self.uid):
+            if fd is not None:
+                os.close(fd)
+            return
+        self.apps[pid] = [start, fd]
+        if fd is not None:
+            self.poller.register(fd, select.POLLIN)
+            self.handlers[fd] = lambda ev, pid=pid: self.on_app_exit(pid)
+
+    def untrack_app(self, pid):
+        start, fd = self.apps.pop(pid, (None, None))
+        if fd is not None:
+            self.handlers.pop(fd, None)
+            try:
+                self.poller.unregister(fd)
+            except (KeyError, ValueError):
+                pass
+            os.close(fd)
+
+    def on_app_exit(self, pid):
+        self.untrack_app(pid)
+        log(f"ComfyUI app ended (pid {pid})")
+        if not self.apps and not self.windows:
+            self.schedule_close("app ended")
+
+    def check_apps(self):
+        for pid, (start, _) in list(self.apps.items()):
+            if proc_start(pid, self.proc) != start:
+                self.on_app_exit(pid)
+
+    # ---------- o servidor
+    def ppids(self):
+        now = time.monotonic()
+        if now - self.ppids_cache[0] > 10:
+            self.ppids_cache = (now, ppid_map(self.uid, self.proc))
+        return self.ppids_cache[1]
+
+    def scan_backend(self, schedule=True):
+        """Quem escuta em 127.0.0.1:porta, se for um processo NOSSO que parece o ComfyUI."""
+        port = self.conf["comfy_port"]
+        addrs = listen_addrs(read_tcp(self.proc), port, self.uid)
+        inodes = sorted(addrs)
+        b = self.backend
+        if b is not None:
+            st = proc_stat(b.pid, self.proc)
+            if b.inode in addrs and st and st["state"] not in ("Z", "X") and st["start"] == b.start:
+                # terminal: o tty some quando o terminal fecha (nohup), então visto uma vez vale pra sempre
+                b.has_tty = b.has_tty or is_terminal_tty(st["tty"])
+                if self.windows or self.apps:
+                    b.app_seen = True
+                self.sample(b)
+                self.safe("collect", self.collect_models, b)    # a cada 10 s: pega modelo recém-carregado
+                return b
+            self.backend_gone(b, schedule)
+        if not inodes or inodes == self.ignored:
+            return None
+        owners = find_inode_owners(inodes, self.uid, self.proc, skip={self.mypid})
+        pids = set(owners.values())
+        if len(pids) != 1:
+            self.ignored = inodes               # não é um processo nosso só: não varre de novo à toa
+            self.say_once(f"owner-{port}-{len(pids)}", f"port {port}: listener is not one of your processes; ignored"
+                          if not pids else f"port {port}: several processes listen; ignored")
+            return None
+        pid = pids.pop()
+        st, status = proc_stat(pid, self.proc), proc_status(pid, self.proc)
+        if not st or not same_user(status, self.uid):
+            return None
+        if not looks_like_comfy(st["comm"], proc_cmdline(pid, self.proc), proc_cwd(pid, self.proc),
+                                comfy_layout(f"{self.proc}/{pid}/cwd")):
+            self.ignored = inodes               # outro programa nessa porta: fica ignorado até ela mudar
+            self.say_once(f"notcomfy-{pid}", f"port {port} is used by {clean_name(st['comm'])} (pid {pid}), "
+                                             "which is not ComfyUI; ignored")
+            return None
+        up = proc_uptime(self.proc)
+        young = up is not None and up - st["start"] / CLK_TCK < YOUNG_S
+        now = time.monotonic()
+        mine = [i for i, p in owners.items() if p == pid]
+        self.ignored = None
+        self.gone = None                        # servidor novo (reinício): ele carrega os mesmos arquivos
+        b = self.backend = Backend(pid, st["start"], min(mine), clean_name(st["comm"]), is_terminal_tty(st["tty"]),
+                                   young, now, http_host(addrs[i] for i in mine))
+        b.cpu, b.cpu_at = st["cpu"], now
+        self.recent_backends.append(pid)
+        log(f"ComfyUI server found: pid {pid} ({b.comm})" + (", started from a terminal" if b.has_tty else ""))
+        app = find_app_ancestor(pid, self.uid, self.conf["comfy_window_class"], self.proc)
+        if app:
+            self.track_app(app)
+        b.app_seen = bool(app or self.windows or self.apps)
+        self.sample(b)
+        self.safe("collect", self.collect_models, b)
+        self.t["queue"] = self.t["gpu"] = now
+        return b
+
+    def sample(self, b):
+        status = proc_status(b.pid, self.proc)
+        if not status:
+            return
+        b.ram_mb = status["anon_mb"] + status["shmem_mb"]
+        b.rss_mb = status["rss_mb"]
+        if b.floor_trusted:
+            b.floor_mb = b.ram_mb if b.floor_mb is None else min(b.floor_mb, b.ram_mb)
+
+    def backend_gone(self, b, schedule=True):
+        log(f"ComfyUI server ended: pid {b.pid}")
+        self.backend = None
+        self.orphan_since = None
+        # guarda mesmo com janela aberta (o aero-memory pode ter fechado ele, ou ele caiu): se nenhum
+        # servidor novo aparecer, o fechamento do app limpa o cache. Servidor novo = reinício: esquece.
+        self.gone = (b.models, b.ram_mb or 0, b.vram_mb or 0, time.monotonic(), b.app_seen)
+        if not self.windows and schedule and self.close_at is None:
+            self.schedule_close("server ended")
+
+    def collect_models(self, b):
+        if len(b.models) >= MAX_MODEL_FILES:
+            return
+        paths = parse_maps_paths(read_text(f"{self.proc}/{b.pid}/maps", MAPS_CAP))
+        paths |= fd_model_paths(b.pid, self.proc)
+        remember_model_files(paths, b.models, b.seen)
+
+    def external_clients(self, b):
+        ignore = socket_inodes(b.pid, self.proc)
+        family = set()
+        for app in self.apps:
+            family |= {app} | descendants(app, self.ppids())
+        for pid in list(family)[:256]:
+            ignore |= socket_inodes(pid, self.proc)
+        return count_external_clients(read_tcp(self.proc), self.conf["comfy_port"], ignore)
+
+    def still_listening(self, b):
+        """b ainda é o mesmo processo escutando no mesmo socket? Conferido logo antes de cada pedido HTTP:
+        se ele saiu, outro programa pode ter pegado a porta."""
+        return (b.inode in listen_addrs(read_tcp(self.proc), self.conf["comfy_port"], self.uid)
+                and proc_start(b.pid, self.proc) == b.start)
+
+    def ask_queue(self, b):
+        return comfy_queue(self.conf["comfy_port"], b.host) if self.still_listening(b) else None
+
+    def ask_free(self, b):
+        return self.still_listening(b) and comfy_free(self.conf["comfy_port"], b.host)
+
+    def cpu_rate(self, b):
+        """CPU (em núcleos) que o servidor gastou desde a última olhada na fila. None = não sei."""
+        st = proc_stat(b.pid, self.proc)
+        now = time.monotonic()
+        if not st or st["start"] != b.start or b.cpu is None or b.cpu_at is None or now - b.cpu_at < 1:
+            return None
+        return (st["cpu"] - b.cpu) / CLK_TCK / (now - b.cpu_at)
+
+    def quiet_now(self, b):
+        """O servidor está parado AGORA? Pergunta a fila de novo e olha a CPU desde a última olhada.
+        Sem resposta da fila só a CPU decide; sem saber nenhum dos dois, não está (não encerra)."""
+        q = self.ask_queue(b)
+        if q is not None and sum(q) > 0:
+            return False
+        rate = self.cpu_rate(b)
+        if rate is not None and rate >= CPU_BUSY_S / QUEUE_EVERY_S:
+            return False
+        return q is not None or rate is not None
+
+    def schedule_close(self, why):
+        if self.close_at is None:
+            self.close_at = time.monotonic() + CLOSE_GRACE_S
+            self.close_since = time.monotonic()
+            self.close_reason = why
+            if self.backend is not None:           # o app costuma matar o servidor já: anota os arquivos agora
+                self.safe("collect", self.collect_models, self.backend)
+
+    def close_check(self):
+        """5 s depois da última janela / do app sair."""
+        reason, self.close_reason = self.close_reason, None
+        since, self.close_since = self.close_since, None
+        self.resync_windows()
+        if self.windows:
+            return
+        self.check_apps()
+        b = self.scan_backend(schedule=False)
+        enabled = bool(self.conf["comfy_free_on_close"])
+        ext = 0
+        if b is not None and enabled and not self.apps and not b.has_tty:
+            ext = self.external_clients(b)
+        v = close_verdict(enabled, len(self.windows), bool(self.apps), b is not None, b.has_tty if b else False, ext)
+        if v == "stop":
+            if since is not None and b.first_seen > since:
+                # apareceu depois que o app fechou (um reinício, outro programa): não é o que o app deixou
+                log("ComfyUI closed; a server that started after that is left alone")
+            elif not self.quiet_now(b):
+                b.app_seen = True                    # quando terminar, a regra do órfão encerra
+                log("ComfyUI closed; server kept while it is still working (ended later, once idle)")
+            else:
+                self.stop_backend(b, "closed")
+        elif v == "gone":
+            # "server ended" sozinho (servidor sem app) limpa em silêncio; com o app junto, avisa
+            gone = self.gone
+            self.finish_gone(notify=reason != "server ended" or bool(gone and gone[4]))
+        elif v == "clients":
+            log(f"ComfyUI closed; server kept: {ext} other connection(s) use it (a browser tab?)")
+        elif v == "terminal":
+            self.say_once(f"tty-{b.pid}", "ComfyUI closed; server kept: it was started from a terminal")
+        elif v == "app":
+            log("ComfyUI window closed; the app is still running (tray?), server kept")
+
+    def orphan_check(self, b):
+        """Servidor que o app do ComfyUI deixou pra trás: sem janela, sem app, sem terminal, sem ninguém
+        conectado e sem trabalhar por 2 min seguidos -> encerra. Um servidor que nunca rodou junto com o
+        app (script, serviço, outro launcher, terminal já fechado) nunca é órfão."""
+        # sem o Hyprland conectado não dá pra saber se há janela: nunca chama de órfão
+        candidate = (bool(self.conf["comfy_free_on_close"]) and self.hypr_sock is not None and not self.windows
+                     and not self.apps and not b.has_tty and self.close_at is None)
+        if candidate and not b.app_seen:
+            self.say_once(f"noapp-{b.pid}", f"ComfyUI server pid {b.pid} was not started by the ComfyUI app; "
+                                            "left alone")
+            candidate = False
+        now = time.monotonic()
+        due, self.orphan_since = orphan_due(now, self.orphan_since, candidate)
+        if self.orphan_since is None:
+            return
+        # alguém conectado (aba do navegador, script) ou trabalho desde que virou candidato: conta de novo
+        if b.last_busy > self.orphan_since or self.external_clients(b):
+            self.orphan_since = now
+            return
+        if due:
+            if self.quiet_now(b):
+                self.stop_backend(b, "orphan")
+            else:
+                self.orphan_since = now
+
+    def stop_backend(self, b, kind):
+        if b.pid <= 1 or b.pid == self.mypid or b.pid in self.apps or b.stuck:
+            return
+        self.collect_models(b)
+        self.sample(b)
+        self.gpu_sample(b, quick=True)
+        what = "orphan ComfyUI server" if kind == "orphan" else "ComfyUI server"
+        if not self.act(f"stop the {what} pid {b.pid} ({b.comm}) and purge {len(b.models)} model file(s)"):
+            self.orphan_since = None
+            return
+        st = proc_status(b.pid, self.proc)
+        if not same_user(st, self.uid):
+            return
+        result = stop_process(b.pid, b.start)
+        log(f"{what} pid {b.pid} ({b.comm}): {result}")
+        if result == "stuck":
+            b.stuck = True
+            return
+        self.backend = None
+        self.orphan_since = None
+        self.gone = (b.models, b.ram_mb or 0, b.vram_mb or 0, time.monotonic(), b.app_seen)
+        self.finish_gone(kind=kind)
+
+    def finish_gone(self, kind="closed", notify=True):
+        """Servidor fechado: tira os arquivos de modelo dele do cache e conta o que foi liberado."""
+        gone, self.gone = self.gone, None
+        if gone is None or time.monotonic() - gone[3] > GONE_KEEP_S:
+            return
+        models, ram_mb, vram_mb = gone[:3]
+        if not self.act(f"purge {len(models)} model file(s) from the page cache"):
+            return
+        before = meminfo_cached_mb(self.proc)
+        n, size = purge_files(models)
+        after = meminfo_cached_mb(self.proc)
+        cache_mb = max(0.0, before - after) if before is not None and after is not None else 0.0
+        freed = ram_mb + cache_mb
+        log(f"ComfyUI {kind}: freed {int(freed)} MB RAM ({int(cache_mb)} MB page cache from {n} file(s)), "
+            f"{int(vram_mb)} MB VRAM")
+        self.last_action = {"t": int(time.time()), "kind": kind, "mb": int(freed), "vram_mb": int(vram_mb),
+                            "files": n}
+        if notify and (freed >= 256 or vram_mb >= 256):
+            body = f"Freed {fmt_size(freed)} RAM" + (f", {fmt_size(vram_mb)} VRAM" if vram_mb >= 64 else "")
+            self.notify("comfy-closed", "ComfyUI closed", body, "dialog-information-symbolic", "low")
+
+    # ---------- fila / ocioso
+    def queue_tick(self, b):
+        now = time.monotonic()
+        q = self.ask_queue(b)
+        st = proc_stat(b.pid, self.proc)
+        cpu_delta = 0.0
+        if st and st["start"] == b.start:
+            if b.cpu is not None:
+                cpu_delta = (st["cpu"] - b.cpu) / CLK_TCK
+            b.cpu, b.cpu_at = st["cpu"], now
+        b.last_busy, busy = update_busy(now, b.last_busy, q, cpu_delta)
+        b.idle = None if busy is None else not busy
+        if busy:
+            b.armed_idle = b.pressure_armed = True       # trabalhou: pode ter carregado modelo de novo
+        floor = b.floor_mb if b.floor_trusted else None
+        b.models_loaded = models_loaded_guess(b.vram_mb, b.ram_mb, floor)
+        minutes = self.conf["comfy_idle_unload_min"]
+        if b.idle and idle_unload_due(now, b.last_busy, minutes, b.armed_idle, b.models_loaded):
+            if not self.worth_unloading(b):
+                b.armed_idle = False                         # nada grande carregado: nem acorda a GPU
+                return
+            self.free_models(b, "idle_unload", f"Idle for {minutes} min · they load again on the next run",
+                             "ComfyUI models unloaded")
+
+    def worth_unloading(self, b):
+        floor = b.floor_mb if b.floor_trusted else None
+        return unload_worth_it(b.models_loaded, nvidia_asleep(gpu_states(self.gpus)), b.ram_mb, floor)
+
+    def free_models(self, b, kind, body, title):
+        """POST /free, só se a fila estiver vazia AGORA. Uma vez por motivo a cada minuto. O aviso sai
+        alguns segundos depois e só se deu pra ver memória saindo de verdade (confirm_free)."""
+        now = time.monotonic()
+        if not self.free_rate.allow(kind, now):
+            return False
+        q = self.ask_queue(b)
+        if q is None or sum(q) > 0:
+            return False
+        self.sample(b)                                      # RAM de antes, pra comparar depois
+        if self.act(f"unload ComfyUI models ({kind})"):
+            if not self.ask_free(b):
+                log(f"ComfyUI did not accept the unload request ({kind})")
+                return False
+            log(f"ComfyUI unload requested ({kind}); server pid {b.pid}")
+            self.free_note = {"at": now + FREE_CHECK_S, "pid": b.pid, "start": b.start, "kind": kind,
+                              "title": title, "body": body, "rss": b.rss_mb, "vram": b.vram_mb}
+        else:
+            self.notify(f"comfy-{kind}", title, body, "dialog-information-symbolic", "low")
+        b.armed_idle = False
+        b.models_loaded = False
+        b.floor_trusted, b.floor_mb = True, None            # a RAM de agora em diante é o "vazio"
+        return True
+
+    def confirm_free(self):
+        """Alguns segundos depois do POST /free: quanto saiu de verdade (RSS e, com a GPU acordada, VRAM)?
+        Sem nada que valha (não havia modelo carregado), não avisa nem anota como "última ação"."""
+        n, self.free_note = self.free_note, None
+        b = self.backend
+        if n is None or b is None or (b.pid, b.start) != (n["pid"], n["start"]):
+            return
+        self.sample(b)
+        self.gpu_sample(b)                       # dormindo: VRAM 0 (a GPU só dorme sem modelo nela)
+        ram = max(0.0, n["rss"] - b.rss_mb) if n["rss"] is not None and b.rss_mb is not None else 0.0
+        vram = max(0, n["vram"] - b.vram_mb) if n["vram"] is not None and b.vram_mb is not None else 0
+        if max(ram, vram) < FREED_MIN_MB:
+            log(f"ComfyUI unload ({n['kind']}): nothing big was loaded; no notification")
+            return
+        log(f"ComfyUI models unloaded ({n['kind']}): {int(ram)} MB RAM, {int(vram)} MB VRAM")
+        self.last_action = {"t": int(time.time()), "kind": n["kind"], "mb": int(ram), "vram_mb": int(vram)}
+        self.notify(f"comfy-{n['kind']}", n["title"], n["body"], "dialog-information-symbolic", "low")
+
+    # ---------- GPU
+    def gpu_sample(self, b, quick=False):
+        """VRAM do servidor pelo nvidia-smi, só com a NVIDIA já acordada. Dormindo = 0 (sem modelo na VRAM)."""
+        if not self.gpus:
+            return None
+        states = gpu_states(self.gpus)
+        if nvidia_asleep(states):
+            b.vram_mb = 0
+            return None
+        if not nvidia_awake(states):
+            return None
+        out = self.run_smi(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"])
+        if out is None:
+            return None
+        apps = parse_nvidia_apps(out)
+        tree = {b.pid} | (descendants(b.pid, self.ppids()) if not quick else set())
+        b.vram_mb = sum(mb for pid, mb in apps.items() if pid in tree)
+        return b.vram_mb
+
+    def gpu_tick(self, b):
+        vram = self.gpu_sample(b)
+        if vram is None or not self.conf["comfy_free_for_games"]:
+            return
+        used = parse_nvidia_used(self.run_smi(["--query-gpu=memory.used", "--format=csv,noheader,nounits"]))
+        if used is None:
+            return
+        other = max(0, used - vram)
+        if vram < MODEL_VRAM_MB:
+            # sem modelo na VRAM ainda: só aprende a base (o que o sistema usa), antes de um jogo abrir
+            b.other_base = other if b.other_base is None else min(b.other_base, other)
+            return
+        want, b.games_armed, b.other_base = games_step(other, b.other_base, vram, b.idle, b.games_armed)
+        if want and self.free_models(b, "games", f"Unloaded idle ComfyUI models ({fmt_size(vram)})",
+                                     "GPU memory freed for your game"):
+            b.games_armed = False
+
+    # ---------- eventos do aero-memory
+    def on_memory_event(self, ev):
+        if ev["kind"] == "pressure":
+            # uma vez até o ComfyUI trabalhar de novo (o aero-memory repete o evento a cada minuto)
+            b = self.backend
+            if b is not None and b.idle is not False and b.pressure_armed and self.worth_unloading(b):
+                if self.free_models(b, "unload", "Unloaded idle ComfyUI models to make room", "Memory is low"):
+                    b.pressure_armed = False
+            return
+        # pausado/retomado/fechado: só os processos DESTE usuário (o aero-memory cuida de todos).
+        # oom_kill não tem dono (o kernel só conta) e o aviso não diz nome: vale pra todos
+        if ev["kind"] != "oom_kill" and ev.get("uid") != self.uid:
+            return
+        n = event_notification(ev, tuple(self.recent_backends))
+        if n:
+            self.notify(*n)
+
+    # ---------- estado (pro Settings)
+    def state_doc(self):
+        b, now = self.backend, time.monotonic()
+        comfy = {"running": b is not None, "pid": b.pid if b else None,
+                 "idle_s": (int(now - b.last_busy) if b.idle else 0) if b and b.idle is not None else None,
+                 "models_loaded": b.models_loaded if b else False, "windows": len(self.windows),
+                 "app": bool(self.apps), "last_action": self.last_action}
+        return {"t": int(time.time()), "comfy": comfy, "config": dict(self.conf), "dry_run": self.dry}
+
+    def write_state(self, force=False):
+        if not self.state_path:
+            return
+        now = time.monotonic()
+        if not force and now - self.state_at < 2:
+            return
+        doc = self.state_doc()
+        key = json.dumps({k: v for k, v in doc.items() if k != "t"}, sort_keys=True)
+        if not force and key == self.state_key and now - self.state_at < 30:
+            return
+        atomic_write_json(self.state_path, doc)
+        self.state_key, self.state_at, self.state_written = key, now, True
+
+    # ---------- laço principal
+    def timers(self):
+        now = time.monotonic()
+        if now >= self.t["tick"]:
+            self.t["tick"] = now + TICK_S
+            for ev in self.safe("events", self.tail.poll) or []:
+                self.safe("event", self.on_memory_event, ev)
+            self.reap_notifiers()
+            self.reap_smi()
+            self.safe("apps", self.check_apps)
+        if self.free_note is not None and now >= self.free_note["at"]:
+            self.safe("unload", self.confirm_free)
+        if self.hypr_sock is None and now >= self.hypr_retry_at:
+            self.safe("hyprland", self.hypr_connect)
+        if self.hypr_sock is not None and now >= self.t["resync"]:
+            self.t["resync"] = now + RESYNC_EVERY_S
+            self.safe("windows", self.resync_windows)
+        if self.close_at is not None and now >= self.close_at:
+            self.close_at = None
+            self.safe("close", self.close_check)
+        if now >= self.t["backend"]:
+            self.t["backend"] = now + BACKEND_EVERY_S
+            b = self.safe("backend", self.scan_backend)
+            if b is not None:
+                self.safe("orphan", self.orphan_check, b)
+        b = self.backend
+        if b is not None and now >= self.t["gpu"]:
+            fast = self.conf["comfy_free_for_games"] and b.idle and (b.vram_mb or 0) >= MODEL_VRAM_MB
+            self.t["gpu"] = now + (GPU_FAST_S if fast else GPU_SLOW_S)
+            self.safe("gpu", self.gpu_tick, b)
+        b = self.backend
+        if b is not None and now >= self.t["queue"]:
+            self.t["queue"] = now + QUEUE_EVERY_S
+            self.safe("queue", self.queue_tick, b)
+        self.safe("state", self.write_state)
+
+    def next_timeout_ms(self):
+        now = time.monotonic()
+        due = [self.t["tick"]]
+        if self.close_at is not None:
+            due.append(self.close_at)
+        if self.hypr_sock is None:
+            due.append(self.hypr_retry_at)
+        return max(0, min(int((min(due) - now) * 1000) + 1, TICK_S * 1000))
+
+    def on_wake(self, _):
+        try:
+            while self.wake_r.recv(64):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            pass
+
+    def setup_signals(self):
+        self.wake_r, self.wake_w = socket.socketpair()
+        self.wake_r.setblocking(False)
+        self.wake_w.setblocking(False)
+        signal.set_wakeup_fd(self.wake_w.fileno(), warn_on_full_buffer=False)
+        self.poller.register(self.wake_r.fileno(), select.POLLIN)
+        self.handlers[self.wake_r.fileno()] = self.on_wake
+
+        def stop(*_):
+            self.running = False
+
+        def hup(*_):
+            self.reload = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGHUP, hup)
+
+    def run(self):
+        self.setup_signals()
+        c = self.conf
+        log(f"started{' (dry run: no actions)' if self.dry else ''}: port {c['comfy_port']}, "
+            f"window class {c['comfy_window_class']}, free on close {c['comfy_free_on_close']}, "
+            f"idle unload {c['comfy_idle_unload_min']} min, free for games {c['comfy_free_for_games']}, "
+            f"NVIDIA GPUs {len(self.gpus)}")
+        self.safe("hyprland", self.hypr_connect)
+        try:
+            while self.running:
+                self.step()
+        finally:
+            self.shutdown()
+
+    def step(self, timeout_ms=None):
+        """Uma volta do laço: espera um evento (ou o próximo relógio) e faz o que estiver na hora."""
+        wait = self.next_timeout_ms() if timeout_ms is None else timeout_ms
+        for fd, rev in self.poller.poll(wait):
+            h = self.handlers.get(fd)
+            if h is not None:
+                self.safe("poll", h, rev)
+        if not self.running:
+            return
+        if self.reload:
+            self.reload = False
+            new = self.safe("config", self.load_config)     # um erro aqui nunca derruba o agente
+            if new is None:
+                log("configuration not reloaded; keeping the previous one")
+            else:
+                old_port, self.conf = self.conf["comfy_port"], new
+                if self.conf["comfy_port"] != old_port:
+                    self.backend = self.gone = self.ignored = self.free_note = None
+                    self.orphan_since = None
+                self.gpus = find_nvidia_gpus(self.sysfs)
+                log("configuration reloaded")
+                self.safe("windows", self.resync_windows)
+        self.timers()
+
+    def shutdown(self):
+        self.hypr_disconnect_quiet()
+        for pid in list(self.apps):
+            self.untrack_app(pid)
+        self.reap_notifiers(final=True)
+        if self.smi_parked is not None:          # nvidia-smi travado: espera um pouco, nunca pra sempre
+            try:
+                self.smi_parked.wait(timeout=1)
+                self.smi_parked = None
+            except subprocess.TimeoutExpired:
+                pass
+        if self.wake_r is not None:
+            signal.set_wakeup_fd(-1)
+            self.handlers.pop(self.wake_r.fileno(), None)
+            try:
+                self.poller.unregister(self.wake_r.fileno())
+            except (KeyError, ValueError):
+                pass
+            self.wake_r.close()
+            self.wake_w.close()
+            self.wake_r = self.wake_w = None
+        if self.state_written and self.state_path:
+            try:
+                os.unlink(self.state_path)
+            except OSError:
+                pass
+        log("stopped")
+
+    def hypr_disconnect_quiet(self):
+        s, self.hypr_sock = self.hypr_sock, None
+        if s is not None:
+            self.handlers.pop(s.fileno(), None)
+            try:
+                self.poller.unregister(s.fileno())
+            except (KeyError, ValueError):
+                pass
+            s.close()
+
+    # ---------- --check
+    def check(self):
+        c = self.conf
+        print("aero-memory-agent check (changes nothing)")
+        print("config: " + ", ".join(f"{k}={v}" for k, v in c.items()))
+        inst = hypr_instances(self.runtime, os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"), self.uid)
+        clients = None
+        for d in inst[:5]:
+            clients = hypr_request(d)
+            if isinstance(clients, list):
+                self.hypr_dir = d
+                break
+        if isinstance(clients, list):
+            self.windows = comfy_windows(clients, c["comfy_window_class"])
+            print(f"hyprland: running, {len(clients)} windows, {len(self.windows)} of ComfyUI")
+            for pid in self.windows.values():
+                if pid:
+                    self.track_app(pid)
+        else:
+            print("hyprland: not found (the agent keeps trying when it runs)")
+        b = self.scan_backend()
+        port = c["comfy_port"]
+        if b is None:
+            print(f"comfyui server: not running (nothing of yours listening on 127.0.0.1:{port})")
+        else:
+            q = self.ask_queue(b)
+            ext = self.external_clients(b)
+            print(f"comfyui server: pid {b.pid} ({b.comm}), RAM {fmt_size(b.ram_mb)}, "
+                  f"{'started from a terminal' if b.has_tty else 'no terminal'}")
+            print("  started with the ComfyUI app: " + ("yes" if b.app_seen else
+                                                        "no (never ended as an orphan)"))
+            print("  queue: " + ("no answer" if q is None else f"{q[0]} running, {q[1]} waiting"))
+            print(f"  other connections (browser): {ext}")
+            print(f"  model files it holds: {len(b.models)} ({fmt_size(sum(s for _, s in b.models.values()) / 2**20)})")
+        print("comfyui app: " + (f"running (pid {', '.join(map(str, self.apps))})" if self.apps else "not running"))
+        states = gpu_states(self.gpus)
+        if not self.gpus:
+            print("nvidia gpu: none")
+        else:
+            print("nvidia gpu: " + ", ".join(states) + ("" if nvidia_awake(states) else " (nvidia-smi not called)"))
+            if b is not None and nvidia_awake(states):
+                vram = self.gpu_sample(b)
+                print("  comfyui VRAM: " + ("unknown" if vram is None else fmt_size(vram)))
+        try:
+            st = os.stat(self.tail.path)
+            print(f"memory guard events: present ({st.st_size} bytes)")
+        except OSError:
+            print("memory guard events: not found (aero-memory not installed or not running)")
+        if b is not None:
+            would = close_verdict(bool(c["comfy_free_on_close"]), 0, bool(self.apps), True, b.has_tty,
+                                  self.external_clients(b))
+            print(f"if the last ComfyUI window closed now: {would}")
+        for pid in list(self.apps):
+            self.untrack_app(pid)
+        return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="aero-memory-agent", description="Aero OS memory helper (ComfyUI).")
+    ap.add_argument("--check", action="store_true", help="one-shot report; changes nothing")
+    ap.add_argument("--dry-run", action="store_true", help="run, but only log what it would do")
+    ap.add_argument("--config", help="config file (default ~/.config/aero/memory-agent.conf)")
+    ap.add_argument("--events", default=EVENTS_FILE, help="aero-memory events file")
+    ap.add_argument("--state", help="state file (default $XDG_RUNTIME_DIR/aero-memory-agent.json; "
+                                    "none in --dry-run)")
+    a = ap.parse_args(argv)
+    state = a.state
+    if state is None and not a.dry_run and not a.check:
+        rt = runtime_dir()
+        state = os.path.join(rt, "aero-memory-agent.json") if rt else None
+        if state is None:
+            log("XDG_RUNTIME_DIR is missing or not private; no state file for Settings")
+    agent = Agent(conf_path=a.config, events_path=a.events, state_path=state, dry_run=a.dry_run or a.check)
+    if a.check:
+        return agent.check()
+    agent.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

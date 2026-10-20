@@ -1,0 +1,13 @@
+55d0c0a00000-55d0c0a01000 r--p 00000000 103:02 1311001                    /usr/bin/python3.14
+55d0c1200000-55d0c1400000 rw-p 00000000 00:00 0                          [heap]
+7f1000000000-7f1080000000 r--s 00000000 00:2a 9001                       /models/checkpoints/base model v1.safetensors
+7f1080000000-7f1090000000 r--s 08000000 00:2a 9001                       /models/checkpoints/base model v1.safetensors
+7f1090000000-7f10a0000000 r--p 00000000 00:2a 9002                       /models/loras/STYLE.SafeTensors
+7f10a0000000-7f10a1000000 r--p 00000000 00:2a 9003                       /models/unet/old.gguf (deleted)
+7f10a1000000-7f10a2000000 r-xp 00000000 103:02 1311500                   /usr/lib/python3.14/site-packages/torch/lib/libtorch_cuda.so
+7f10a2000000-7f10a3000000 rw-p 00000000 00:00 0
+7f10a3000000-7f10a3001000 r--p 00000000 00:05 1234                       /dev/nvidia0
+7f10a4000000-7f10a5000000 r--p 00000000 00:2a 9004                       /models/vae/ae.sft
+7f10a5000000-7f10a6000000 r--p 00000000 00:2a 9005                       relative/not-absolute.ckpt
+7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]
+7ffd00100000-7ffd00102000 r-xp 00000000 00:00 0                          [vdso]

@@ -1,0 +1,14 @@
+Name:	python3
+Umask:	0022
+State:	S (sleeping)
+Tgid:	4242
+Pid:	4242
+PPid:	4200
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+VmPeak:	30000000 kB
+VmRSS:	 6291456 kB
+RssAnon:	 5242880 kB
+RssFile:	  983040 kB
+RssShmem:	   65536 kB
+Threads:	48

@@ -1,0 +1,7 @@
+[
+  {"address": "0x55800f619320", "class": "comfyui", "initialClass": "comfyui", "pid": 4200, "title": "ComfyUI"},
+  {"address": "0x55800f6193a0", "class": "", "initialClass": "ComfyUI", "pid": 4200, "title": "Settings"},
+  {"address": "0x55800f5407b0", "class": "firefox", "initialClass": "firefox", "pid": 3100, "title": "x"},
+  {"address": "not-an-address", "class": "comfyui", "pid": 1},
+  "garbage"
+]

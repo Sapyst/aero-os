@@ -1,0 +1,377 @@
+#!/usr/bin/python3 -I
+"""aero-memory-config: changes the Aero OS memory guard settings (root helper used by Settings).
+
+  aero-memory-config set KEY VALUE   change one setting in /etc/aero/memory.conf, then reload the guard
+  aero-memory-config get             print the settings in use (file values over the defaults)
+  aero-memory-config swap-size N     resize the SSD swap file to N GB (4..64), via aero-swap-setup
+
+Keys and values (anything else is refused):
+  enabled, pause_background, kill_on_critical   0 or 1
+  warn_available, critical_available             whole percent 1..50, critical lower than warn
+  protect, background                            process names, comma separated (max 20; letters,
+                                                 digits and . _ + - only), or empty
+
+Exit codes: 0 ok, 2 refused (bad input), 3 unsafe right now (nothing changed), 4 a step failed.
+Test mode (never as root): --config-path PATH works on another file and never reloads anything.
+"""
+# Roda como root (sudo -A pelo app Settings). Por isso:
+#  - só aceita chaves e valores de uma lista fechada (nada vira comando ou texto livre no arquivo);
+#  - grava atômico (tmp + rename na mesma pasta), sem seguir link, com trava (flock) contra duas
+#    mudanças ao mesmo tempo; o arquivo fica 0644 root;
+#  - programas chamados por caminho absoluto, lista de argumentos (sem shell, sem PATH);
+#  - python -I (no shebang): ignora PYTHONPATH & cia. e a pasta do script.
+import fcntl
+import os
+import re
+import stat
+import subprocess
+import sys
+
+CONF_PATH = "/etc/aero/memory.conf"
+SWAP_SETUP = "/usr/local/bin/aero-swap-setup"
+SYSTEMCTL = ("/usr/bin/systemctl", "/bin/systemctl")
+SERVICE = "aero-memory.service"
+MAX_FILE = 64 * 1024
+
+DEFAULTS = {
+    "enabled": "1",
+    "pause_background": "1",
+    "kill_on_critical": "1",
+    "warn_available": "15",
+    "critical_available": "4",
+    "protect": "",
+    "background": "fossilize_replay",
+}
+BOOL_KEYS = ("enabled", "pause_background", "kill_on_critical")
+PCT_KEYS = ("warn_available", "critical_available")
+LIST_KEYS = ("protect", "background")
+# comm do kernel tem até 15 caracteres; aceitamos até 32 (ex: o padrão fossilize_replay tem 16)
+# e o guarda compara pelos 15 primeiros
+NAME_RE = re.compile(r"[A-Za-z0-9._+-]{1,32}")
+MAX_NAMES = 20
+SWAP_MIN, SWAP_MAX = 4, 64
+
+OK, REFUSED, UNSAFE, FAILED = 0, 2, 3, 4
+
+
+class Refused(Exception):
+    """Entrada recusada (código 2)."""
+
+
+class Unsafe(Exception):
+    """Agora não dá com segurança (código 3)."""
+
+
+class Failed(Exception):
+    """Uma etapa falhou (código 4)."""
+
+
+# ---------- validação (funções puras, testadas) ----------
+
+def validate(chave, valor):
+    """(chave, valor) vindos da linha de comando -> valor normalizado pro arquivo. Recusa o resto."""
+    if chave not in DEFAULTS:
+        raise Refused(f"unknown setting: only {', '.join(DEFAULTS)}")
+    if not isinstance(valor, str) or len(valor) > 1024:
+        raise Refused("value too long")
+    if chave in BOOL_KEYS:
+        if valor not in ("0", "1"):
+            raise Refused(f"{chave} must be 0 or 1")
+        return valor
+    if chave in PCT_KEYS:
+        if not re.fullmatch(r"[0-9]{1,2}", valor) or not 1 <= int(valor) <= 50:
+            raise Refused(f"{chave} must be a whole number from 1 to 50")
+        return str(int(valor))
+    nomes = []
+    for t in valor.split(","):
+        t = t.strip(" ")
+        if not t:
+            continue
+        if not NAME_RE.fullmatch(t):
+            raise Refused(f"{chave}: process names may only have letters, digits and . _ + - (max 32)")
+        if t not in nomes:
+            nomes.append(t)
+    if len(nomes) > MAX_NAMES:
+        raise Refused(f"{chave}: at most {MAX_NAMES} names")
+    return ",".join(nomes)
+
+
+def parse_file(texto):
+    """Conteúdo atual -> {chave: valor} só com o que é válido (o resto é descartado na regravação)."""
+    vals = {}
+    for linha in texto.splitlines()[:500]:
+        linha = linha.split("#", 1)[0].strip()
+        chave, sep, valor = linha.partition("=")
+        chave, valor = chave.strip(), valor.strip()
+        if not sep or chave not in DEFAULTS:
+            continue
+        if chave in BOOL_KEYS:
+            # o guarda aceita yes/no/true/false à mão; aqui vira 0/1
+            v = valor.lower()
+            valor = "1" if v in ("1", "yes", "true", "on") else "0" if v in ("0", "no", "false", "off") else None
+            if valor is None:
+                continue
+        try:
+            vals[chave] = validate(chave, valor)
+        except Refused:
+            continue
+    return vals
+
+
+def check_pair(vals):
+    """critical_available tem de ser menor que warn_available (com os padrões no que faltar)."""
+    warn = int(vals.get("warn_available", DEFAULTS["warn_available"]))
+    crit = int(vals.get("critical_available", DEFAULTS["critical_available"]))
+    if crit >= warn:
+        raise Refused(f"critical_available ({crit}) must be lower than warn_available ({warn})")
+
+
+def render(vals):
+    """{chave: valor} -> texto do arquivo (só chaves conhecidas, na ordem fixa)."""
+    linhas = ["# Aero OS memory guard (aero-memory). Written by aero-memory-config: change it from",
+              "# Settings > System > Memory. Missing keys use the defaults."]
+    linhas += [f"{k}={vals[k]}" for k in DEFAULTS if k in vals]
+    return "\n".join(linhas) + "\n"
+
+
+def effective(vals):
+    out = dict(DEFAULTS)
+    out.update(vals)
+    return out
+
+
+def config_path(pedido, euid):
+    """Caminho do arquivo. --config-path só fora do root: senão seria gravar onde quiser como root."""
+    if pedido is None:
+        return CONF_PATH, False
+    if euid == 0:
+        raise Refused("--config-path is only for tests and can't be used as root")
+    return pedido, True
+
+
+# ---------- arquivo ----------
+
+def open_dir(pasta, euid, criar):
+    """fd da pasta da config, conferida: pasta de verdade (não link), do root (ou nossa, em teste),
+    sem escrita pra grupo/outros."""
+    criada = False
+    if criar:
+        try:
+            os.mkdir(pasta, 0o755)
+            criada = True
+        except FileExistsError:
+            pass
+        except OSError as e:
+            raise Failed(f"can't create the config folder ({e.strerror})") from None
+    try:
+        dfd = os.open(pasta, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Failed(f"can't open the config folder ({e.strerror})") from None
+    if criada:
+        os.fchmod(dfd, 0o755)       # legível por todos mesmo se o sudo vier com umask fechada
+    st = os.fstat(dfd)
+    if st.st_uid != euid or st.st_mode & 0o022:
+        os.close(dfd)
+        raise Failed("the config folder has the wrong owner or permissions")
+    return dfd
+
+
+def read_current(dfd, nome):
+    try:
+        fd = os.open(nome, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dfd)
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        raise Failed(f"can't read the config ({e.strerror})") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Failed("the config is not a regular file")
+        return os.read(fd, MAX_FILE).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def write_atomic(dfd, nome, texto, euid):
+    tmp = f".{nome}.{os.getpid()}.tmp"
+    try:
+        os.unlink(tmp, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644,
+                 dir_fd=dfd)
+    try:
+        try:
+            if euid == 0:
+                os.fchown(fd, 0, 0)
+            os.fchmod(fd, 0o644)
+            dados = memoryview(texto.encode())
+            while dados:
+                dados = dados[os.write(fd, dados):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, nome, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+
+
+def set_value(caminho, chave, valor, euid):
+    """Valida, lê o atual, troca uma chave e grava (com trava). Devolve o texto gravado."""
+    novo = validate(chave, valor)
+    pasta, nome = os.path.split(os.path.abspath(caminho))
+    dfd = open_dir(pasta, euid, criar=(caminho == CONF_PATH))
+    try:
+        fcntl.flock(dfd, fcntl.LOCK_EX)         # duas mudanças seguidas do Settings não se perdem
+        vals = parse_file(read_current(dfd, nome))
+        vals[chave] = novo
+        if chave in PCT_KEYS:
+            check_pair(vals)
+        else:
+            try:
+                check_pair(vals)
+            except Refused:
+                # par inválido gravado à mão: o guarda já usa os padrões dos dois, então tirar as
+                # duas chaves não muda nada nele, e as outras chaves (desligar o guarda!) continuam
+                # podendo ser mudadas pelo Settings
+                vals.pop("warn_available", None)
+                vals.pop("critical_available", None)
+                print("warning: warn_available/critical_available were invalid; reset to the defaults "
+                      "the guard already uses", file=sys.stderr)
+        texto = render(vals)
+        try:
+            write_atomic(dfd, nome, texto, euid)
+        except OSError as e:
+            raise Failed(f"can't write the config ({e.strerror})") from None
+        return texto
+    finally:
+        os.close(dfd)                            # fechar solta a trava
+
+
+def get_values(caminho):
+    try:
+        with open(caminho, "rb") as f:
+            texto = f.read(MAX_FILE).decode("utf-8", "replace")
+    except FileNotFoundError:
+        texto = ""
+    except OSError as e:
+        raise Failed(f"can't read the config ({e.strerror})") from None
+    return effective(parse_file(texto))
+
+
+# ---------- recarregar e swap ----------
+
+def systemctl():
+    for c in SYSTEMCTL:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def reload_guard():
+    """Avisa o guarda (SIGHUP pelo ExecReload). Só se ele estiver rodando: não liga um serviço parado."""
+    c = systemctl()
+    if c is None:
+        print("warning: systemctl not found; the guard reads the new config when it starts", file=sys.stderr)
+        return
+    try:
+        r = subprocess.run([c, "try-reload-or-restart", SERVICE], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=30, env=_clean_env())
+    except (OSError, subprocess.TimeoutExpired):
+        print("warning: couldn't reload the memory guard; it reads the new config when it restarts",
+              file=sys.stderr)
+        return
+    if r.returncode != 0:
+        print("warning: the memory guard didn't reload; it reads the new config when it restarts",
+              file=sys.stderr)
+
+
+def _clean_env():
+    """Ambiente mínimo pros programas chamados como root (nada herdado do usuário)."""
+    return {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+def swap_setup_result(codigo, saida):
+    """Código do aero-swap-setup -> exceção nossa (ou None se deu certo).
+    Ele devolve: 0 ok, 1 comando falhou, 2 uso errado, 3 precisa de root, 4 inseguro,
+    5 pouco espaço no disco, 6 swap em uso sem RAM livre pra desligar agora."""
+    if codigo == 0:
+        return None
+    linhas = [l.strip() for l in (saida or "").splitlines() if l.strip()]
+    msg = "aero-swap-setup: " + (linhas[-1][:300] if linhas else f"exit code {codigo}")
+    if codigo in (4, 5, 6):
+        return Unsafe(msg)
+    if codigo == 2:
+        return Refused(msg)
+    return Failed(msg)
+
+
+def swap_size(valor):
+    """Ajusta o swap do SSD. O aero-swap-setup faz tudo e confere sozinho se é seguro (espaço no
+    disco, RAM livre pra desligar o swap atual); aqui só vai o número já validado."""
+    if not re.fullmatch(r"[0-9]{1,2}", valor) or not SWAP_MIN <= int(valor) <= SWAP_MAX:
+        raise Refused(f"swap size must be a whole number of GB from {SWAP_MIN} to {SWAP_MAX}")
+    if not (os.path.isfile(SWAP_SETUP) and os.access(SWAP_SETUP, os.X_OK)):
+        raise Failed("aero-swap-setup is not installed")
+    try:
+        # sem prazo de propósito (mas sempre esperado): desligar um swap cheio pode levar muitos
+        # minutos, e matar o aero-swap-setup no meio (o timeout do subprocess manda SIGKILL só no
+        # bash) deixaria o swapoff órfão segurando a trava, sem a limpeza do trap e com o swap do
+        # SSD desligado até o boot. Ele mesmo recusa o que não dá (RAM/disco) e o Settings já roda
+        # isto em segundo plano, sem prazo.
+        r = subprocess.run([SWAP_SETUP, "--apply", "--size", str(int(valor))], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, env=_clean_env())
+    except OSError as e:
+        raise Failed(f"can't run aero-swap-setup ({e.strerror})") from None
+    erro = swap_setup_result(r.returncode, r.stderr or r.stdout)
+    if erro is not None:
+        raise erro
+
+
+# ---------- linha de comando ----------
+
+def main(argv):
+    pedido = None
+    if len(argv) >= 2 and argv[0] == "--config-path":
+        pedido, argv = argv[1], argv[2:]
+    euid = os.geteuid()
+    try:
+        caminho, teste = config_path(pedido, euid)
+        if len(argv) == 3 and argv[0] == "set":
+            if not teste and euid != 0:
+                raise Refused("run as root (Settings uses sudo)")
+            set_value(caminho, argv[1], argv[2], euid)
+            if not teste:
+                reload_guard()
+            print("ok")
+        elif len(argv) == 1 and argv[0] == "get":
+            for k, v in get_values(caminho).items():
+                print(f"{k}={v}")
+        elif len(argv) == 2 and argv[0] == "swap-size":
+            if teste:
+                raise Refused("swap-size has no test mode")
+            if euid != 0:
+                raise Refused("run as root (Settings uses sudo)")
+            swap_size(argv[1])
+            print("ok")
+        else:
+            raise Refused("usage: aero-memory-config set KEY VALUE | get | swap-size N")
+    except Refused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return REFUSED
+    except Unsafe as e:
+        print(f"not now: {e}", file=sys.stderr)
+        return UNSAFE
+    except Failed as e:
+        print(f"failed: {e}", file=sys.stderr)
+        return FAILED
+    return OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

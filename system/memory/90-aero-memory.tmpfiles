@@ -1,0 +1,22 @@
+# Aero OS — memória esperta, parte do kernel. Instalar em /etc/tmpfiles.d/90-aero-memory.conf
+# (system/memory/install.sh faz isso). Roda a cada boot (systemd-tmpfiles-setup.service).
+# Aplicar agora: sudo systemd-tmpfiles --create /etc/tmpfiles.d/90-aero-memory.conf
+#
+# MGLRU (multi-gen LRU, o gerenciador de memória do kernel) com proteção contra "thrashing":
+# min_ttl_ms=1000 = o kernel não tira da RAM o que foi usado no último 1 segundo. Se nem isso
+# couber, ele chama o OOM killer em vez de ficar minutos trocando páginas com a tela congelada.
+# O OOM killer escolhe pelo oom_score_adj: o aero-memory protege o desktop (-900) e marca como
+# primeiros alvos os trabalhos de fundo e o ComfyUI (+500).
+# Atenção: essa morte é do próprio kernel, não do aero-memory — acontece mesmo com
+# kill_on_critical=0 ("Close the biggest app before a freeze" desligado no Settings). É o último
+# recurso contra o congelamento; o kernel conta cada uma em /proc/vmstat (oom_kill), e o
+# aero-memory lê esse contador e avisa (evento oom_kill: notificação e "Last action" no Settings).
+# 1000 ms ≈ 10x o atraso que uma pessoa percebe (~100 ms) — o valor sugerido pela doc do kernel
+# (admin-guide/mm/multigen_lru). Padrão: 0 (desligado).
+# Só tem efeito com o MGLRU ligado (/sys/kernel/mm/lru_gen/enabled diferente de 0x0000; o
+# kernel do Arch já vem com 0x0007).
+#
+# "w" só escreve se o arquivo existir: num kernel sem MGLRU (sem /sys/kernel/mm/lru_gen) a
+# linha é ignorada em silêncio (testado no systemd 262: saída 0, sem aviso).
+# O "-" de "w-" faz uma falha ao escrever (ex.: valor recusado) não marcar o boot como falho.
+w- /sys/kernel/mm/lru_gen/min_ttl_ms - - - - 1000

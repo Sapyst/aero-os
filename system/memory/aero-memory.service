@@ -1,0 +1,97 @@
+# aero-memory.service — guarda de memória do Aero OS (instalar em /etc/systemd/system/).
+# Mantém o desktop respondendo quando a memória acaba: protege o compositor, pausa trabalho de
+# fundo no aperto e, em último caso, fecha o maior culpado antes do sistema congelar.
+# Não usamos o systemd-oomd: todos os apps da sessão ficam num cgroup só (session-N.scope) e ele
+# derrubaria o desktop inteiro.
+[Unit]
+Description=Aero OS memory guard (keeps the desktop responsive when memory runs out)
+After=systemd-sysctl.service
+# guarda nunca desiste: tenta de novo para sempre (com espera crescente, ver RestartSteps)
+StartLimitIntervalSec=0
+
+[Service]
+# notify: o daemon avisa "pronto" e manda sinal de vida (watchdog) a cada ~10 s; se o laço travar
+# por 30 s, o systemd reinicia ele (e a partida retoma qualquer processo pausado)
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+ExecStart=/usr/local/bin/aero-memory
+# recarregar = SIGHUP: relê /etc/aero/memory.conf sem reiniciar (kill resolvido pelo systemd, sem PATH)
+ExecReload=kill -HUP $MAINPID
+# rede de segurança: mesmo se o daemon morrer com SIGKILL, ninguém fica pausado (SIGSTOP) e o
+# oom_score_adj que ele mudou (adj.json) volta ao original
+ExecStopPost=/usr/local/bin/aero-memory --resume-paused
+Restart=always
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=30
+TimeoutStopSec=15
+
+# prioridade: o guarda precisa rodar justamente quando tudo está lento
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+# o kernel nunca escolhe o guarda como vítima do OOM
+OOMScoreAdjust=-1000
+# mlockall(MCL_CURRENT|MCL_FUTURE): o guarda (~20 MB) nunca vai pro swap
+LimitMEMLOCK=infinity
+# um processo, sem threads (o resto é margem)
+TasksMax=8
+UMask=0022
+
+# /run/aero-memory (0755): state.json e events.jsonl (0644, só números, nomes e uids) e, só pro
+# guarda, paused.json e adj.json (0600)
+RuntimeDirectory=aero-memory
+RuntimeDirectoryMode=0755
+# a pasta sobrevive aos reinícios automáticos: o paused.json não se perde e a próxima partida retoma
+# os pausados. Ao parar de vez ela é apagada (depois do ExecStopPost).
+RuntimeDirectoryPreserve=restart
+
+# ----- capacidades (só estas; o root do serviço não pode mais nada) -----
+# CAP_KILL           SIGSTOP/SIGCONT/SIGTERM/SIGKILL em processos de outros usuários
+# CAP_SYS_RESOURCE   baixar oom_score_adj abaixo do mínimo do processo (-900) e criar o gatilho do
+#                    PSI com janela de 1 s (sem ela o kernel só aceita janelas de 2 s)
+# CAP_DAC_OVERRIDE   /proc/PID/oom_score_adj é 0644 do DONO do processo: root só grava com ela
+# CAP_SYS_PTRACE     ler /proc/PID/cwd e /proc/PID/exe de outros usuários (backend do ComfyUI;
+#                    conferir que o "Hyprland" é mesmo o programa do sistema)
+# CAP_IPC_LOCK       mlockall sem limite de memória travada
+CapabilityBoundingSet=CAP_KILL CAP_SYS_RESOURCE CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_IPC_LOCK
+NoNewPrivileges=yes
+
+# ----- isolamento -----
+# o sistema todo só leitura (a config em /etc também); só /run/aero-memory gravável.
+# /proc continua o de sempre: ProtectProc/ProcSubset NÃO podem ser usados (escondem os processos dos
+# outros usuários e /proc/meminfo, /proc/pressure) e PrivateUsers também não (tira o poder sobre
+# os processos de fora).
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+# só socket unix (journal, sd_notify)
+RestrictAddressFamilies=AF_UNIX
+# ProtectKernelTunables fica desligado de propósito (padrão da spec): o guarda escreve no gatilho
+# /proc/pressure/memory e em /proc/PID/oom_score_adj
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# testado: python + ctypes (mlockall, syscall) funcionam com memória W^X (PR_SET_MDWE)
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# process_mrelease (libera na hora a memória de quem levou SIGKILL) não está em nenhum grupo
+SystemCallFilter=@system-service process_mrelease
+# nada de trocar dono/uid, relógio, swap, módulos, prioridades de outros
+SystemCallFilter=~@privileged @resources
+# chamada bloqueada devolve erro em vez de matar o guarda
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

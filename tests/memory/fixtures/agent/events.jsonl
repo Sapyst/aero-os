@@ -1,0 +1,11 @@
+{"t": 1700000000, "seq": 0, "kind": "paused", "uid": 1000, "names": ["fossilize_replay", "fossilize_replay"], "count": 7, "mb": 5200}
+{"t": 1700000005.5, "seq": 1, "kind": "killed", "uid": 1000, "name": "Web Content", "pid": 999, "mb": 3100, "count": 1}
+{"t": 1700000010, "seq": 2, "kind": "resumed", "uid": 1000, "names": ["fossilize_replay"], "count": 1, "reason": "calm"}
+{"t": 1700000011, "seq": 3, "kind": "pressure", "level": "warning", "available_pct": 9.5}
+{"t": true, "kind": "pressure"}
+{"t": 1700000012, "kind": "something-else"}
+[1, 2, 3]
+not json at all
+{"t": 1700000013, "seq": 4, "kind": "killed", "uid": 1000, "name": "<span color='red'>x</span>&amp;", "mb": -5}
+{"t": 1700000014, "seq": 5, "kind": "resumed", "uid": 1000, "names": ["fossilize_repla"], "count": 1, "reason": "reload"}
+{"t": 1700000015, "seq": 6, "kind": "oom_kill", "count": 1}

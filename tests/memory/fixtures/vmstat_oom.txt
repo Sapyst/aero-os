@@ -1,0 +1,6 @@
+nr_free_pages 123456
+nr_zone_inactive_anon 1000
+pswpin 10
+pswpout 20
+oom_kill 3
+nr_unaccepted 0

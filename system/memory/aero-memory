@@ -1,0 +1,2293 @@
+#!/usr/bin/python3 -I
+"""aero-memory: Aero OS memory guard (root daemon, run by aero-memory.service).
+
+Keeps the desktop responsive when memory runs out, instead of freezing:
+  - watches memory pressure (kernel PSI trigger on /proc/pressure/memory + /proc/meminfo every 2 s);
+  - protects the desktop: oom_score_adj -900 for the compositor, bar, audio, portals, Aero's own
+    scripts, and +500 for known hogs (Steam shader compilation, the ComfyUI backend), so even the
+    kernel's own OOM killer picks the right victim;
+  - warning: pauses (SIGSTOP) the background work listed in background= and tells the user agent
+    (event "pressure") so it can unload idle ComfyUI models;
+  - critical: as a last resort, closes the biggest offender before the system freezes;
+  - calm again: resumes (SIGCONT) everything it paused.
+It never leaves a process stopped: paused processes are written to /run/aero-memory/paused.json
+(pid + start time, so a reused pid is never touched) and resumed on exit, on reload and on start.
+It never leaves its oom_score_adj changes behind either: they are written to /run/aero-memory/adj.json
+and undone when the guard stops or is switched off.
+
+  aero-memory                  run as the service (systemd)
+  aero-memory --check          one-shot report: readings, level, what it would do, the victim it
+                               would choose. Never acts; works as a normal user (less detail)
+  aero-memory --dry-run        run the loop but only log what it would do (never sends a signal)
+  aero-memory --resume-paused  resume whatever paused.json lists and undo what adj.json lists
+                               (the unit's ExecStopPost)
+
+Config: /etc/aero/memory.conf (key=value; change it from Settings, via aero-memory-config).
+Files for Settings and the user agent (numbers, process names and the owner's uid only):
+  /run/aero-memory/state.json    current state, rewritten every 2 s
+  /run/aero-memory/events.jsonl  one JSON event per line (paused, resumed, pressure, killed, oom_kill),
+                                 max 64 KB; paused/resumed/killed carry the uid of the processes' owner,
+                                 resumed a reason (calm, reload, stopping, disabled, leftover); oom_kill
+                                 {count} = the kernel's own OOM killer closed something (no name, no uid)
+"""
+import errno
+import json
+import os
+import pwd
+import re
+import select
+import signal
+import socket
+import stat
+import sys
+import time
+import traceback
+
+# ---------- caminhos e limites ----------
+
+CONF_PATH = "/etc/aero/memory.conf"
+RUN_DIR = "/run/aero-memory"
+PROC = "/proc"
+PSI_PATH = "/proc/pressure/memory"
+
+TICK_S = 2.0                 # leitura de memória / timeout do poll
+MIN_EVAL_GAP_S = 0.5         # avaliações extras (gatilho do PSI) no máximo 2x por segundo
+PROTECT_EVERY_S = 10.0       # passada de proteção (oom_score_adj)
+PAUSE_SCAN_EVERY_S = 2.0     # no aperto: procura trabalho de fundo novo pra pausar
+CALM_HOLD_S = 30.0           # tempo de folga contínua antes de voltar ao normal
+CRITICAL_CONFIRM_S = 0.5     # crítico precisa se repetir (2 leituras) antes de fechar alguém
+KILL_COOLDOWN_S = 15.0       # intervalo mínimo entre dois fechamentos
+KILL_WAIT_S = 3.0            # espera depois do SIGTERM antes do SIGKILL
+VICTIM_RETRY_S = 5.0         # sem vítima boa: não varre de novo a cada leitura
+PRESSURE_EVENT_EVERY_S = 60.0
+PSI_SPIKE_S = 2.5            # gatilho do PSI disparou há menos que isso = pico agora
+PSI_RETRY_MIN_S, PSI_RETRY_MAX_S = 10.0, 300.0
+
+# Gatilho do PSI: "some <stall µs> <janela µs>" + \0. O kernel troca o ÚLTIMO byte escrito por \0,
+# então sem o \0 no fim o número da janela perde um dígito. Janela de 1 s só com CAP_SYS_RESOURCE
+# (privilegiado: 0,5 s..10 s); sem privilégio o kernel só aceita janelas múltiplas de 2 s.
+PSI_TRIGGERS = (
+    (b"some 150000 1000000\0", "kernel trigger, 150 ms stall per 1 s"),
+    (b"some 300000 2000000\0", "kernel trigger, 300 ms stall per 2 s (unprivileged)"),
+)
+
+PROTECT_ADJ = -900           # desktop vital
+PREFER_ADJ = 500             # gastões conhecidos: o OOM do kernel escolhe eles primeiro
+DEFAULT_RESTORE_ADJ = 0      # valor de quem herdou -900 do pai sem ser vital (padrão da sessão)
+UID_MIN, UID_MAX = 1000, 60000   # usuários humanos (login.defs); 65534 e usuários dinâmicos ficam fora
+PF_KTHREAD = 0x00200000      # flag de thread do kernel em /proc/PID/stat (campo 9)
+COMM_LEN = 15                # o kernel corta o comm em 15 caracteres
+
+MAX_PROCS = 32768            # teto de processos lidos por varredura (memória limitada)
+MAX_PAUSED = 256
+MAX_APPLIED = 1024           # processos com oom_score_adj mudado pelo guarda (anotados em adj.json)
+MAX_KILL_GROUP = 64
+MAX_JSON_FILE = 64 * 1024
+EVENTS_MAX = 64 * 1024
+MiB = 1024 * 1024
+MIN_VICTIM_MEM = 64 * MiB    # fechar algo menor não resolve nada
+PREFER_MIN_MEM = 256 * MiB   # trabalho de fundo/ComfyUI só tem preferência se for grande
+HOG_FRACTION = 0.40          # vital usando mais que isso da RAM está com defeito: pode ser fechado
+
+# Encher o zram custa ~1/3 do tamanho em RAM (zstd comprime ~3:1): o espaço livre nele vale ~2/3 de
+# folga de verdade. O swap no SSD (prioridade menor) nem conta como folga: quando ele enche, o sistema
+# já está trocando páginas com o disco.
+ZRAM_GAIN = 2 / 3
+THRASH_FULL = 30.0           # PSI full avg10: 30% do tempo tudo parado esperando memória
+THRASH_FAST_PCT = 5.0        # ... com o swap rápido (zram) praticamente cheio (% da RAM)
+
+# Desktop vital (oom_score_adj -900). Só vale se o programa (/proc/PID/exe) tiver o mesmo nome do comm,
+# for de root, não gravável por outros e estiver em /usr (um processo qualquer que se chame "Hyprland"
+# não ganha proteção: o comm qualquer um troca, o exe não).
+VITAL = frozenset({
+    "Hyprland", "start-hyprland", "Xwayland", "greetd", "waybar", "hyprpaper", "hypridle",
+    "hyprlock", "mako", "pipewire", "pipewire-pulse", "wireplumber", "dbus-daemon", "dbus-broker",
+    "dbus-broker-launch", "xdg-desktop-portal", "xdg-desktop-portal-hyprland", "polkitd",
+    "hyprpolkitagent", "systemd",
+})
+# Nunca fechados, nem com defeito: fechar = derrubar a sessão inteira. Aqui basta o nome do programa
+# bater com o comm, seja de quem for o arquivo (um compositor compilado em ~/.local também conta).
+NEVER_KILL = frozenset({
+    "Hyprland", "start-hyprland", "Xwayland", "greetd", "systemd", "dbus-daemon", "dbus-broker",
+    "dbus-broker-launch", "sway", "kwin_wayland", "gnome-shell", "labwc", "niri", "river",
+    "wayfire", "weston", "Xorg", "gdm", "sddm", "login", "agetty",
+    # Terminais e multiplexadores: fechar um derruba todo shell e programa rodando nele (o que
+    # gasta memória lá dentro é um processo filho, e esse continua podendo ser escolhido).
+    "kitty", "foot", "alacritty", "wezterm-gui", "konsole", "gnome-terminal-", "xterm", "tmux",
+    "screen", "zellij",
+})
+# comm -> nome do programa de verdade, quando ele roda por um link simbólico com outro nome
+EXE_ALIAS = {"pipewire-pulse": "pipewire"}
+SYSTEM_DIRS = ("/usr/",)     # onde ficam os programas vitais (pastas que só o root grava)
+# Scripts python do próprio Aero: só valem onde o Aero instala os dele (pastas relativas à home do
+# DONO do processo; o agente de memória também em /usr/local/bin). Um "/aero-shell/" qualquer no
+# caminho não basta.
+AERO_DIRS = (".local/share/aero-shell", ".local/share/aero-settings")
+AERO_SCRIPTS = ("aero-memory-agent",)
+AERO_SCRIPT_DIRS = (".local/bin", "/usr/local/bin")     # relativo = na home
+# Os scripts do Aero são pequenos (barra, dock, Settings: ~100-300 MB). Um "script do Aero" usando
+# mais que isso está com defeito ou não é do Aero (o dono pode pôr qualquer coisa na própria home):
+# perde a proteção, e o -900 nunca vale pra um gastão.
+AERO_MAX_MEM = 1024 * 1024 * 1024
+
+DEFAULTS = {
+    "enabled": True,
+    "pause_background": True,
+    "kill_on_critical": True,
+    "warn_available": 15,
+    "critical_available": 4,
+    "protect": (),
+    "background": ("fossilize_replay",),
+}
+BOOL_KEYS = ("enabled", "pause_background", "kill_on_critical")
+PCT_KEYS = ("warn_available", "critical_available")
+LIST_KEYS = ("protect", "background")
+NAME_RE = re.compile(r"[A-Za-z0-9._+-]{1,32}")
+MAX_NAMES = 20
+
+NORMAL, WARNING, CRITICAL = "normal", "warning", "critical"
+
+# ---------- log (journal) ----------
+
+def _stderr_is_journal():
+    """stderr é o socket do journal? (JOURNAL_STREAM = "dev:ino" do fd 2, posto pelo systemd)"""
+    try:
+        dev, ino = (int(x) for x in os.environ.get("JOURNAL_STREAM", "").split(":"))
+        st = os.fstat(2)
+    except (ValueError, OSError):
+        return False
+    return (st.st_dev, st.st_ino) == (dev, ino)
+
+
+_JOURNAL = _stderr_is_journal()
+_PRIO_NAME = {3: "error", 4: "warning", 5: "notice", 6: "info", 7: "debug"}
+VERBOSE = False
+_last_log = {}
+
+
+def log(prio, msg):
+    """Uma linha no stderr (o journal lê o prefixo <N> como prioridade). Nunca linhas de comando."""
+    if prio >= 7 and not VERBOSE:
+        return
+    msg = msg.replace("\n", " ").replace("\r", " ")
+    try:
+        if _JOURNAL:
+            # serviço: uma escrita direta no fd 2, que é não-bloqueante (ver nonblocking_journal):
+            # com o journal engasgado na falta de memória, a linha se perde, o guarda não para
+            os.write(2, f"<{prio}>{msg}\n".encode("utf-8", "replace"))
+        else:
+            sys.stderr.write(f"aero-memory {_PRIO_NAME.get(prio, '')}: {msg}\n")
+            sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def nonblocking_journal():
+    """Só no serviço e só se o fd 2 for mesmo o socket do journal (num terminal o fd é dividido com
+    o shell e não pode virar não-bloqueante)."""
+    if not _JOURNAL:
+        return
+    try:
+        import fcntl  # noqa: PLC0415
+        fl = fcntl.fcntl(2, fcntl.F_GETFL)
+        fcntl.fcntl(2, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    except OSError:
+        pass
+
+
+def log_limited(key, every_s, prio, msg):
+    """Log com limite: a mesma chave (texto fixo do código) no máximo 1x a cada every_s."""
+    agora = time.monotonic()
+    ultimo = _last_log.get(key)
+    if ultimo is not None and agora - ultimo < every_s:
+        return
+    if len(_last_log) > 256:
+        _last_log.clear()
+    _last_log[key] = agora
+    log(prio, msg)
+
+
+def describe_error(e):
+    """Erro -> "OSError EACCES at funcao:linha" (sem a mensagem: ela pode carregar dados de /proc)."""
+    nome = type(e).__name__
+    if isinstance(e, OSError) and e.errno in errno.errorcode:
+        nome += " " + errno.errorcode[e.errno]
+    try:
+        quadros = traceback.extract_tb(e.__traceback__)[-3:]
+        onde = " < ".join(f"{q.name}:{q.lineno}" for q in reversed(quadros))
+    except Exception:  # noqa: BLE001 — log nunca derruba o daemon
+        onde = "?"
+    return f"{nome} at {onde}"
+
+
+def sanitize_name(nome, tamanho=32):
+    """Nome de processo seguro pra log/JSON: só ASCII visível (um comm pode ter \\n e forjar log)."""
+    return "".join(c if " " <= c <= "~" else "?" for c in str(nome)[:tamanho])
+
+
+def mib(n):
+    return int(n // MiB)
+
+
+# ---------- leitura de arquivos ----------
+
+def read_at(dfd, nome, limite):
+    """Lê até `limite` bytes de dfd/nome (sem seguir link)."""
+    fd = os.open(nome, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dfd)
+    try:
+        partes, total = [], 0
+        while total < limite:
+            bloco = os.read(fd, min(65536, limite - total))
+            if not bloco:
+                break
+            partes.append(bloco)
+            total += len(bloco)
+        return b"".join(partes)
+    finally:
+        os.close(fd)
+
+
+def read_path(caminho, limite=65536):
+    """Lê até `limite` bytes de um caminho (/proc/meminfo, config...). O_NONBLOCK: um FIFO no
+    lugar do arquivo não trava o guarda."""
+    fd = os.open(caminho, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        partes, total = [], 0
+        while total < limite:
+            bloco = os.read(fd, min(65536, limite - total))
+            if not bloco:
+                break
+            partes.append(bloco)
+            total += len(bloco)
+        return b"".join(partes)
+    finally:
+        os.close(fd)
+
+
+# ---------- interpretação de /proc (funções puras, testadas) ----------
+
+def parse_meminfo(texto):
+    """/proc/meminfo -> {mem_total, mem_available, swap_total, swap_free} em bytes."""
+    if isinstance(texto, bytes):
+        texto = texto.decode("ascii", "replace")
+    chaves = {"MemTotal": "mem_total", "MemAvailable": "mem_available",
+              "SwapTotal": "swap_total", "SwapFree": "swap_free"}
+    v = {}
+    for linha in texto.splitlines():
+        nome, _, resto = linha.partition(":")
+        if nome in chaves:
+            partes = resto.split()
+            if partes and partes[0].isdigit():
+                n = int(partes[0])
+                v[chaves[nome]] = n * 1024 if len(partes) > 1 and partes[1] == "kB" else n
+    if v.get("mem_total", 0) <= 0 or "mem_available" not in v:
+        raise ValueError("meminfo without MemTotal/MemAvailable")
+    v.setdefault("swap_total", 0)
+    v.setdefault("swap_free", 0)
+    v["mem_available"] = min(v["mem_available"], v["mem_total"])
+    v["swap_free"] = min(v["swap_free"], v["swap_total"])
+    return v
+
+
+def parse_psi(texto):
+    """/proc/pressure/memory -> {"some": avg10, "full": avg10} (0.0 se faltar)."""
+    if isinstance(texto, bytes):
+        texto = texto.decode("ascii", "replace")
+    out = {"some": 0.0, "full": 0.0}
+    for linha in texto.splitlines():
+        partes = linha.split()
+        if not partes or partes[0] not in out:
+            continue
+        for kv in partes[1:]:
+            k, _, val = kv.partition("=")
+            if k != "avg10":
+                continue
+            try:
+                f = float(val)
+            except ValueError:
+                continue
+            if 0.0 <= f <= 100.0:
+                out[partes[0]] = f
+    return out
+
+
+def parse_oom_kills(texto):
+    """/proc/vmstat -> quantas vezes o OOM killer do kernel já fechou um processo desde o boot (ou
+    None se a linha faltar ou vier estranha). O SIGKILL do próprio guarda não entra nessa conta."""
+    if isinstance(texto, bytes):
+        texto = texto.decode("ascii", "replace")
+    for linha in texto.splitlines():
+        if linha.startswith("oom_kill "):
+            partes = linha.split()
+            return int(partes[1]) if len(partes) == 2 and partes[1].isdigit() else None
+    return None
+
+
+def parse_swaps(texto):
+    """/proc/swaps -> [(nome, tamanho, usado, prioridade)], tamanhos em bytes (o cabeçalho e linhas
+    estranhas ficam de fora)."""
+    if isinstance(texto, bytes):
+        texto = texto.decode("utf-8", "replace")
+    out = []
+    for linha in texto.splitlines()[:65]:
+        partes = linha.rsplit(None, 4)        # o nome pode ter espaço (vem como \040, mas por via das dúvidas)
+        if len(partes) != 5:
+            continue
+        try:
+            tam, usado, prio = int(partes[2]), int(partes[3]), int(partes[4])
+        except ValueError:
+            continue
+        if tam < 0 or usado < 0:
+            continue
+        out.append((partes[0], tam * 1024, min(usado, tam) * 1024, prio))
+    return out
+
+
+def swap_headroom(devs):
+    """Swaps -> quanto deles conta como folga, em bytes. Só a camada rápida (os de maior prioridade:
+    o kernel enche eles primeiro; o zram), e o zram livre vale ZRAM_GAIN dele. Camadas de prioridade
+    menor (o arquivo no SSD) não contam. Um swap só, que não seja zram, conta inteiro."""
+    if not devs:
+        return 0
+    topo = max(d[3] for d in devs)
+    folga = 0
+    for nome, tam, usado, prio in devs:
+        if prio == topo:
+            folga += int((tam - usado) * ZRAM_GAIN) if nome.startswith("/dev/zram") else tam - usado
+    return folga
+
+
+def read_readings(proc_root=PROC):
+    """Leituras de agora: /proc/meminfo (erro sobe), PSI (sem PSI = 0, psi_ok False) e a folga do swap
+    rápido (de /proc/swaps; se não der pra ler, fica sem a chave e metrics usa o SwapFree todo)."""
+    r = parse_meminfo(read_path(f"{proc_root}/meminfo", 16384))
+    try:
+        psi = parse_psi(read_path(f"{proc_root}/pressure/memory", 4096))
+        r["psi_ok"] = True
+    except OSError:
+        psi = {"some": 0.0, "full": 0.0}
+        r["psi_ok"] = False
+    r["psi_some"], r["psi_full"] = psi["some"], psi["full"]
+    try:
+        devs = parse_swaps(read_path(f"{proc_root}/swaps", 65536))
+    except OSError:
+        devs = None
+    # tabela vazia com SwapTotal > 0 = formato estranho: melhor o SwapFree todo do que folga zero
+    if devs is not None and (devs or r["swap_total"] == 0):
+        r["swap_headroom"] = swap_headroom(devs)
+    return r
+
+
+def read_oom_kills(proc_root=PROC):
+    """Contador oom_kill de agora (None = sem /proc/vmstat ou sem a linha)."""
+    try:
+        return parse_oom_kills(read_path(f"{proc_root}/vmstat", 65536))
+    except OSError:
+        return None
+
+
+class Stat:
+    """Campos de /proc/PID/stat que interessam."""
+    __slots__ = ("pid", "comm", "state", "ppid", "pgrp", "session", "tty", "flags", "nice",
+                 "starttime", "rss_pages")
+
+
+def parse_stat(dados):
+    """/proc/PID/stat -> Stat. O comm fica entre o PRIMEIRO "(" e o ÚLTIMO ")": ele pode ter espaços,
+    parênteses e até quebra de linha. Campo N (1-based) depois do comm = resto[N-3]."""
+    if isinstance(dados, str):
+        dados = dados.encode("utf-8", "surrogateescape")
+    ini, fim = dados.find(b"("), dados.rfind(b")")
+    if ini <= 0 or fim < ini:
+        raise ValueError("stat without (comm)")
+    resto = dados[fim + 1:].split()
+    if len(resto) < 22:
+        raise ValueError("stat too short")
+    s = Stat()
+    s.pid = int(dados[:ini].strip())
+    s.comm = dados[ini + 1:fim].decode("utf-8", "replace")
+    s.state = resto[0].decode("ascii", "replace")[:1]
+    s.ppid = int(resto[1])
+    s.pgrp = int(resto[2])
+    s.session = int(resto[3])
+    s.tty = int(resto[4])
+    s.flags = int(resto[6])
+    s.nice = int(resto[16])
+    s.starttime = int(resto[19])    # campo 22: início em ticks desde o boot (contra reuso de pid)
+    s.rss_pages = max(0, int(resto[21]))
+    return s
+
+
+def parse_status(dados):
+    """/proc/PID/status -> (uids (real, efetivo, salvo, fs), swap em bytes)."""
+    if isinstance(dados, bytes):
+        dados = dados.decode("utf-8", "replace")
+    uids, swap = None, 0
+    for linha in dados.splitlines():
+        if linha.startswith("Uid:"):
+            partes = linha.split()[1:5]
+            if len(partes) == 4 and all(p.isdigit() for p in partes):
+                uids = tuple(int(p) for p in partes)
+        elif linha.startswith("VmSwap:"):
+            partes = linha.split()
+            if len(partes) >= 2 and partes[1].isdigit():
+                swap = int(partes[1]) * 1024
+    if uids is None:
+        raise ValueError("status without Uid")
+    return uids, swap
+
+
+def parse_cmdline(dados, max_args=64):
+    """/proc/PID/cmdline -> lista de argumentos (usada só pra decidir, nunca gravada nem logada)."""
+    partes = dados.split(b"\0")
+    if partes and partes[-1] == b"":
+        partes.pop()
+    return [p.decode("utf-8", "replace") for p in partes[:max_args]]
+
+
+def is_user(uids):
+    """Processo de pessoa (todos os uids na faixa humana). sudo/setuid (efetivo 0) fica de fora."""
+    return bool(uids) and all(UID_MIN <= u <= UID_MAX for u in uids)
+
+
+def comm_matches(comm, nomes):
+    """comm bate com algum nome da lista (comparando os 15 primeiros caracteres)."""
+    return any(comm == n[:COMM_LEN] for n in nomes)
+
+
+def full_name(comm, nomes):
+    """comm (cortado em 15 pelo kernel) -> o nome inteiro da lista que bate com ele, pela mesma regra
+    do comm_matches ("fossilize_repla" -> "fossilize_replay"); sem nenhum, o próprio comm."""
+    return next((n for n in nomes if n[:COMM_LEN] == comm), comm)
+
+
+def script_arg(argv):
+    """Primeiro argumento do python que é o script (pula opções; -c/-m = não é script)."""
+    i = 1
+    while i < len(argv) and i < 10:
+        a = argv[i]
+        if a in ("-c", "-m"):
+            return None
+        if a in ("-X", "-W", "--check-hash-based-pycs"):
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return None
+
+
+def is_python(argv):
+    return bool(argv) and os.path.basename(argv[0]).startswith("python")
+
+
+def script_path(argv, cwd):
+    """Caminho absoluto e normalizado do script de um python (relativo = a partir do cwd dele)."""
+    s = script_arg(argv) if is_python(argv) else None
+    if not s:
+        return None
+    if not os.path.isabs(s):
+        if not cwd:
+            return None
+        s = os.path.join(cwd, s)
+    return os.path.normpath(s)
+
+
+def is_aero_path(caminho, home):
+    """O script fica onde o Aero instala os dele? (caminho já absoluto e normalizado)"""
+    if not caminho or not home or not os.path.isabs(home):
+        return False
+    home = os.path.normpath(home)
+    base = os.path.basename(caminho)
+    if base in AERO_SCRIPTS:
+        return any(caminho == os.path.join(home, d, base) for d in AERO_SCRIPT_DIRS)
+    return any(caminho.startswith(os.path.join(home, d) + "/") for d in AERO_DIRS)
+
+
+def has_main_py(argv):
+    return any(os.path.basename(a) == "main.py" for a in argv[1:])
+
+
+def is_comfy_backend(argv, cwd_base):
+    """Backend do ComfyUI: python rodando main.py, numa pasta ComfyUI ou com "comfy" nos argumentos."""
+    if not is_python(argv) or not has_main_py(argv):
+        return False
+    if cwd_base and cwd_base.lower() == "comfyui":
+        return True
+    return any("comfy" in a.lower() for a in argv)
+
+
+# ---------- config ----------
+
+def _bool(valor):
+    v = valor.strip().lower()
+    if v in ("1", "yes", "true", "on"):
+        return True
+    if v in ("0", "no", "false", "off"):
+        return False
+    raise ValueError("not a boolean")
+
+
+def _pct(valor):
+    if not re.fullmatch(r"[0-9]{1,2}", valor.strip()):
+        raise ValueError("not a percent")
+    n = int(valor)
+    if not 1 <= n <= 50:
+        raise ValueError("percent out of range")
+    return n
+
+
+def _names(valor):
+    nomes = []
+    for t in valor.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        if not NAME_RE.fullmatch(t):
+            raise ValueError("bad process name")
+        if t not in nomes:
+            nomes.append(t)
+    if len(nomes) > MAX_NAMES:
+        raise ValueError("too many names")
+    return tuple(nomes)
+
+
+def parse_config(texto):
+    """Texto de memory.conf -> (config, problemas). Chave/valor inválido = padrão (e um aviso)."""
+    cfg = dict(DEFAULTS)
+    problemas = []
+    for n, linha in enumerate(texto.splitlines()[:500], 1):
+        linha = linha.split("#", 1)[0].strip()
+        if not linha:
+            continue
+        chave, sep, valor = linha.partition("=")
+        chave, valor = chave.strip(), valor.strip()
+        if not sep or chave not in DEFAULTS:
+            problemas.append(f"line {n}: unknown setting ignored")
+            continue
+        try:
+            if chave in BOOL_KEYS:
+                cfg[chave] = _bool(valor)
+            elif chave in PCT_KEYS:
+                cfg[chave] = _pct(valor)
+            else:
+                cfg[chave] = _names(valor)
+        except ValueError as e:
+            problemas.append(f"{chave}: {e}, using the default")
+            cfg[chave] = DEFAULTS[chave]
+    if cfg["critical_available"] >= cfg["warn_available"]:
+        problemas.append("critical_available must be lower than warn_available, using the defaults")
+        cfg["warn_available"] = DEFAULTS["warn_available"]
+        cfg["critical_available"] = DEFAULTS["critical_available"]
+    return cfg, problemas
+
+
+def load_config(caminho):
+    try:
+        texto = read_path(caminho, 65536).decode("utf-8", "replace")
+    except FileNotFoundError:
+        return dict(DEFAULTS), []
+    except OSError as e:
+        return dict(DEFAULTS), [f"can't read the config ({describe_error(e)}), using the defaults"]
+    return parse_config(texto)
+
+
+def export_config(cfg):
+    """Config pro state.json (0/1, números, listas de nomes)."""
+    out = {}
+    for k in DEFAULTS:
+        v = cfg[k]
+        out[k] = int(v) if isinstance(v, bool) else (list(v) if isinstance(v, tuple) else v)
+    return out
+
+
+# ---------- níveis (função pura, com histerese) ----------
+
+def metrics(r):
+    """(folga %, disponível %, fração de swap livre) das leituras.
+    folga = RAM disponível + o que o swap rápido ainda dá (swap_headroom, de /proc/swaps; sem ele,
+    o SwapFree todo). A fração de swap livre (pro crítico) é de todo o swap: com espaço no SSD e sem
+    travar (PSI full baixo), páginas frias indo pro disco não são motivo pra fechar app."""
+    total = r["mem_total"]
+    folga = (r["mem_available"] + r.get("swap_headroom", r["swap_free"])) / total * 100
+    disp = r["mem_available"] / total * 100
+    swap_livre = r["swap_free"] / r["swap_total"] if r["swap_total"] > 0 else 0.0
+    return folga, disp, swap_livre
+
+
+def decide_level(anterior, calmo_desde, r, cfg, agora, pico=False):
+    """Novo nível. r = leituras + psi_some/psi_full (avg10). Devolve (nível, calmo_desde).
+    normal -> warning: folga < warn_available ou PSI some > 20
+    -> critical: disponível < critical_available E (swap < 10% livre ou PSI full > 10)
+       ou travando: PSI full > 30 com o swap rápido no fim (< 5% da RAM) e disponível < warn_available
+       (o sistema trocando páginas com o SSD; o MemAvailable conta cache "quente" e pode nunca
+       chegar em 4% antes de travar)
+    warning/critical -> normal: folga >= warn+10 e PSI some < 5 por 30 s seguidos.
+    pico (o gatilho do PSI disparou agora) só adia a volta ao normal: sozinho ele não é aviso (um
+    soluço de 150 ms com a memória folgada não pausa nada nem descarrega os modelos do ComfyUI)."""
+    folga, disp, swap_livre = metrics(r)
+    critico = disp < cfg["critical_available"] and (swap_livre < 0.10 or r["psi_full"] > 10)
+    rapido = r.get("swap_headroom", r["swap_free"]) / r["mem_total"] * 100
+    travando = (r["psi_full"] > THRASH_FULL and rapido < THRASH_FAST_PCT
+                and disp < cfg["warn_available"])
+    if critico or travando:
+        return CRITICAL, None
+    aviso = folga < cfg["warn_available"] or r["psi_some"] > 20
+    if anterior == NORMAL:
+        return (WARNING, None) if aviso else (NORMAL, None)
+    calmo = folga >= cfg["warn_available"] + 10 and r["psi_some"] < 5 and not pico
+    if not calmo:
+        return WARNING, None
+    if calmo_desde is None:
+        calmo_desde = agora
+    if agora - calmo_desde >= CALM_HOLD_S:
+        return NORMAL, None
+    return WARNING, calmo_desde
+
+
+# ---------- processos ----------
+
+class Proc:
+    """Um processo visto numa varredura (só números, comm e conclusões; nada de cmdline guardada)."""
+    __slots__ = ("pid", "start", "comm", "state", "ppid", "session", "tty", "uids", "mem", "adj",
+                 "score", "exe_ok", "exe_name", "aero", "comfy", "pending", "vital", "never_kill",
+                 "user_protect", "background")
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+    @property
+    def key(self):
+        return (self.pid, self.start)
+
+
+def classify(p, cfg):
+    """Preenche vital/never_kill/user_protect/background a partir de comm, exe_ok, exe_name, aero.
+    exe_ok: o programa é o do sistema (nome certo, de root, em /usr); exe_name: só o nome bate.
+    None = não deu pra ver (sem root): vital não, nunca-fechar sim (na dúvida, não fecha).
+    aero: script do Aero conferido pelo Scanner; acima de AERO_MAX_MEM deixa de ser vital.
+    A lista protect= compara só o comm: qualquer processo com aquele nome ganha a proteção.
+    Fica de fora (documentado): um LD_PRELOAD num programa vital de verdade passa na conferência."""
+    aero = bool(p.aero) and (p.mem or 0) <= AERO_MAX_MEM
+    p.vital = bool((comm_matches(p.comm, VITAL) and p.exe_ok is True) or aero)
+    p.never_kill = comm_matches(p.comm, NEVER_KILL) and p.exe_name is not False
+    p.user_protect = comm_matches(p.comm, cfg["protect"])
+    p.background = comm_matches(p.comm, cfg["background"])
+    return p
+
+
+def exe_name_matches(comm, alvo):
+    """O arquivo do programa tem o nome do comm? (o kernel tira o comm do nome usado no exec e corta
+    em 15; um processo pode trocar o próprio comm, mas não o exe)"""
+    base = os.path.basename(alvo)
+    return base[:COMM_LEN] == comm or EXE_ALIAS.get(comm) == base
+
+
+class Scanner:
+    """Varre /proc. Cada processo é lido por um fd do diretório /proc/PID: se o pid morrer e for
+    reusado no meio da leitura, as leituras falham em vez de misturar dois processos."""
+
+    def __init__(self, proc_root=PROC, trusted_uids=(0,), system_dirs=SYSTEM_DIRS):
+        self.proc_root = proc_root
+        self.trusted_uids = tuple(trusted_uids)
+        self.system_dirs = tuple(system_dirs)
+        self.page = os.sysconf("SC_PAGE_SIZE")
+        self.cache = {}      # (pid, início, comm) -> (aero, comfy): o que veio da cmdline
+        self.homes = {}      # uid -> pasta home (do passwd), pra conferir os scripts do Aero
+        self.denied = 0      # leituras negadas na última varredura (rodando sem root)
+
+    def scan(self, cfg, details=True, oom_score=False, only=None, limite=MAX_PROCS):
+        """details: pode ler cmdline/cwd de processos python (só com a memória calma: cmdline pode
+        esperar o mmap_lock de um processo em apuros). Sem details, python que ainda não está no
+        cache volta com pending=True (não se sabe se é script do Aero ou o ComfyUI).
+        only(comm) -> bool filtra cedo (barato)."""
+        out = []
+        vistos = set()
+        self.denied = 0
+        try:
+            pfd = os.open(self.proc_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            return out
+        try:
+            for nome in os.listdir(pfd):
+                if not nome.isdigit():
+                    continue
+                if len(out) >= limite:
+                    break
+                p = self._read_one(pfd, nome, cfg, details, oom_score, only, vistos)
+                if p is not None:
+                    out.append(p)
+        finally:
+            os.close(pfd)
+        if only is None:
+            # poda: o cache só guarda quem ainda existe (memória limitada)
+            for k in [k for k in self.cache if k not in vistos]:
+                del self.cache[k]
+        if len(self.cache) > MAX_PROCS:
+            self.cache.clear()
+        return out
+
+    def _read_one(self, pfd, nome, cfg, details, oom_score, only, vistos):
+        try:
+            dfd = os.open(nome, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=pfd)
+        except OSError:
+            return None
+        try:
+            st = parse_stat(read_at(dfd, "stat", 4096))
+            if st.flags & PF_KTHREAD or st.pid <= 1 or str(st.pid) != nome:
+                return None
+            if only is not None and not only(st.comm):
+                return None
+            uids, swap = parse_status(read_at(dfd, "status", 16384))
+            chave = (st.pid, st.starttime, st.comm)
+            vistos.add(chave)
+            # o programa (exe) é conferido sempre: um exec troca o programa sem trocar pid/início
+            exe_ok = exe_nome = None
+            if comm_matches(st.comm, VITAL) or comm_matches(st.comm, NEVER_KILL):
+                exe_ok, exe_nome = self._exe_check(dfd, st.comm)
+            cache = self.cache.get(chave)
+            pendente = False
+            if cache is None:
+                aero, comfy = False, False
+                if st.comm.startswith("python") or comm_matches(st.comm, AERO_SCRIPTS):
+                    if details:
+                        try:
+                            argv = parse_cmdline(read_at(dfd, "cmdline", 8192))
+                        except OSError:
+                            argv = []
+                        aero = is_python(argv) and self._aero_trusted(dfd, argv, uids[0])
+                        if not aero and is_python(argv) and has_main_py(argv):
+                            comfy = is_comfy_backend(argv, self._cwd_base(dfd))
+                    else:
+                        pendente = True
+                if not pendente:
+                    self.cache[chave] = (aero, comfy)
+            else:
+                aero, comfy = cache
+            p = Proc(pid=st.pid, start=st.starttime, comm=st.comm, state=st.state, ppid=st.ppid,
+                     session=st.session, tty=st.tty, uids=uids,
+                     mem=st.rss_pages * self.page + swap, exe_ok=exe_ok, exe_name=exe_nome,
+                     aero=aero, comfy=comfy, pending=pendente)
+            p.adj = _read_int_at(dfd, "oom_score_adj")
+            p.score = _read_int_at(dfd, "oom_score") if oom_score else None
+            return classify(p, cfg)
+        except PermissionError:
+            self.denied += 1
+            return None
+        except (OSError, ValueError):
+            return None
+        finally:
+            os.close(dfd)
+
+    def _exe_check(self, dfd, comm, nome_ok=None):
+        """(confiável, nome_ok) do programa do processo; (None, None) = não deu pra ver (sem root).
+        nome_ok: o arquivo tem o nome do comm (um python que se renomeou "Hyprland" não passa);
+        ou, se veio a função nome_ok(nome do arquivo), o que ela disser.
+        confiável: o nome bate, o arquivo é de root, ninguém mais grava nele, fica em /usr e é o
+        mesmo arquivo que está nesse caminho aqui (não outro programa montado por cima num
+        namespace do usuário)."""
+        try:
+            alvo = os.readlink("exe", dir_fd=dfd)
+            st = os.stat("exe", dir_fd=dfd)     # segue o link mágico até o arquivo de verdade
+        except OSError:
+            return None, None
+        apagado = alvo.endswith(" (deleted)")   # programa atualizado com ele rodando: continua valendo
+        if apagado:
+            alvo = alvo[:-10]
+        alvo = os.path.normpath(alvo)
+        bate = nome_ok(os.path.basename(alvo)) if nome_ok else exe_name_matches(comm, alvo)
+        if not bate:
+            return False, False
+        if st.st_uid not in self.trusted_uids or st.st_mode & 0o022:
+            return False, True
+        if not any(alvo.startswith(d) for d in self.system_dirs):
+            return False, True
+        if not apagado:
+            try:
+                st2 = os.stat(alvo)
+            except OSError:
+                return False, True
+            if (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
+                return False, True
+        return True, True
+
+    def _home(self, uid):
+        """Pasta home do uid (passwd), guardada por uid; None se não tiver."""
+        if uid not in self.homes:
+            if len(self.homes) > 256:
+                self.homes.clear()
+            try:
+                self.homes[uid] = pwd.getpwuid(uid).pw_dir
+            except (KeyError, OSError):
+                self.homes[uid] = None
+        return self.homes[uid]
+
+    def _aero_trusted(self, dfd, argv, uid):
+        """Script do Aero de verdade (o comm e o argv qualquer processo troca, então confere tudo):
+        o python é o do sistema (de root, em /usr), o script fica onde o Aero instala os dele (na home
+        do dono do processo, ou /usr/local/bin pro agente) e é um arquivo comum do dono ou do root
+        que ninguém mais grava. Só roda na passada calma (é a que lê cmdline), uma vez por processo;
+        o mais barato primeiro (a maioria dos python nem é do Aero)."""
+        caminho = script_path(argv, None)
+        if caminho is None:
+            caminho = script_path(argv, self._cwd(dfd))
+        if not is_aero_path(caminho, self._home(uid)):
+            return False
+        ok, _ = self._exe_check(dfd, None, nome_ok=lambda b: b.startswith("python"))
+        if ok is not True:
+            return False
+        try:
+            st = os.stat(caminho)
+        except OSError:
+            return False
+        return (stat.S_ISREG(st.st_mode) and (st.st_uid == uid or st.st_uid in self.trusted_uids)
+                and not st.st_mode & 0o022)
+
+    @staticmethod
+    def _cwd(dfd):
+        try:
+            alvo = os.readlink("cwd", dir_fd=dfd)
+        except OSError:
+            return None
+        if alvo.endswith(" (deleted)"):
+            alvo = alvo[:-10]
+        return alvo
+
+    @classmethod
+    def _cwd_base(cls, dfd):
+        alvo = cls._cwd(dfd)
+        return os.path.basename(alvo.rstrip("/")) if alvo else None
+
+
+def _read_int_at(dfd, nome):
+    try:
+        return int(read_at(dfd, nome, 64).strip() or b"x")
+    except (OSError, ValueError):
+        return None
+
+
+# ---------- planos (funções puras, testadas) ----------
+
+def plan_protection(procs, orig_adj, vistos_antes, restaurando=False):
+    """O que mudar no oom_score_adj. Devolve [(proc, valor, motivo)], motivo: protect/prefer/inherited.
+    - vitais e a lista protect: -900 (só se estiver acima; nunca sobe quem já está mais protegido);
+    - de pessoas: background e backend do ComfyUI: +500 (só se estiver abaixo);
+    - processo de pessoa, não vital, visto pela primeira vez com -900 exato: herdou (o valor passa do
+      pai pro filho no fork) e volta ao valor normal da família, seja quem for o pai agora. Senão TODO
+      app aberto pelo compositor ficaria intocável (o Hyprland e o gio abrem apps com fork duplo: o
+      app fica filho do PID 1, que nem entra na varredura).
+    - python ainda não lido (pending, só na memória apertada) fica pra depois: pode ser script do Aero.
+    restaurando=True (guarda parando ou desligado, com os vitais já de volta ao normal): só o -900
+    herdado, de qualquer um de pessoa (vital ou não, lido ou não).
+    Root/sistema: só pode ganhar proteção, nunca outra mudança. orig_adj é atualizado."""
+    por_pid = {p.pid: p for p in procs}
+    mudar = []
+    for p in procs:
+        if restaurando or p.adj is None or not (p.vital or p.user_protect):
+            continue
+        if p.key not in orig_adj:
+            orig_adj[p.key] = p.adj if p.adj != PROTECT_ADJ else DEFAULT_RESTORE_ADJ
+        if p.adj > PROTECT_ADJ:
+            mudar.append((p, PROTECT_ADJ, "protect"))
+    for p in procs:
+        if p.adj is None or not is_user(p.uids):
+            continue
+        if not restaurando:
+            if p.vital or p.user_protect:
+                continue
+            if p.background or p.comfy:
+                if p.adj < PREFER_ADJ:
+                    mudar.append((p, PREFER_ADJ, "prefer"))
+                continue
+            if p.pending:
+                continue
+        if p.adj == PROTECT_ADJ and p.key not in vistos_antes:
+            valor = _restore_value(p, por_pid, orig_adj)
+            orig_adj[p.key] = valor
+            mudar.append((p, valor, "inherited"))
+    return mudar
+
+
+def _restore_value(p, por_pid, orig_adj):
+    """Valor normal de quem herdou -900: o original do ancestral protegido, ou o do primeiro ancestral
+    que não está em -900; sem ancestral na varredura (filho do PID 1), o padrão (0)."""
+    q, passos = por_pid.get(p.ppid), 0
+    while q is not None and passos < 64:
+        if q.key in orig_adj:
+            return orig_adj[q.key]
+        if q.adj is None:
+            break
+        if q.adj != PROTECT_ADJ:
+            return q.adj
+        q, passos = por_pid.get(q.ppid), passos + 1
+    return DEFAULT_RESTORE_ADJ
+
+
+def _still_wanted(p, valor):
+    """O processo ainda deve ter o valor que o guarda pôs nele?"""
+    if valor <= PROTECT_ADJ:
+        return bool(p.vital or p.user_protect)
+    return is_user(p.uids) and bool(p.background or p.comfy) and not (p.vital or p.user_protect)
+
+
+def plan_restore(procs, applied, tudo=True):
+    """Desfazer o oom_score_adj que o guarda pôs. applied = {chave: (original, valor posto)}.
+    Devolve [(proc, original, "restore")]. tudo=True (parando, desligado): todos; tudo=False (passada
+    normal): só quem não se encaixa mais (o nome saiu de protect=/background=, o programa mudou).
+    Só quem ainda está com o valor que o guarda pôs (se alguém mudou depois, o valor é dele)."""
+    mudar = []
+    for p in procs:
+        reg = applied.get(p.key)
+        if reg is None or p.adj is None or p.adj != reg[1] or reg[0] == reg[1]:
+            continue
+        if not tudo and (p.pending or _still_wanted(p, reg[1])):
+            continue
+        mudar.append((p, reg[0], "restore"))
+    return mudar
+
+
+def plan_pause(procs, pausados, own_pid):
+    """Trabalho de fundo de pessoas que pode ser pausado agora (ainda não pausado, rodando)."""
+    return [p for p in procs
+            if p.background and is_user(p.uids) and not (p.vital or p.user_protect or p.never_kill)
+            and p.state in ("R", "S", "D") and p.key not in pausados and p.pid != own_pid]
+
+
+def _shield(procs):
+    """pids que seguram o desktop (compositor & cia. e todos os ancestrais) + as sessões deles."""
+    por_pid = {p.pid: p for p in procs}
+    escudo, sessoes = set(), set()
+    for p in procs:
+        if p.never_kill:
+            sessoes.add(p.session)
+            q, passos = p, 0
+            while q is not None and passos < 64 and q.pid not in escudo:
+                escudo.add(q.pid)
+                q, passos = por_pid.get(q.ppid), passos + 1
+    return escudo, sessoes
+
+
+def choose_victim(procs, mem_total, own_pid=None):
+    """Quem fechar no crítico (ou None). Só processos de pessoas; nunca: protegidos pela lista
+    protect, compositor/sessão e seus ancestrais, líderes de sessão com terminal ou da sessão do
+    compositor, vitais (a não ser que um vital esteja usando > 40% da RAM: aí ele é o problema),
+    nem coisas pequenas (< 64 MB). Preferência: trabalho de fundo / backend do ComfyUI grandes;
+    depois quem usa mais memória (RSS + swap); empate: o maior oom_score. A memória vem antes do
+    oom_score de propósito: o oom_score soma o oom_score_adj que o próprio app escolhe (Electron e
+    Chromium põem 300 nos renderers), e com swap grande isso pesa mais que muitos GB de verdade."""
+    escudo, sessoes = _shield(procs)
+    candidatos = []
+    for p in procs:
+        if p.pid <= 1 or p.pid == own_pid or p.pid in escudo or p.never_kill:
+            continue
+        if not is_user(p.uids) or p.state in ("Z", "X", "x") or p.user_protect:
+            continue
+        if p.pid == p.session and (p.tty != 0 or p.session in sessoes):
+            continue
+        if p.vital and not p.mem > HOG_FRACTION * mem_total:
+            continue
+        if p.mem < MIN_VICTIM_MEM:
+            continue
+        candidatos.append(p)
+    if not candidatos:
+        return None
+
+    def ordem(p):
+        preferido = (p.background or p.comfy) and p.mem >= PREFER_MIN_MEM
+        return (preferido, p.mem, p.score or 0)
+    return max(candidatos, key=ordem)
+
+
+def kill_group(vitima, procs):
+    """Fechar trabalho de fundo = todos os processos com o mesmo comm do mesmo dono (ex: os 7
+    workers do fossilize_replay); o resto, só a vítima."""
+    if not vitima.background:
+        return [vitima]
+    escudo, _ = _shield(procs)
+    grupo = [vitima] + [p for p in procs
+                        if p is not vitima and p.background and p.comm == vitima.comm
+                        and p.uids == vitima.uids and is_user(p.uids) and p.pid not in escudo
+                        and not (p.vital or p.user_protect or p.never_kill)
+                        and p.state not in ("Z", "X", "x")]
+    return grupo[:MAX_KILL_GROUP]
+
+
+def by_uid(registros):
+    """[{..., "uid"}] -> [(uid, [registros desse uid])], na ordem dos uids."""
+    grupos = {}
+    for reg in registros:
+        grupos.setdefault(reg["uid"], []).append(reg)
+    return sorted(grupos.items())
+
+
+def tail_lines(dados, limite):
+    """Os últimos `limite` bytes de dados, começando numa linha inteira."""
+    if len(dados) <= limite:
+        return dados
+    cauda = dados[-limite:]
+    quebra = cauda.find(b"\n")
+    return cauda[quebra + 1:] if quebra >= 0 else b""
+
+
+def parse_paused(dados, max_itens=MAX_PAUSED):
+    """paused.json -> lista de registros válidos {pid, start, comm, uid} (o resto é ignorado)."""
+    try:
+        d = json.loads(dados.decode("utf-8", "replace"))
+    except ValueError:
+        return []
+    itens = d.get("paused") if isinstance(d, dict) else None
+    out = []
+    for it in itens if isinstance(itens, list) else []:
+        if len(out) >= max_itens:
+            break
+        if not isinstance(it, dict):
+            continue
+        pid, inicio, uid = it.get("pid"), it.get("start"), it.get("uid", -1)
+        if not (type(pid) is int and 2 <= pid <= 1 << 22 and type(inicio) is int and inicio >= 0
+                and type(uid) is int):
+            continue
+        out.append({"pid": pid, "start": inicio, "comm": sanitize_name(it.get("comm", "?")),
+                    "uid": uid})
+    return out
+
+
+def _adj_ok(v):
+    return type(v) is int and -1000 <= v <= 1000
+
+
+def parse_adj(dados, max_itens=MAX_APPLIED):
+    """adj.json -> {(pid, início): (original, valor posto)} só com registros válidos."""
+    try:
+        d = json.loads(dados.decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+    itens = d.get("adj") if isinstance(d, dict) else None
+    out = {}
+    for it in itens if isinstance(itens, list) else []:
+        if len(out) >= max_itens:
+            break
+        if not isinstance(it, dict):
+            continue
+        pid, inicio, orig, posto = it.get("pid"), it.get("start"), it.get("orig"), it.get("set")
+        if (type(pid) is int and 2 <= pid <= 1 << 22 and type(inicio) is int and inicio >= 0
+                and _adj_ok(orig) and _adj_ok(posto)):
+            out[(pid, inicio)] = (orig, posto)
+    return out
+
+
+# ---------- sinais com pidfd (sem reuso de pid) ----------
+
+def open_verified(pid, inicio, so_pessoa=True):
+    """pidfd do processo SE ele ainda é o mesmo (hora de início igual) e, se so_pessoa, ainda é
+    de uma pessoa. O pidfd prende o processo: um sinal por ele nunca vai pra um pid reusado
+    (a conferência vem DEPOIS do pidfd_open: se o pid já era de outro, a hora de início não bate).
+    Sempre o /proc de verdade (o pidfd é de verdade). None = sumiu ou é outro processo.
+    Erro passageiro (falta de fd, de memória, kernel sem pidfd) sobe como OSError: quem chamou
+    não perde o registro de um processo pausado por causa disso. Quem recebe fecha o fd."""
+    try:
+        fd = os.pidfd_open(pid)
+    except (ProcessLookupError, FileNotFoundError):
+        return None
+    except OSError as e:
+        if e.errno == errno.EINVAL:
+            return None
+        raise
+    try:
+        st = parse_stat(read_path(f"{PROC}/{pid}/stat", 4096))
+        if st.starttime != inicio or st.flags & PF_KTHREAD:
+            raise LookupError
+        if so_pessoa:
+            uids, _ = parse_status(read_path(f"{PROC}/{pid}/status", 16384))
+            if not is_user(uids):
+                raise LookupError
+    except (ProcessLookupError, FileNotFoundError, ValueError, LookupError):
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def send(fd, sig):
+    """Sinal pelo pidfd. True = entregue; False = o processo já tinha acabado."""
+    try:
+        signal.pidfd_send_signal(fd, sig)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def write_adj(pid, inicio, valor, proc_root=PROC, esperado=None):
+    """Grava oom_score_adj pelo fd do diretório do processo, conferindo a hora de início antes (e,
+    com esperado, que o valor atual ainda é esse: alguém pode ter mudado depois da varredura).
+    True = gravou; False = o processo sumiu/é outro/o valor mudou. PermissionError sobe."""
+    try:
+        dfd = os.open(f"{proc_root}/{pid}", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        try:
+            st = parse_stat(read_at(dfd, "stat", 4096))
+        except (OSError, ValueError):
+            return False
+        if st.starttime != inicio:
+            return False
+        if esperado is not None and _read_int_at(dfd, "oom_score_adj") != esperado:
+            return False
+        try:
+            fd = os.open("oom_score_adj", os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dfd)
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        try:
+            os.write(fd, str(int(valor)).encode())
+        except ProcessLookupError:
+            return False
+        finally:
+            os.close(fd)
+        return True
+    finally:
+        os.close(dfd)
+
+
+# ---------- memória travada (mlockall via ctypes) ----------
+
+def lock_memory():
+    """mlockall(MCL_CURRENT|MCL_FUTURE): o daemon nunca vai pro swap (senão travaria junto com o
+    sistema). Devolve a libc (pra process_mrelease) ou None. Erros só viram aviso."""
+    try:
+        import ctypes  # noqa: PLC0415 — só no modo serviço (o --check não precisa)
+        libc = ctypes.CDLL(None, use_errno=True)
+    except Exception as e:  # noqa: BLE001
+        log(4, f"can't load libc for mlockall ({describe_error(e)}); running without locked memory")
+        return None
+    MCL_CURRENT, MCL_FUTURE = 1, 2
+    if libc.mlockall(MCL_CURRENT | MCL_FUTURE) != 0:
+        err = ctypes.get_errno()
+        motivo = {errno.ENOMEM: "memlock limit too low (LimitMEMLOCK=infinity / CAP_IPC_LOCK)",
+                  errno.EPERM: "no CAP_IPC_LOCK", errno.EAGAIN: "kernel couldn't lock now"}.get(err, "")
+        log(4, f"mlockall failed: {errno.errorcode.get(err, err)} {motivo}; running without locked memory")
+    else:
+        log(6, "memory locked (never swapped)")
+    return libc
+
+
+_MRELEASE_NR = {"x86_64": 448, "aarch64": 448, "riscv64": 448}
+
+
+def mrelease(libc, fd):
+    """process_mrelease(pidfd): libera na hora a memória de quem acabou de levar SIGKILL (Linux 5.15+).
+    Melhor esforço: qualquer erro é ignorado."""
+    nr = _MRELEASE_NR.get(os.uname().machine)
+    if libc is None or nr is None:
+        return
+    try:
+        libc.syscall(nr, fd, 0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------- systemd (sd_notify, sem bibliotecas) ----------
+
+def sd_notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr or addr[0] not in "/@":
+        return
+    if addr[0] == "@":
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except OSError as e:
+        log_limited("notify", 300, 4, f"sd_notify failed ({describe_error(e)})")
+
+
+# ---------- arquivos em /run/aero-memory ----------
+
+class Store:
+    """state.json, events.jsonl e paused.json numa pasta de root (fd da pasta aberto o tempo todo,
+    arquivos 0644, gravação atômica tmp+rename, nunca segue link)."""
+
+    def __init__(self, pasta, criar=True):
+        self.pasta = pasta
+        self.dfd = None
+        if pasta:
+            self._abrir(criar)
+
+    def _abrir(self, criar):
+        criada = False
+        if criar:
+            try:
+                os.mkdir(self.pasta, 0o755)
+                criada = True
+            except FileExistsError:
+                pass
+            except OSError as e:
+                log(4, f"can't create the runtime directory ({describe_error(e)})")
+        try:
+            dfd = os.open(self.pasta, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as e:
+            log(4, f"runtime directory unavailable ({describe_error(e)}); not writing state")
+            return
+        if criada:
+            os.fchmod(dfd, 0o755)           # 0755 mesmo com umask fechada (o agente do usuário lê)
+        st = os.fstat(dfd)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            os.close(dfd)
+            log(3, "runtime directory has the wrong owner or permissions; not writing state")
+            return
+        self.dfd = dfd
+
+    @property
+    def ok(self):
+        return self.dfd is not None
+
+    def close(self):
+        if self.dfd is not None:
+            os.close(self.dfd)
+            self.dfd = None
+
+    def write_atomic(self, nome, dados, modo=0o644):
+        if self.dfd is None:
+            return False
+        tmp = f".{nome}.{os.getpid()}.tmp"
+        try:
+            try:
+                os.unlink(tmp, dir_fd=self.dfd)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         modo, dir_fd=self.dfd)
+            try:
+                os.fchmod(fd, modo)
+                vista = memoryview(dados)
+                while vista:
+                    vista = vista[os.write(fd, vista):]
+            finally:
+                os.close(fd)
+            os.rename(tmp, nome, src_dir_fd=self.dfd, dst_dir_fd=self.dfd)
+            return True
+        except OSError as e:
+            log_limited("write-" + nome, 60, 4, f"can't write {nome} ({describe_error(e)})")
+            try:
+                os.unlink(tmp, dir_fd=self.dfd)
+            except OSError:
+                pass
+            return False
+
+    def read(self, nome, limite=MAX_JSON_FILE):
+        """Conteúdo de um arquivo nosso (regular, do nosso dono) ou None."""
+        if self.dfd is None:
+            return None
+        try:
+            fd = os.open(nome, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                         dir_fd=self.dfd)
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_size > limite:
+                return None
+            return os.read(fd, limite)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+
+    def remove(self, nome):
+        if self.dfd is None:
+            return
+        try:
+            os.unlink(nome, dir_fd=self.dfd)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log_limited("rm-" + nome, 60, 4, f"can't remove {nome} ({describe_error(e)})")
+
+    def write_json(self, nome, obj, modo=0o644):
+        return self.write_atomic(nome, (json.dumps(obj, separators=(",", ":")) + "\n").encode(), modo)
+
+    def load_paused(self):
+        dados = self.read("paused.json")
+        return parse_paused(dados) if dados else []
+
+    def save_paused(self, registros):
+        if not registros:
+            self.remove("paused.json")
+            return self.dfd is not None
+        # só o guarda precisa dele (pids e uids de quem está pausado): 0600
+        return self.write_json("paused.json", {"version": 1, "paused": registros}, 0o600)
+
+    def load_adj(self):
+        dados = self.read("adj.json")
+        return parse_adj(dados) if dados else {}
+
+    def save_adj(self, applied):
+        """{(pid, início): (original, posto)} -> adj.json (0600; vazio = sem arquivo)."""
+        if not applied:
+            self.remove("adj.json")
+            return self.dfd is not None
+        itens = [{"pid": k[0], "start": k[1], "orig": v[0], "set": v[1]} for k, v in applied.items()]
+        return self.write_json("adj.json", {"version": 1, "adj": itens}, 0o600)
+
+    def last_seq(self):
+        dados = self.read("events.jsonl", EVENTS_MAX * 2)
+        for linha in reversed((dados or b"")[-8192:].splitlines()):
+            try:
+                seq = json.loads(linha).get("seq")
+            except (ValueError, AttributeError):
+                continue
+            if type(seq) is int and seq >= 0:
+                return seq
+        return 0
+
+    def append_event(self, obj):
+        """Uma linha JSON no fim de events.jsonl; passando de 64 KB, fica só a metade mais nova."""
+        if self.dfd is None:
+            return
+        linha = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+        try:
+            fd = os.open("events.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                         | os.O_CLOEXEC, 0o644, dir_fd=self.dfd)
+        except OSError as e:
+            log_limited("events", 60, 4, f"can't write events ({describe_error(e)})")
+            return
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return
+            if stat.S_IMODE(st.st_mode) != 0o644:
+                os.fchmod(fd, 0o644)
+            if st.st_size + len(linha) <= EVENTS_MAX:
+                os.write(fd, linha)         # uma escrita só com O_APPEND: a linha não se mistura
+                return
+        except OSError as e:
+            log_limited("events", 60, 4, f"can't write events ({describe_error(e)})")
+            return
+        finally:
+            os.close(fd)
+        antigo = self.read("events.jsonl", EVENTS_MAX * 2) or b""
+        self.write_atomic("events.jsonl", tail_lines(antigo, EVENTS_MAX // 2) + linha)
+
+
+# ---------- o daemon ----------
+
+class Guard:
+    def __init__(self, conf_path, run_dir, dry_run=False, proc_root=PROC):
+        self.conf_path = conf_path
+        self.dry = dry_run
+        self.proc_root = proc_root
+        self.store = Store(run_dir) if run_dir else Store(None)
+        self.scanner = Scanner(proc_root)
+        self.cfg = dict(DEFAULTS)
+        self.level = NORMAL
+        self.level_since = time.time()
+        self.calm_since = None
+        self.critical_since = None
+        self.paused = []           # [{pid, start, comm, uid, mem}]
+        self.orig_adj = {}         # (pid, início) -> valor normal (pra calcular o de quem herdou -900)
+        self.applied = {}          # (pid, início) -> (original, valor posto): o que o guarda desfaz
+        self.seen = set()
+        self.dry_logged = set()
+        self.last_action = None
+        self.seq = self.store.last_seq() + 1 if self.store.ok else 1
+        self.libc = None
+        self.own_pid = os.getpid()
+        self.psi_fd = None
+        self.psi_mode = "tick only"
+        self.psi_fired = None
+        self.psi_retry_at = 0.0
+        self.psi_backoff = PSI_RETRY_MIN_S
+        self.last_protect = -1e9
+        self.last_pause_scan = -1e9
+        self.last_kill = -1e9
+        self.last_victim_try = -1e9
+        self.last_pressure_event = -1e9
+        self.last_readings = None
+        self.oom_kills = None      # último oom_kill de /proc/vmstat (None = ainda sem base)
+        self.stop = False
+        self.reload = False
+        self.wake_r = self.wake_w = None
+        self.poller = select.poll()
+        wd = os.environ.get("WATCHDOG_USEC", "")
+        wd_pid = os.environ.get("WATCHDOG_PID", "")
+        self.watchdog_s = (int(wd) / 1e6 / 3) if wd.isdigit() and (not wd_pid or wd_pid == str(self.own_pid)) else None
+        self.last_ping = -1e9
+        self.last_eval = -1e9
+        self.next_tick = time.monotonic()
+
+    # ----- partida e saída -----
+
+    def run(self):
+        self._signals()
+        nonblocking_journal()
+        try:
+            if not self.dry and os.geteuid() == 0:
+                self.libc = lock_memory()
+            self.load_config(primeira=True)
+            if not self.dry:
+                if not self.store.ok:
+                    log(3, "no runtime directory: pausing is disabled (paused processes must be recorded)")
+                self.resume_leftovers()
+                # mudanças de oom_score_adj de uma execução que não terminou limpa: continuam sendo
+                # nossas (o original verdadeiro fica guardado pra quando o guarda parar)
+                self.applied = self.store.load_adj()
+            self.open_psi()
+            self.safe(self.warm_up)
+            modo = "dry-run, nothing will be changed" if self.dry else "active"
+            log(6, f"started ({modo}; pressure: {self.psi_mode})")
+            sd_notify("READY=1\nSTATUS=Watching memory")
+            self.loop()
+        finally:
+            self.shutdown()
+        return 0
+
+    def _signals(self):
+        self.wake_r, self.wake_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        signal.set_wakeup_fd(self.wake_w, warn_on_full_buffer=False)
+        signal.signal(signal.SIGTERM, self._on_stop)
+        signal.signal(signal.SIGINT, self._on_stop)
+        signal.signal(signal.SIGHUP, self._on_hup)
+        self.poller.register(self.wake_r, select.POLLIN)
+
+    def _on_stop(self, *_):
+        self.stop = True
+
+    def _on_hup(self, *_):
+        self.reload = True
+
+    def shutdown(self):
+        sd_notify("STOPPING=1")
+        if not self.dry:
+            try:
+                self.resume_all("stopping", "stopping")
+            except Exception as e:  # noqa: BLE001 — sair sempre, mas registrar
+                log(3, f"error while resuming on exit ({describe_error(e)})")
+            try:
+                # parando (ou desinstalando): nada de deixar a sessão em -900 sem ninguém pra zerar
+                # o que os apps novos herdam. Num reinício, a primeira passada protege de novo.
+                self.restore_pass()
+            except Exception as e:  # noqa: BLE001
+                log(3, f"error while undoing oom_score_adj changes on exit ({describe_error(e)})")
+        self.close_psi()
+        try:
+            signal.set_wakeup_fd(-1)
+        except (ValueError, OSError):
+            pass
+        for fd in (self.wake_r, self.wake_w):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.wake_r = self.wake_w = None
+        self.store.close()
+        log(6, "stopped")
+
+    def safe(self, funcao, *args):
+        """Roda uma etapa; erro vira log e o daemon segue (nunca morre por causa de uma etapa)."""
+        try:
+            return funcao(*args)
+        except Exception as e:  # noqa: BLE001
+            log_limited("err-" + getattr(funcao, "__name__", "?"), 60, 3,
+                        f"internal error in {getattr(funcao, '__name__', '?')}: {describe_error(e)} (continuing)")
+            return None
+
+    def load_config(self, primeira=False):
+        cfg, problemas = load_config(self.conf_path)
+        for p in problemas[:10]:
+            log(4, f"config: {p}")
+        mudou = cfg != self.cfg
+        self.cfg = cfg
+        if not primeira:
+            # recarregar: retoma só quem não deve mais ficar parado (saiu de background=, pausa ou
+            # guarda desligados); retomar os outros no meio do aperto só faria eles voltarem do swap
+            # pra serem pausados de novo 2 s depois
+            if not self.dry:
+                def ainda_vale(reg):
+                    return (self.level != NORMAL and cfg["enabled"] and cfg["pause_background"]
+                            and comm_matches(reg["comm"], cfg["background"]))
+                self.resume_all("config reloaded", "reload", manter=ainda_vale)
+            # próxima leitura: passada de proteção (desfaz o que saiu de protect=/background=) ou,
+            # com o guarda desligado, desfaz tudo
+            self.last_protect = -1e9
+            self.dry_logged.clear()
+            log(6, "config reloaded" + ("" if mudou else " (no changes)"))
+        if not cfg["enabled"]:
+            log(6, "memory guard is switched off in the config (only watching)")
+
+    def warm_up(self):
+        """Uma passada sem agir no começo: carrega na memória (travada) todo o caminho do crítico.
+        Sem ler cmdline: ela não decide nada aqui, e depois de um reinício no aperto o cache está
+        vazio (seriam dezenas de leituras que podem esperar o mmap_lock antes do READY=1)."""
+        r = self.read_readings()
+        procs = self.scanner.scan(self.cfg, details=False, oom_score=True)
+        choose_victim(procs, r["mem_total"] if r else 1, self.own_pid)
+        plan_protection(procs, {}, set())
+        json.dumps({"warm": [p.comm for p in procs[:5]]})
+        try:
+            os.close(os.pidfd_open(self.own_pid))
+        except OSError:
+            pass
+
+    # ----- PSI -----
+
+    def open_psi(self):
+        fd, modo = open_psi_trigger(PSI_PATH)
+        if fd is None:
+            self.psi_mode = f"tick only ({modo})"
+            return False
+        self.psi_fd, self.psi_mode = fd, modo
+        self.poller.register(fd, select.POLLPRI)
+        self.psi_backoff = PSI_RETRY_MIN_S
+        return True
+
+    def close_psi(self):
+        if self.psi_fd is not None:
+            try:
+                self.poller.unregister(self.psi_fd)
+            except (KeyError, ValueError):
+                pass
+            try:
+                os.close(self.psi_fd)
+            except OSError:
+                pass
+            self.psi_fd = None
+
+    def _psi_broken(self, agora):
+        log_limited("psi-broken", 300, 4, "pressure trigger stopped working; using the 2 s tick")
+        self.close_psi()
+        self.psi_mode = "tick only (trigger lost)"
+        self.psi_retry_at = agora + self.psi_backoff
+        self.psi_backoff = min(self.psi_backoff * 2, PSI_RETRY_MAX_S)
+
+    # ----- laço -----
+
+    def loop(self):
+        self.next_tick = time.monotonic()
+        while not self.stop:
+            try:
+                self.iteration()
+            except Exception as e:  # noqa: BLE001 — um erro aqui nunca derruba o guarda
+                log_limited("loop", 60, 3, f"internal error in the main loop: {describe_error(e)} (continuing)")
+                time.sleep(0.5)     # sem laço quente se o erro se repetir
+
+    def iteration(self):
+        """Uma volta: espera (gatilho do PSI, sinal ou o tique de 2 s) e avalia."""
+        espera = max(0.0, self.next_tick - time.monotonic())
+        try:
+            eventos = self.poller.poll(espera * 1000)
+        except InterruptedError:
+            eventos = []
+        agora = time.monotonic()
+        gatilho = False
+        for fd, ev in eventos:
+            if fd == self.wake_r:
+                self._drain()
+            elif fd == self.psi_fd:
+                if ev & (select.POLLERR | select.POLLNVAL | select.POLLHUP):
+                    self._psi_broken(agora)
+                elif ev & select.POLLPRI:
+                    self.psi_fired = agora
+                    gatilho = True
+        if self.stop:
+            return
+        if self.reload:
+            self.reload = False
+            self.safe(self.load_config)
+            self.next_tick = agora
+        if self.psi_fd is None and self.psi_retry_at and agora >= self.psi_retry_at:
+            self.psi_retry_at = 0.0
+            if not self.open_psi():
+                self.psi_retry_at = agora + self.psi_backoff
+                self.psi_backoff = min(self.psi_backoff * 2, PSI_RETRY_MAX_S)
+        # gatilho do PSI: avalia na hora, mas no máximo 2x por segundo (nada de laço quente)
+        if agora >= self.next_tick or (gatilho and agora - self.last_eval >= MIN_EVAL_GAP_S):
+            if agora >= self.next_tick:
+                self.next_tick = agora + TICK_S
+            self.last_eval = agora
+            self.safe(self.tick, agora)
+        self._ping(time.monotonic())
+
+    def _drain(self):
+        try:
+            while os.read(self.wake_r, 256):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
+
+    def _ping(self, agora):
+        if self.watchdog_s and agora - self.last_ping >= self.watchdog_s:
+            self.last_ping = agora
+            sd_notify("WATCHDOG=1")
+
+    def read_readings(self):
+        return read_readings()
+
+    def tick(self, agora):
+        try:
+            r = self.read_readings()
+        except (OSError, ValueError) as e:
+            log_limited("readings", 60, 3, f"can't read memory info ({describe_error(e)}); doing nothing")
+            return
+        self.last_readings = r
+        # sempre, até com o guarda desligado: só avisa, não age
+        self.safe(self.check_oom_kills)
+        pico = self.psi_fired is not None and agora - self.psi_fired < PSI_SPIKE_S
+        antes = self.level
+        self.level, self.calm_since = decide_level(antes, self.calm_since, r, self.cfg, agora, pico)
+        if self.level != antes:
+            self.safe(self.on_level_change, antes, agora, r)
+        if self.level == CRITICAL:
+            if self.critical_since is None:
+                self.critical_since = agora
+        else:
+            self.critical_since = None
+        if self.cfg["enabled"]:
+            if self.level != NORMAL:
+                self.safe(self.pressure_actions, agora, r)
+            if self.level == CRITICAL:
+                self.safe(self.critical_actions, agora, r)
+            elif agora - self.last_protect >= PROTECT_EVERY_S:
+                # no crítico a passada de proteção espera. Fora da calma ela não lê cmdline (pode
+                # esperar o mmap_lock de um processo em apuros e atrasar o crítico): python novo fica
+                # pendente e é decidido na primeira passada calma (o +500 de um ComfyUI aberto no
+                # aperto só vem quando a memória folgar)
+                self.last_protect = agora
+                self.safe(self.protect_pass, self.level == NORMAL and r["psi_some"] < 5)
+        elif self.applied and agora - self.last_protect >= PROTECT_EVERY_S:
+            # guarda desligado: desfaz o que ele mudou no oom_score_adj (e tenta de novo se falhar)
+            self.last_protect = agora
+            self.safe(self.restore_pass)
+        if self.paused and (self.level == NORMAL or not self.cfg["enabled"] or not self.cfg["pause_background"]):
+            # rede de segurança: fora do aperto (ou com a pausa desligada) ninguém fica parado
+            if self.level == NORMAL:
+                self.safe(self.resume_all, "memory is fine again", "calm")
+            else:
+                self.safe(self.resume_all, "pausing is switched off", "disabled")
+        self.safe(self.write_state, r)
+
+    def check_oom_kills(self):
+        """O OOM killer do próprio kernel fechou algo (o min_ttl_ms do MGLRU faz ele agir antes do
+        travamento, às vezes antes do guarda)? Vira o evento "oom_kill" {count}: sem nome nem uid,
+        que o kernel não conta quem foi. A primeira leitura só marca a base (mortes de antes do guarda
+        subir não são avisadas)."""
+        n = read_oom_kills(self.proc_root)
+        if n is None:
+            return
+        antes, self.oom_kills = self.oom_kills, n
+        if antes is not None and n > antes:
+            log(4, f"the kernel's out-of-memory killer closed {n - antes} process(es)")
+            self.emit("oom_kill", count=min(n - antes, 1000))
+
+    def on_level_change(self, antes, agora, r):
+        self.level_since = time.time()
+        folga, disp, _ = metrics(r)
+        log(5 if self.level != NORMAL else 6,
+            f"level {antes} -> {self.level} (available {disp:.1f}%, with swap {folga:.0f}%, "
+            f"pressure some {r['psi_some']:.1f} full {r['psi_full']:.1f})")
+        if antes == NORMAL and self.cfg["enabled"]:
+            self.last_pressure_event = agora
+            self.emit("pressure", level=self.level, available_pct=round(disp, 1))
+
+    # ----- proteção (oom_score_adj) -----
+
+    def protect_pass(self, details=True):
+        self.protect_procs(self.scanner.scan(self.cfg, details=details))
+
+    def protect_procs(self, procs):
+        """A passada de proteção sobre uma varredura completa (a do crítico também serve)."""
+        antes = dict(self.applied)
+        self._prune_applied(procs)
+        # o que não se encaixa mais (saiu de protect=/background=) volta ao valor original
+        contagem = self._apply(plan_restore(procs, self.applied, tudo=False))
+        for k, v in self._apply(plan_protection(procs, self.orig_adj, self.seen)).items():
+            contagem[k] += v
+        if not self.dry:
+            # vital de pessoa que já nasceu com -900 (herdou do greetd/Hyprland protegidos): o -900
+            # também é nosso, e volta ao normal quando o guarda parar
+            for p in procs:
+                if ((p.vital or p.user_protect) and is_user(p.uids) and p.adj == PROTECT_ADJ
+                        and p.key not in self.applied and len(self.applied) < MAX_APPLIED):
+                    self.applied[p.key] = (self.orig_adj.get(p.key, DEFAULT_RESTORE_ADJ), PROTECT_ADJ)
+        atuais = {p.key for p in procs}
+        # python pendente não conta como visto: o -900 herdado dele é decidido quando for lido
+        self.seen = {p.key for p in procs if not p.pending or p.key in self.seen}
+        for k in [k for k in self.orig_adj if k not in atuais]:
+            del self.orig_adj[k]
+        self.dry_logged &= atuais
+        if self.applied != antes:
+            self.store.save_adj(self.applied)
+        if self.scanner.denied and os.geteuid() != 0:
+            log_limited("denied", 3600, 6, "not running as root: some processes can't be read")
+        if contagem["protect"] or contagem["prefer"]:
+            log(6, f"protection: {contagem['protect']} desktop processes protected, "
+                   f"{contagem['prefer']} marked as first to go")
+        if contagem["restore"]:
+            log(6, f"protection: {contagem['restore']} processes no longer listed, back to their normal priority")
+        if contagem["inherited"]:
+            log(7, f"protection: {contagem['inherited']} apps restored to their normal priority")
+
+    def restore_pass(self):
+        """Guarda parando ou desligado: devolve o valor original a quem ele mudou e, depois, zera o
+        -900 que algum filho herdou de um vital antes dele voltar ao normal."""
+        if self.dry or not self.applied:
+            return
+        procs = self.scanner.scan(self.cfg, details=False)
+        self._prune_applied(procs)
+        c = self._apply(plan_restore(procs, self.applied, tudo=True))
+        if c["restore"]:
+            procs = self.scanner.scan(self.cfg, details=False)
+            c["inherited"] = self._apply(plan_protection(procs, self.orig_adj, self.seen,
+                                                         restaurando=True))["inherited"]
+        self.store.save_adj(self.applied)
+        if c["restore"] or c["inherited"]:
+            log(6, f"protection undone: {c['restore']} processes back to their own priority, "
+                   f"{c['inherited']} apps reset")
+        if self.applied:
+            log_limited("restore-left", 300, 4, f"couldn't undo the priority of {len(self.applied)} "
+                                                "processes; trying again")
+
+    def _prune_applied(self, procs):
+        """Esquece quem acabou ou teve o valor mudado por outro (aí o valor é dele, não nosso)."""
+        vivos = {p.key: p for p in procs}
+        for k, (_, posto) in list(self.applied.items()):
+            p = vivos.get(k)
+            if p is None or (p.adj is not None and p.adj != posto):
+                del self.applied[k]
+
+    def _apply(self, mudar):
+        """Grava os valores planejados (no dry-run só registra) e anota em applied o que é nosso."""
+        contagem = {"protect": 0, "prefer": 0, "inherited": 0, "restore": 0}
+        for p, valor, motivo in mudar:
+            if self.dry:
+                if p.key not in self.dry_logged:
+                    self.dry_logged.add(p.key)
+                    log(6, f"dry-run: would set oom_score_adj {p.adj} -> {valor} on "
+                           f"{sanitize_name(p.comm)} ({p.pid}) [{motivo}]")
+                continue
+            if motivo in ("protect", "prefer") and p.key not in self.applied and len(self.applied) >= MAX_APPLIED:
+                log_limited("adj-full", 600, 4, "too many processes to keep track of; not changing more")
+                continue
+            try:
+                ok = write_adj(p.pid, p.start, valor, self.proc_root, esperado=p.adj)
+            except PermissionError:
+                log_limited("adj-perm", 600, 4, "no permission to change oom_score_adj (needs root with "
+                                                "CAP_DAC_OVERRIDE and CAP_SYS_RESOURCE)")
+                continue
+            except OSError as e:
+                log_limited("adj-err", 600, 4, f"can't change oom_score_adj ({describe_error(e)})")
+                continue
+            if motivo == "restore":
+                self.applied.pop(p.key, None)       # gravou, sumiu ou outro mudou: não é mais nosso
+            if not ok:
+                continue
+            contagem[motivo] += 1
+            if motivo == "protect":
+                self.applied[p.key] = (self.orig_adj.get(p.key, DEFAULT_RESTORE_ADJ), valor)
+            elif motivo == "prefer":
+                self.applied[p.key] = (p.adj if p.adj > PROTECT_ADJ else DEFAULT_RESTORE_ADJ, valor)
+        return contagem
+
+    # ----- aperto: pausar trabalho de fundo -----
+
+    def pressure_actions(self, agora, r):
+        if agora - self.last_pressure_event >= PRESSURE_EVENT_EVERY_S:
+            self.last_pressure_event = agora
+            _, disp, _ = metrics(r)
+            self.emit("pressure", level=self.level, available_pct=round(disp, 1))
+        if not self.cfg["pause_background"] or not self.cfg["background"]:
+            return
+        if agora - self.last_pause_scan < PAUSE_SCAN_EVERY_S:
+            return
+        self.last_pause_scan = agora
+        if self.paused:
+            self._prune_paused()
+        nomes = self.cfg["background"]
+        procs = self.scanner.scan(self.cfg, details=False, only=lambda c: comm_matches(c, nomes))
+        ja = {(x["pid"], x["start"]) for x in self.paused}
+        novos = plan_pause(procs, ja, self.own_pid)[:max(0, MAX_PAUSED - len(self.paused))]
+        if not novos:
+            return
+        if self.dry:
+            chave = tuple(sorted(p.key for p in novos))
+            if chave not in self.dry_logged:
+                self.dry_logged.add(chave)
+                log(6, f"dry-run: would pause {len(novos)} background processes "
+                       f"({', '.join(sorted({sanitize_name(p.comm) for p in novos}))}, {mib(sum(p.mem for p in novos))} MB)")
+            return
+        if not self.store.ok:
+            return       # sem onde anotar = não pausa (nunca deixar processo parado sem registro)
+        registros = [{"pid": p.pid, "start": p.start, "comm": sanitize_name(p.comm), "uid": p.uids[0],
+                      "mem": p.mem} for p in novos]
+        # anota ANTES de parar: se o daemon cair logo depois do SIGSTOP, a próxima partida retoma
+        if not self.store.save_paused(self._paused_records(self.paused + registros)):
+            log_limited("pause-save", 60, 4, "can't record paused processes; not pausing")
+            return
+        feitos = []
+        for reg in registros:
+            # na lista ANTES do sinal, como no paused.json: um erro inesperado no meio (MemoryError...)
+            # nunca deixa um processo parado fora dela (na dúvida fica anotado: SIGCONT em quem não
+            # estava parado não faz mal)
+            self.paused.append(reg)
+            if self._pause_one(reg):
+                feitos.append(reg)
+            else:
+                self.paused.pop()
+        if len(feitos) != len(registros):
+            self.store.save_paused(self._paused_records(self.paused))
+        if feitos:
+            nomes_f = sorted({r_["comm"] for r_ in feitos})
+            mb = mib(sum(r_["mem"] for r_ in feitos))
+            log(5, f"paused {len(feitos)} background processes ({', '.join(nomes_f)}, {mb} MB) "
+                   "until memory is free again")
+            # um evento por dono: cada agente só avisa (e mostra os nomes) dos processos do seu usuário
+            for uid, regs in by_uid(feitos):
+                dele = [x for x in self.paused if x["uid"] == uid]
+                self.emit("paused", uid=uid, names=self.show_names(regs), count=len(dele),
+                          mb=mib(sum(x["mem"] for x in dele)))
+
+    def _pause_one(self, reg):
+        """SIGSTOP num registro. True = parou; False = sumiu, é outro processo ou erro passageiro."""
+        try:
+            fd = open_verified(reg["pid"], reg["start"], True)
+        except OSError as e:
+            log_limited("pause-err", 60, 4, f"can't pause a process ({describe_error(e)})")
+            return False
+        if fd is None:
+            return False
+        try:
+            return send(fd, signal.SIGSTOP)
+        except OSError as e:
+            log_limited("pause-err", 60, 4, f"can't pause a process ({describe_error(e)})")
+            return False
+        finally:
+            os.close(fd)
+
+    def show_names(self, regs):
+        """Nomes pra eventos e state.json: o nome inteiro da lista background= (o kernel corta o comm
+        em 15: "fossilize_repla" vira "fossilize_replay" de novo), sem repetir, em ordem."""
+        return sorted({full_name(x["comm"], self.cfg["background"]) for x in regs})
+
+    def _prune_paused(self):
+        """Esquece os pausados que já acabaram ou cujo pid agora é de outro processo (o Steam fecha os
+        workers parados, por exemplo). Erro passageiro: o registro fica, como no resume_all."""
+        vivos = []
+        for reg in self.paused:
+            try:
+                fd = open_verified(reg["pid"], reg["start"], False)
+            except OSError:
+                vivos.append(reg)
+                continue
+            if fd is None:
+                continue
+            os.close(fd)
+            vivos.append(reg)
+        if len(vivos) != len(self.paused):
+            self.paused = vivos
+            self.store.save_paused(self._paused_records(vivos))
+
+    @staticmethod
+    def _paused_records(lista):
+        return [{"pid": x["pid"], "start": x["start"], "comm": x["comm"], "uid": x["uid"]} for x in lista]
+
+    def resume_all(self, motivo, razao="calm", manter=None):
+        """SIGCONT nos pausados. manter(registro) -> True = esse continua pausado (e anotado).
+        razao vai no evento "resumed" (calm, reload, stopping, disabled, leftover): o agente só avisa
+        "a memória voltou ao normal" quando é calm."""
+        if not self.paused:
+            return
+        retomados, ficaram = [], []
+        for reg in self.paused:
+            if manter is not None and manter(reg):
+                ficaram.append(reg)
+                continue
+            try:
+                fd = open_verified(reg["pid"], reg["start"], False)
+            except OSError as e:
+                ficaram.append(reg)      # erro passageiro: continua anotado, tenta de novo na próxima
+                log_limited("resume-err", 60, 3, f"can't resume a process ({describe_error(e)})")
+                continue
+            if fd is None:
+                continue        # acabou ou o pid é de outro processo agora: nada a fazer
+            try:
+                if send(fd, signal.SIGCONT):
+                    retomados.append(reg)
+            except OSError as e:
+                ficaram.append(reg)
+                log_limited("resume-err", 60, 3, f"can't resume a process ({describe_error(e)})")
+            finally:
+                os.close(fd)
+        self.paused = ficaram
+        self.store.save_paused(self._paused_records(ficaram))
+        if retomados:
+            nomes = sorted({r_["comm"] for r_ in retomados})
+            log(5, f"resumed {len(retomados)} paused processes ({', '.join(nomes)}): {motivo}")
+            for uid, regs in by_uid(retomados):
+                self.emit("resumed", uid=uid, names=self.show_names(regs), count=len(regs), reason=razao)
+
+    def resume_leftovers(self):
+        """Na partida: retoma o que uma execução anterior deixou anotado em paused.json e, por
+        segurança, trabalho de fundo de pessoas parado (estado T) sem registro."""
+        self.paused = [dict(x, mem=0) for x in self.store.load_paused()]
+        if self.paused:
+            log(5, f"found {len(self.paused)} processes paused by a previous run")
+            self.resume_all("left over from a previous run", "leftover")    # grava só os que falharam
+        else:
+            self.store.save_paused([])      # arquivo vazio ou estragado: some
+        nomes = self.cfg["background"]
+        if not nomes:
+            return
+        procs = self.scanner.scan(self.cfg, details=False, only=lambda c: comm_matches(c, nomes))
+        n = 0
+        for p in procs:
+            if p.background and is_user(p.uids) and p.state == "T":
+                try:
+                    fd = open_verified(p.pid, p.start, True)
+                    if fd is None:
+                        continue
+                except OSError:
+                    continue
+                try:
+                    n += send(fd, signal.SIGCONT)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+        if n:
+            log(5, f"resumed {n} stopped background processes with no record")
+
+    # ----- crítico: fechar o maior culpado -----
+
+    def critical_actions(self, agora, r):
+        if self.critical_since is None or agora - self.critical_since < CRITICAL_CONFIRM_S:
+            return
+        if agora - self.last_kill < KILL_COOLDOWN_S or agora - self.last_victim_try < VICTIM_RETRY_S:
+            return
+        self.last_victim_try = agora
+        procs = self.scanner.scan(self.cfg, details=False, oom_score=True)
+        # a passada de proteção normal espera o crítico passar; esta usa a mesma varredura (sem
+        # cmdline): app aberto no aperto perde o -900 herdado, e um guarda que acabou de reiniciar
+        # protege o desktop de novo antes do OOM do kernel escolher alguém
+        self.safe(self.protect_procs, procs)
+        if not self.cfg["kill_on_critical"]:
+            return
+        vitima = choose_victim(procs, r["mem_total"], self.own_pid)
+        if vitima is None:
+            log_limited("no-victim", 60, 4, "memory is critical but there is no app worth closing")
+            return
+        grupo = kill_group(vitima, procs)
+        nome = sanitize_name(vitima.comm)
+        # nome pro evento (notificação, "Last action" do Settings): o backend do ComfyUI é só um
+        # "python" pro kernel; trabalho de fundo vai com o nome inteiro da lista background=
+        mostrar = "ComfyUI" if vitima.comfy else sanitize_name(full_name(vitima.comm, self.cfg["background"]))
+        mb = mib(sum(p.mem for p in grupo))
+        if self.dry:
+            log(4, f"dry-run: would close {nome} ({vitima.pid}{f' +{len(grupo) - 1}' if len(grupo) > 1 else ''}, "
+                   f"{mb} MB, oom_score {vitima.score})")
+            self.last_kill = agora
+            return
+        fechados = self.kill_procs(grupo, KILL_WAIT_S)
+        if fechados:
+            self.last_kill = time.monotonic()
+            ids = {p.key for p in fechados}
+            self.paused = [x for x in self.paused if (x["pid"], x["start"]) not in ids]
+            self.store.save_paused(self._paused_records(self.paused))
+            mb = mib(sum(p.mem for p in fechados))
+            log(3, f"memory critical: closed {nome} ({vitima.pid}"
+                   f"{f' and {len(fechados) - 1} more' if len(fechados) > 1 else ''}, {mb} MB) to prevent a freeze")
+            # o grupo é sempre de um dono só (kill_group exige os mesmos uids)
+            self.emit("killed", uid=vitima.uids[0], name=mostrar, pid=vitima.pid, mb=mb, count=len(fechados))
+
+    def kill_procs(self, grupo, espera_s):
+        """SIGTERM (+SIGCONT: parado não trata o TERM) em todos; quem não saiu em espera_s leva
+        SIGKILL (+process_mrelease). Tudo por pidfd conferido. Devolve quem recebeu o sinal."""
+        abertos = []        # (fd, proc)
+        try:
+            for p in grupo:
+                try:
+                    fd = open_verified(p.pid, p.start, True)
+                except OSError as e:
+                    log_limited("kill-err", 60, 3, f"can't close a process ({describe_error(e)})")
+                    continue
+                if fd is None:
+                    continue
+                try:
+                    if send(fd, signal.SIGTERM):
+                        send(fd, signal.SIGCONT)
+                        abertos.append((fd, p))
+                        fd = None
+                except OSError as e:
+                    log_limited("kill-err", 60, 3, f"can't close a process ({describe_error(e)})")
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+            pendentes = {fd for fd, _ in abertos}
+            prazo = time.monotonic() + espera_s
+            while pendentes:
+                falta = prazo - time.monotonic()
+                if falta <= 0:
+                    break
+                p_ = select.poll()
+                for fd in pendentes:
+                    p_.register(fd, select.POLLIN)
+                for fd, _ in p_.poll(falta * 1000):
+                    pendentes.discard(fd)       # pidfd legível = o processo terminou
+            for fd in pendentes:
+                try:
+                    if send(fd, signal.SIGKILL):
+                        mrelease(self.libc, fd)
+                except OSError as e:
+                    log_limited("kill9-err", 60, 3, f"can't force-close a process ({describe_error(e)})")
+            return [p for _, p in abertos]
+        finally:
+            for fd, _ in abertos:
+                os.close(fd)
+
+    # ----- eventos e estado -----
+
+    def emit(self, tipo, **campos):
+        obj = {"t": int(time.time()), "seq": self.seq, "kind": tipo}
+        obj.update(campos)
+        if self.dry:
+            obj["dry_run"] = True
+        self.seq += 1
+        if tipo in ("paused", "resumed", "killed", "oom_kill"):
+            self.last_action = dict(obj)
+        if self.store.ok:
+            self.store.append_event(obj)
+        elif self.dry:
+            log(6, f"dry-run: event {tipo}")
+
+    def write_state(self, r):
+        if not self.store.ok:
+            return
+        folga, disp, _ = metrics(r)
+        estado = {
+            "t": int(time.time()), "level": self.level, "level_since": int(self.level_since),
+            "enabled": bool(self.cfg["enabled"]), "dry_run": self.dry,
+            "mem_total": r["mem_total"], "mem_available": r["mem_available"],
+            "swap_total": r["swap_total"], "swap_free": r["swap_free"],
+            "headroom_pct": round(folga, 1), "available_pct": round(disp, 1),
+            "psi_some_avg10": r["psi_some"], "psi_full_avg10": r["psi_full"],
+            "psi_trigger": self.psi_fd is not None,
+            "paused": self.show_names(self.paused), "paused_count": len(self.paused),
+            # de quem são os pausados (o Settings só mostra os nomes se forem todos de quem olha)
+            "paused_uids": sorted({x["uid"] for x in self.paused}),
+            "last_action": self.last_action, "config": export_config(self.cfg),
+        }
+        self.store.write_json("state.json", estado)
+
+
+def open_psi_trigger(caminho):
+    """Abre o gatilho do PSI. Devolve (fd, descrição) ou (None, motivo). Tenta a janela de 1 s
+    (precisa CAP_SYS_RESOURCE na hora do open) e depois a de 2 s (aceita sem privilégio)."""
+    motivo = "unsupported"
+    for gatilho, descricao in PSI_TRIGGERS:
+        try:
+            fd = os.open(caminho, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as e:
+            return None, f"can't open {caminho}: {errno.errorcode.get(e.errno, e.errno)}"
+        try:
+            os.write(fd, gatilho)
+            return fd, descricao
+        except OSError as e:
+            os.close(fd)
+            motivo = f"trigger refused: {errno.errorcode.get(e.errno, e.errno)}"
+            if e.errno not in (errno.EINVAL, errno.EPERM, errno.EACCES):
+                break
+    return None, motivo
+
+
+# ---------- --check ----------
+
+def gib(n):
+    return f"{n / (1024 ** 3):.1f} GiB"
+
+
+def run_check(conf_path, run_dir):
+    """Relatório único, sem agir."""
+    root = os.geteuid() == 0
+    cfg, problemas = load_config(conf_path)
+    try:
+        r = read_readings()
+    except (OSError, ValueError) as e:
+        print(f"Can't read /proc/meminfo ({describe_error(e)})")
+        return 1
+    psi_ok = r["psi_ok"]
+    fd, modo = open_psi_trigger(PSI_PATH)
+    if fd is not None:
+        os.close(fd)
+    folga, disp, swap_livre = metrics(r)
+    nivel, _ = decide_level(NORMAL, None, r, cfg, time.monotonic())
+    sc = Scanner()
+    procs = sc.scan(cfg, details=True, oom_score=True)
+    mudar = plan_protection(procs, {}, set())
+    pausar = plan_pause(procs, set(), os.getpid())
+    vitima = choose_victim(procs, r["mem_total"], os.getpid())
+
+    print("Aero memory guard: check (read-only, nothing is changed)")
+    print(f"  RAM          {gib(r['mem_total'])} total, {gib(r['mem_available'])} available ({disp:.1f}%)")
+    if r["swap_total"]:
+        print(f"  Swap         {gib(r['swap_total'])} total, {gib(r['swap_free'])} free ({swap_livre * 100:.0f}%)")
+    else:
+        print("  Swap         none")
+    print(f"  Headroom     {folga:.0f}% (RAM available + fast swap; warning below {cfg['warn_available']}%)")
+    if psi_ok:
+        print(f"  Pressure     some {r['psi_some']:.2f}%  full {r['psi_full']:.2f}% (avg 10 s)")
+    else:
+        print("  Pressure     not available (kernel without PSI)")
+    print(f"  PSI trigger  {modo if fd is not None else 'not available: ' + modo}")
+    oom = read_oom_kills()
+    if oom is not None:
+        print(f"  OOM kills    {oom} by the kernel since boot")
+    print(f"  Level now    {nivel} (one reading, without the 30 s calm-down history)")
+    print("  Config       " + " ".join(f"{k}={v if not isinstance(v, list) else ','.join(v)}"
+                                       for k, v in export_config(cfg).items()))
+    for p in problemas[:10]:
+        print(f"  Config note  {p}")
+    prot = [p for p, v, m in mudar if m == "protect"]
+    pref = [p for p, v, m in mudar if m == "prefer"]
+    ja_prot = [p for p in procs if (p.vital or p.user_protect) and p.adj is not None and p.adj <= PROTECT_ADJ]
+    nao_conf = [p for p in procs if comm_matches(p.comm, VITAL) and p.exe_ok is None and not p.aero]
+    print(f"  Protected    {len(ja_prot)} already, would protect {len(prot)} more: {names_summary(prot)}")
+    if nao_conf:
+        print(f"               {len(nao_conf)} desktop processes can't be verified without root: {names_summary(nao_conf)}")
+    print(f"  First to go  would mark {len(pref)}: {names_summary(pref)}")
+    if pausar:
+        print(f"  On warning   would pause {len(pausar)} ({names_summary(pausar)}, {mib(sum(p.mem for p in pausar))} MB)")
+    else:
+        print("  On warning   nothing to pause right now")
+    if vitima is not None:
+        g = kill_group(vitima, procs)
+        extra = f" + {len(g) - 1} more like it" if len(g) > 1 else ""
+        print(f"  If critical  would close {sanitize_name(vitima.comm)} ({vitima.pid}{extra}, "
+              f"{mib(sum(p.mem for p in g))} MB, oom_score {vitima.score})")
+    else:
+        print("  If critical  no app worth closing right now")
+    estado = None
+    try:
+        estado = json.loads(read_path(os.path.join(run_dir, "state.json"), MAX_JSON_FILE))
+    except (OSError, ValueError):
+        pass
+    if isinstance(estado, dict) and type(estado.get("t")) is int:
+        idade = int(time.time()) - estado["t"]
+        pausados = estado.get("paused_count")
+        print(f"  Service      level {sanitize_name(estado.get('level', '?'), 10)}, updated {idade} s ago, "
+              f"{pausados if type(pausados) is int else 0} processes paused by it")
+    else:
+        print("  Service      not running (no state file)")
+    if not root:
+        print("  Note         not running as root: other users' processes show less detail")
+    return 0
+
+
+def names_summary(procs, maximo=8):
+    nomes = {}
+    for p in procs:
+        n = sanitize_name(p.comm)
+        nomes[n] = nomes.get(n, 0) + 1
+    partes = [f"{n}×{c}" if c > 1 else n for n, c in sorted(nomes.items())]
+    return (", ".join(partes[:maximo]) + (f" +{len(partes) - maximo}" if len(partes) > maximo else "")) or "-"
+
+
+def run_resume_paused(run_dir, proc_root=PROC):
+    """ExecStopPost: retoma o que estiver anotado e desfaz o oom_score_adj que adj.json lista (rede de
+    segurança se o daemon morreu sem limpar: SIGKILL no fim do prazo, watchdog, queda). Numa parada
+    limpa o próprio guarda já desfez tudo e os arquivos nem existem."""
+    if not os.path.isdir(run_dir):
+        return 0            # nada anotado (o serviço nem chegou a criar a pasta)
+    st = Store(run_dir, criar=False)
+    try:
+        registros = st.load_paused()
+        n, ficaram = 0, []
+        for reg in registros:
+            try:
+                fd = open_verified(reg["pid"], reg["start"], False)
+            except OSError:
+                ficaram.append(reg)
+                continue
+            if fd is None:
+                continue
+            try:
+                n += send(fd, signal.SIGCONT)
+            except OSError:
+                ficaram.append(reg)
+            finally:
+                os.close(fd)
+        st.save_paused(ficaram)
+        if registros:
+            log(5, f"resumed {n} of {len(registros)} processes left paused")
+        undo_adj_file(st, proc_root)
+    finally:
+        st.close()
+    return 0
+
+
+def undo_adj_file(st, proc_root=PROC):
+    """Devolve o valor original a quem adj.json lista (só se ainda estiver com o valor que o guarda
+    pôs) e depois zera o -900 que os apps de pessoas herdaram dos vitais. Devolve (desfeitos, zerados)."""
+    applied = st.load_adj()
+    if not applied:
+        st.remove("adj.json")       # vazio ou estragado
+        return 0, 0
+    n, ficaram = 0, {}
+    for (pid, inicio), (orig, posto) in applied.items():
+        if orig == posto:
+            continue
+        try:
+            n += write_adj(pid, inicio, orig, proc_root, esperado=posto)
+        except OSError:
+            ficaram[(pid, inicio)] = (orig, posto)      # tenta de novo no próximo guarda
+    zerados = 0
+    procs = Scanner(proc_root).scan(dict(DEFAULTS), details=False)
+    orig_adj = {k: v[0] for k, v in applied.items()}
+    for p, valor, _ in plan_protection(procs, orig_adj, set(), restaurando=True):
+        try:
+            zerados += write_adj(p.pid, p.start, valor, proc_root, esperado=PROTECT_ADJ)
+        except OSError:
+            pass
+    st.save_adj(ficaram)
+    if n or zerados:
+        log(5, f"protection undone: {n} processes back to their own priority, {zerados} apps reset")
+    return n, zerados
+
+
+def main(argv=None):
+    global VERBOSE
+    import argparse  # noqa: PLC0415
+    ap = argparse.ArgumentParser(prog="aero-memory", description="Aero OS memory guard")
+    modo = ap.add_mutually_exclusive_group()
+    modo.add_argument("--check", action="store_true", help="one-shot report, never acts")
+    modo.add_argument("--dry-run", action="store_true", help="run the loop but only log actions")
+    modo.add_argument("--resume-paused", action="store_true", help="resume processes left paused, then exit")
+    ap.add_argument("--config", default=CONF_PATH, help=f"config file (default {CONF_PATH})")
+    ap.add_argument("--run-dir", default=None,
+                    help=f"state directory (default {RUN_DIR}; with --dry-run nothing is written unless "
+                         f"given, and never into {RUN_DIR})")
+    ap.add_argument("--verbose", action="store_true", help="also log debug messages")
+    a = ap.parse_args(argv)
+    VERBOSE = a.verbose
+    if a.check:
+        return run_check(a.config, a.run_dir or RUN_DIR)
+    if a.resume_paused:
+        return run_resume_paused(a.run_dir or RUN_DIR)
+    if not a.dry_run and os.geteuid() != 0:
+        # sem root o guarda funcionaria pela metade (mexeria só nos processos deste usuário)
+        print("aero-memory: the guard runs as root (aero-memory.service); "
+              "as a normal user use --check or --dry-run", file=sys.stderr)
+        return 2
+    if a.dry_run and a.run_dir and os.path.realpath(a.run_dir) == os.path.realpath(RUN_DIR):
+        # o agente do usuário e o Settings leem essa pasta: um ensaio lá dentro pareceria de verdade
+        print(f"aero-memory: --dry-run can't write into the live {RUN_DIR}; use another --run-dir",
+              file=sys.stderr)
+        return 2
+    run_dir = a.run_dir if a.dry_run else (a.run_dir or RUN_DIR)
+    return Guard(a.config, run_dir, dry_run=a.dry_run).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

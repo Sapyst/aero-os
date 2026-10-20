@@ -1,0 +1,38 @@
+# Agente de memória do Aero (roda como você): libera a RAM/VRAM do ComfyUI quando ele fecha ou fica
+# parado, e avisa o que o guarda de memória (aero-memory, root) fez. O Settings → Memory muda
+# ~/.config/aero/memory-agent.conf e recarrega este serviço (SIGHUP relê o arquivo).
+[Unit]
+Description=Aero OS memory agent: free ComfyUI's memory when it closes or sits idle
+After=dbus.socket
+# Se ele cair em seguida (binário sumiu, erro na partida), para em "failed" depois de 5 tentativas em
+# 1 min, em vez de reiniciar a cada 3 s pra sempre (o padrão, 5 em 10 s, nunca é atingido com RestartSec=3)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aero-memory-agent
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+
+# Limites: se algum dia vazar memória ou processos, o systemd segura e reinicia. Normal: ~30 MB e 1 tarefa;
+# o nvidia-smi e o notify-send (filhos rápidos) contam junto, por isso a folga.
+MemoryHigh=96M
+MemoryMax=160M
+TasksMax=32
+
+# Proteções que funcionam num serviço de usuário (sem PrivateUsers, que esconderia os outros processos
+# seus e quebraria a leitura de /proc/PID/fd e o envio de sinais)
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# UNIX: Hyprland, D-Bus (notify-send); INET/INET6: só 127.0.0.1 (ComfyUI); NETLINK: nvidia-smi/glib
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
+
+[Install]
+WantedBy=default.target

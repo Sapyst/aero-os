@@ -1,0 +1,1112 @@
+#!/usr/bin/env bash
+# aero-swap-setup — a segunda camada de swap do Aero OS: um swapfile no SSD com prioridade baixa (10).
+# A primeira camada é o zram (RAM comprimida, prioridade 100): o kernel só usa o SSD quando o zram
+# enche, e para lá vão as páginas frias (coisas paradas há tempo). Instalar em /usr/local/bin.
+#
+# Uso:
+#   aero-swap-setup                      mostra o que faria (dry-run, o padrão; não precisa de root)
+#   aero-swap-setup --apply [--size N]   cria/ajusta o swapfile de N GB (4..64) — root
+#                                        sem --size: mantém o tamanho do que já existe, ou 16 GB
+#   aero-swap-setup --remove [--apply]   desfaz tudo: swapoff, linha do fstab, arquivo, subvolume,
+#                                        bloqueio da hibernação (um swapfile adotado fica)
+#   aero-swap-setup --status             só mostra as camadas de swap de agora
+#
+# Códigos de saída (o app Settings usa para mostrar a mensagem certa):
+#   0 ok / nada a fazer   1 um comando falhou   2 uso errado   3 precisa de root
+#   4 situação insegura, recusada   5 pouco espaço livre   6 swap em uso, não dá para desligar agora
+#
+# Btrfs: o arquivo mora num subvolume próprio, /swap, aninhado no subvolume do / (o @).
+# Snapshots não são recursivos: num snapshot do @ o /swap aparece como pasta vazia — os 16 GB não
+# entram no snapshot, e o swapfile ativo não impede snapshots do @ (o btrfs só recusa snapshot do
+# subvolume que CONTÉM o swapfile ativo). btrfs filesystem mkswapfile já cria o arquivo sem
+# copy-on-write (sem compressão), pré-alocado e com modo 0600. Testado com btrfs-progs 7.1.
+# Limites do btrfs: o sistema de arquivos precisa ter um disco só e dados em perfil "single".
+# ext4/xfs: pasta /swap comum + fallocate + mkswap (pré-alocado funciona nos dois em kernels novos).
+# A swap liga com "discard": o espaço que a swap libera é apagado (TRIM) no SSD, e o que já foi
+# memória de apps não fica guardado no disco depois de desligar.
+#
+# Um /swap/swapfile que já existia (feito à mão, como na ArchWiki) é "adotado": o marcador
+# /swap/.aero-swap-setup guarda adopted=1 e a linha antiga do fstab; o --remove deixa o arquivo e
+# devolve essa linha. Trocar o tamanho dele só com --size explícito (o arquivo novo muda de lugar
+# no disco, e um resume_offset= da hibernação deixa de valer).
+#
+# Hibernação: com um swapfile no disco o systemd passa a aceitar hibernar. Se o initramfs não sabe
+# voltar da imagem (sem hook "systemd", ou sem resume=/resume_offset= + hook "resume"), hibernar
+# perderia a sessão inteira — e gravaria a RAM toda no disco. Então o setup grava
+# /etc/systemd/sleep.conf.d/90-aero-swap.conf com AllowHibernation=no. O --remove apaga, a não ser
+# que um swap de disco continue ligado (ex.: o adotado) sem o boot saber voltar dele.
+#
+# Roda como root: só caminhos absolutos fixos, PATH fixo, nenhum dado vira comando.
+set -euo pipefail
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+SWAP_DIR=/swap
+SWAP_FILE=/swap/swapfile
+MARKER=/swap/.aero-swap-setup
+FSTAB=/etc/fstab
+LOCK=/run/aero-swap-setup.lock
+PRIO=10
+SWAP_OPTS="defaults,nofail,discard,pri=$PRIO"
+FSTAB_LINE="$SWAP_FILE none swap $SWAP_OPTS 0 0"
+FSTAB_TAG="# aero-swap-setup: SSD swap tier (low priority; compressed RAM swap is used first)"
+SIZE_MIN=4
+SIZE_MAX=64
+SIZE_DEFAULT=16
+MIN_FREE_PCT=20          # sobra pelo menos 20% do disco livre depois de criar o arquivo
+# swapoff só se, depois de trazer de volta o que está no SSD, sobrar na RAM a % de folga que o
+# vigia (aero-memory) quer — warn_available do memory.conf, padrão 15% — e nunca menos de 1 GB
+GUARD_CONF=/etc/aero/memory.conf
+WARN_PCT_DEFAULT=15
+SWAPOFF_MIN_RESERVE_KIB=1048576
+# bloqueio da hibernação (lido pelo systemd-logind a cada pergunta; não precisa de reload)
+SLEEP_DIR=/etc/systemd/sleep.conf.d
+SLEEP_CONF=$SLEEP_DIR/90-aero-swap.conf
+SLEEP_MARK="# Aero OS: made by aero-swap-setup; aero-swap-setup --remove deletes it."
+MKINITCPIO_CONF=/etc/mkinitcpio.conf
+MKINITCPIO_DIR=/etc/mkinitcpio.conf.d
+PAGE=$(getconf PAGESIZE 2>/dev/null || true)
+[[ $PAGE =~ ^[1-9][0-9]*$ ]] || PAGE=4096
+
+# ---------- mensagens ----------
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+err()  { printf 'error: %s\n' "$*" >&2; }
+
+# KiB → "12.3 GB" (GB aqui = GiB, igual ao --size)
+fmt_kib() { awk -v k="$1" 'BEGIN { printf "%.1f GB", k / 1048576 }'; }
+fmt_bytes() { awk -v b="$1" 'BEGIN { printf "%.1f GB", b / 1073741824 }'; }
+
+# ---------- funções puras (testadas em tests/memory/test_swap_setup.py) ----------
+
+# 0 se N é um tamanho aceito (inteiro sem zero à esquerda, SIZE_MIN..SIZE_MAX)
+valid_size() {
+    [[ ${1:-} =~ ^[1-9][0-9]?$ ]] && (( $1 >= SIZE_MIN && $1 <= SIZE_MAX ))
+}
+
+# /proc/swaps → "nome tipo tamanho_kib usado_kib prioridade", uma por linha (sem cabeçalho)
+parse_swaps() {
+    awk 'NR > 1 && NF >= 5 { print $1, $2, $3, $4, $5 }' "$1"
+}
+
+is_zram() { [[ $1 =~ ^/dev/zram[0-9]+$ ]]; }
+
+# valor (kB) de uma chave do /proc/meminfo; vazio se não houver
+meminfo_kib() {
+    awk -v k="$2:" '$1 == k { print $2; exit }' "$1"
+}
+
+# estado da nossa entrada no fstab: none | exact (uma linha, igual à nossa) | other
+fstab_state() {
+    awk -v f="$SWAP_FILE" -v o="$SWAP_OPTS" '
+        /^[[:space:]]*#/ || NF == 0 { next }
+        $1 == f {
+            n++
+            if ($2 == "none" && $3 == "swap" && $4 == o && ($5 == "" || $5 == "0") && ($6 == "" || $6 == "0")) ok++
+        }
+        END { if (n == 0) print "none"; else if (n == 1 && ok == 1) print "exact"; else print "other" }' "$1"
+}
+
+# o fstab sem as nossas linhas (a linha do swapfile e o comentário que a marca); o resto intacto
+fstab_without_ours() {
+    awk -v f="$SWAP_FILE" -v tag="$FSTAB_TAG" '
+        $0 == tag { next }
+        !/^[[:space:]]*#/ && NF > 0 && $1 == f { next }
+        { print }' "$1"
+}
+
+# o fstab com exatamente uma linha nossa no fim
+fstab_with_ours() {
+    fstab_without_ours "$1"
+    printf '%s\n%s\n' "$FSTAB_TAG" "$FSTAB_LINE"
+}
+
+# as linhas (não comentadas) do fstab para o swapfile, exatamente como estão
+fstab_lines_for_file() {
+    [[ -f $1 && -r $1 ]] || return 0
+    awk -v f="$SWAP_FILE" '!/^[[:space:]]*#/ && NF > 0 && $1 == f { print }' "$1"
+}
+
+# as linhas do fstab de antes do Aero guardadas no marcador (fstab=...); só as do swapfile
+saved_fstab_lines() {
+    [[ -f $1 && ! -L $1 ]] || return 0
+    awk -v f="$SWAP_FILE" 'sub(/^fstab=/, "") && $1 == f { print }' "$1"
+}
+
+# o fstab sem as nossas linhas e com as de antes do Aero de volta (swapfile adotado)
+fstab_restore_original() {
+    fstab_without_ours "$1"
+    saved_fstab_lines "$MARKER"
+}
+
+# o que o marcador diz: subvol | dir | file | adopted | none
+#   subvol/dir  o Aero criou a pasta /swap e o swapfile      file  só o swapfile (a pasta já existia)
+marker_kind() {
+    if [[ ! -f $1 || -L $1 ]]; then echo none
+    elif grep -qx 'created=subvol' "$1"; then echo subvol
+    elif grep -qx 'created=dir' "$1"; then echo dir
+    elif grep -qx 'created=file' "$1"; then echo file
+    elif grep -qx 'adopted=1' "$1"; then echo adopted
+    else echo none; fi
+}
+
+# 0 se "UID MODO" (de stat -c '%u %a') é de root e ninguém além do dono pode escrever nele
+dir_is_safe() {
+    local uid="" mode=""
+    read -r uid mode <<< "${1:-}" || true
+    [[ $uid == 0 && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 8#022) == 0 ))
+}
+
+# warn_available do memory.conf do vigia (vale a última; inválida ou ausente = 15), no mínimo 5.
+# Como o aero-memory: só os primeiros 64 KB / 500 linhas contam, e critical_available >=
+# warn_available faz os dois voltarem ao padrão.
+guard_warn_pct() {
+    local v=""
+    if [[ -f ${1:-} && -r $1 ]]; then
+        v=$(head -c 65536 -- "$1" 2>/dev/null | awk -F= '
+            function pct(s, d) { return (s ~ /^[0-9][0-9]?$/ && s + 0 >= 1 && s + 0 <= 50) ? s + 0 : d }
+            NR > 500 { exit }
+            { sub(/#.*/, "") }
+            NF >= 2 {
+                k = $1; val = substr($0, index($0, "=") + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                if (k == "warn_available") w = val; else if (k == "critical_available") c = val
+            }
+            END {
+                w = pct(w, 15); c = pct(c, 4)
+                if (c >= w) w = 15
+                print (w < 5 ? 5 : w)
+            }' 2>/dev/null || true)
+    fi
+    [[ $v =~ ^[0-9]+$ ]] || v=$WARN_PCT_DEFAULT
+    echo "$v"
+}
+
+# folga (KiB) que precisa sobrar de RAM depois de um swapoff: PCT% da RAM total, no mínimo 1 GB.
+# Com a % de aviso do vigia, o swapoff nunca leva o aero-memory a "critical" (que fecha o maior
+# app) nem a "warning" (que pausa trabalhos de fundo).
+# uso: swapoff_reserve_kib MEMTOTAL_KIB PCT
+swapoff_reserve_kib() {
+    local r=$(( ${1:-0} * ${2:-$WARN_PCT_DEFAULT} / 100 ))
+    (( r < SWAPOFF_MIN_RESERVE_KIB )) && r=$SWAPOFF_MIN_RESERVE_KIB
+    echo "$r"
+}
+
+# HOOKS que valem para o mkinitcpio, numa linha (o último HOOKS= vence; HOOKS+= soma)
+# uso: mkinitcpio_hooks ARQUIVO...   (o mkinitcpio.conf e depois os .conf de mkinitcpio.conf.d)
+mkinitcpio_hooks() {
+    (( $# )) || { echo ""; return 0; }
+    awk '
+        function take(s,   end) {
+            end = index(s, ")")
+            if (end) { s = substr(s, 1, end - 1); grab = 0 }
+            gsub(/["\047]/, " ", s)
+            hooks = hooks " " s
+        }
+        { line = $0; sub(/#.*/, "", line) }
+        grab { take(line); next }
+        line ~ /^[[:space:]]*HOOKS\+?=\(/ {
+            if (line !~ /^[[:space:]]*HOOKS\+=/) hooks = ""
+            sub(/^[^(]*\(/, "", line); grab = 1; take(line)
+        }
+        END {
+            n = split(hooks, w, /[[:space:]]+/); out = ""
+            for (i = 1; i <= n; i++) if (w[i] != "") out = out (out == "" ? "" : " ") w[i]
+            print out
+        }' "$@" 2>/dev/null || true
+}
+
+# como este sistema volta de uma hibernação para o swapfile: systemd | cmdline | none
+#   systemd  initramfs com o hook "systemd" num boot EFI, sem resume= na linha do kernel: o systemd
+#            guarda onde está a imagem (com o offset do arquivo) numa variável EFI e o initramfs lê
+#   cmdline  resume= e resume_offset= na linha do kernel + um initramfs que os lê (hook "resume"
+#            ou "systemd" do mkinitcpio, dracut ou booster). O offset é o de UM arquivo: um
+#            swapfile novo fica em outro lugar do disco (isso o decide_setup leva em conta)
+#   none     nada disso (ou noresume): a imagem nunca seria lida e a sessão se perderia
+# uso: resume_mode GERADOR HOOKS CMDLINE EFI(0/1)    GERADOR = mkinitcpio | dracut | booster | unknown
+resume_mode() {
+    local gen=$1 hooks=" $2 " efi=$4 has_resume=0 has_offset=0 w words=()
+    read -r -a words <<< "$3" || true
+    for w in "${words[@]}"; do
+        case $w in
+            noresume) echo none; return 0 ;;
+            resume=?*) has_resume=1 ;;
+            resume_offset=[0-9]*) has_offset=1 ;;
+        esac
+    done
+    if [[ $gen == mkinitcpio && $hooks == *" systemd "* ]]; then
+        if (( has_resume )); then
+            (( has_offset )) && echo cmdline || echo none
+        elif (( efi )); then
+            echo systemd
+        else
+            echo none
+        fi
+        return 0
+    fi
+    if (( has_resume && has_offset )); then
+        if [[ $gen == mkinitcpio && $hooks == *" resume "* ]] || [[ $gen == dracut || $gen == booster ]]; then
+            echo cmdline; return 0
+        fi
+    fi
+    echo none
+}
+
+# o arquivo que bloqueia a hibernação (o texto é sempre este; a 1ª linha marca que é nosso)
+sleep_conf_text() {
+    printf '%s\n' "$SLEEP_MARK" \
+        "# O swapfile do SSD deixaria o systemd hibernar, mas o initramfs deste sistema não volta" \
+        "# da imagem: hibernar perderia a sessão inteira (e gravaria a RAM toda no disco)." \
+        "# Para usar a hibernação: configure o resume (hook \"systemd\" do mkinitcpio, ou" \
+        "# resume= e resume_offset= na linha do kernel) e então apague este arquivo." \
+        "[Sleep]" \
+        "AllowHibernation=no" \
+        "AllowSuspendThenHibernate=no" \
+        "AllowHybridSleep=no"
+}
+
+# estado do arquivo de bloqueio: missing | same (o nosso, igual) | ours (o nosso, outra versão) | foreign
+sleep_conf_state() {
+    local f=$1
+    if [[ ! -e $f && ! -L $f ]]; then echo missing
+    elif [[ -L $f || ! -f $f ]] || ! grep -qxF -- "$SLEEP_MARK" "$f" 2>/dev/null; then echo foreign
+    elif cmp -s -- "$f" <(sleep_conf_text); then echo same
+    else echo ours; fi
+}
+
+# 0 se, depois de ocupar NEED bytes, sobram pelo menos PCT% de TOTAL livres
+# uso: space_ok AVAIL TOTAL NEED PCT
+space_ok() {
+    local after=$(( $1 - $3 ))
+    (( after >= 0 && after * 100 >= $2 * $4 ))
+}
+
+# 0 se o que está na swap do SSD cabe de volta na RAM e ainda sobra a folga (swapoff_reserve_kib)
+# uso: swapoff_safe USADO_KIB MEMAVAILABLE_KIB RESERVA_KIB
+swapoff_safe() {
+    (( $1 + $3 <= $2 ))
+}
+
+# perfis de dados do btrfs a partir de /sys/fs/btrfs/UUID/allocation/data: single | multi | unknown
+btrfs_data_profile() {
+    local d=$1 p found=()
+    [[ -d $d ]] || { echo unknown; return; }
+    for p in single dup raid0 raid1 raid10 raid5 raid6 raid1c3 raid1c4; do
+        [[ -d $d/$p ]] && found+=("$p")
+    done
+    if (( ${#found[@]} == 1 )) && [[ ${found[0]} == single ]]; then echo single
+    elif (( ${#found[@]} == 0 )); then echo unknown
+    else echo multi; fi
+}
+
+# 0 se o tamanho do arquivo bate com o pedido (tolerância de 1 MB)
+size_matches() {
+    local diff=$(( $1 - $2 ))
+    (( diff < 0 )) && diff=$(( -diff ))
+    (( diff <= 1048576 ))
+}
+
+# ---------- decisões (funções puras sobre as variáveis F_*; resultado em P_*, REFUSE, REASON) ----------
+#
+# F_FSTYPE      sistema de arquivos onde o arquivo vai morar (btrfs, ext4, xfs, ...)
+# F_DEVS        número de discos do btrfs (ou unknown)      F_PROFILE single|multi|unknown
+# F_SWAPDIR     missing | subvol | dir | mount | symlink | other
+# F_SWAPDIR_SAFE 1 se o /swap é de root e só o dono escreve nele (ou não existe); 0
+# F_EXTRA       1 se /swap tem outras coisas além do swapfile e do marcador; 0; unknown
+# F_MARKER      subvol | dir | file | adopted | none | unknown   (o que o aero-swap-setup criou/adotou)
+# F_FILE        missing | regular | other | unknown
+# F_FILE_BYTES  tamanho do arquivo     F_FILE_GOOD 1|0|unknown (assinatura de swap + sem CoW)
+# F_FILE_PERM   1 (0600 root) | 0 | unknown
+# F_ACTIVE      1 se o nosso swapfile está ligado     F_USED_KIB  F_ACTIVE_PRIO
+# F_FOREIGN     outras swaps de disco ligadas (separadas por espaço; vazio = nenhuma)
+# F_FSTAB       none | exact | other
+# F_AVAIL F_TOTAL  bytes livres / total do sistema de arquivos
+# F_MEMAVAIL_KIB F_MEMTOTAL_KIB  do /proc/meminfo     F_WARN_PCT  warn_available do vigia
+# F_RESUME      systemd | cmdline | none (resume_mode)     F_SLEEP  missing | same | ours | foreign
+# WANT_BYTES    tamanho pedido em bytes     SIZE_SET  1 se o --size foi dado
+
+reset_plan() {
+    P_CONVERT=0 P_MKSUBVOL=0 P_MKDIR=0 P_MARKER=0 P_ADOPT=0 P_SWAPOFF=0 P_RMFILE=0 P_CREATE=0
+    P_FIXPERM=0 P_REPRIO=0 P_SWAPON=0 P_FSTAB=0 P_CHECK=0 P_NOHIB=0
+    P_FSTAB_RM=0 P_FSTAB_RESTORE=0 P_RMMARKER=0 P_RMSUBVOL=0 P_RMDIR=0 P_NOHIB_RM=0
+    REFUSE=0 REASON="" NOTES=() RESUME_OK=0
+}
+
+refuse() { REFUSE=$1; REASON=$2; }
+
+reserve_kib() { swapoff_reserve_kib "${F_MEMTOTAL_KIB:-0}" "${F_WARN_PCT:-$WARN_PCT_DEFAULT}"; }
+
+busy_reason() {
+    refuse 6 "the SSD swap holds $(fmt_kib "$F_USED_KIB") right now; taking that back into RAM would leave less than $(fmt_kib "$(reserve_kib)") free ($(fmt_kib "$F_MEMAVAIL_KIB") available), and the memory guard would start closing apps. Close some apps and try again, or reboot first."
+}
+
+unsafe_dir_reason() {
+    refuse 4 "$SWAP_DIR must be owned by root and not writable by others; Aero won't put swap there. Fix it with: chown root:root $SWAP_DIR && chmod 700 $SWAP_DIR"
+}
+
+# hibernação: com o swapfile ligado o systemd passa a aceitar hibernar. Sem um initramfs que volte
+# da imagem a sessão inteira se perderia, então o arquivo de bloqueio entra — a não ser que o
+# resume esteja configurado. Depois de escrito, o bloqueio só sai com --remove (ou à mão): um
+# resume_offset= na linha do kernel que apontava para um arquivo antigo não volta a valer sozinho.
+decide_hibernation() {
+    RESUME_OK=0
+    if [[ $F_RESUME == systemd ]]; then
+        RESUME_OK=1
+    elif [[ $F_RESUME == cmdline ]] && (( ! P_CREATE )); then
+        RESUME_OK=1
+    fi
+    case $F_SLEEP in
+        ours) P_NOHIB=1 ;;
+        same)
+            (( RESUME_OK )) && NOTES+=("Hibernation is off ($SLEEP_CONF). This system looks able to resume from the swap file; if hibernating works for you, delete that file to turn it back on.") ;;
+        missing)
+            if (( RESUME_OK )); then
+                if [[ $F_RESUME == systemd ]]; then
+                    NOTES+=("Hibernation stays possible: the initramfs uses systemd, which finds the hibernation image in the swap file by itself.")
+                else
+                    NOTES+=("Hibernation stays possible: the kernel command line has resume= and resume_offset= for the swap file.")
+                fi
+            else
+                P_NOHIB=1
+            fi ;;
+        foreign)
+            (( RESUME_OK )) || NOTES+=("$SLEEP_CONF exists but is not Aero's, so it is left as it is. This system can't resume from the swap file: hibernation must stay off there, or a hibernated session would be lost.") ;;
+    esac
+    if [[ $F_RESUME == cmdline ]] && (( P_CREATE )); then
+        NOTES+=("The kernel command line has resume_offset=, but a new swap file sits elsewhere on the disk, so hibernation stays off. Update resume_offset= for the new file, then delete $SLEEP_CONF.")
+    fi
+    return 0
+}
+
+decide_setup() {
+    reset_plan
+    local method
+    case $F_FSTYPE in
+        btrfs) method=btrfs ;;
+        ext4|xfs) method=plain ;;
+        *) refuse 4 "the file system at $SWAP_DIR is '${F_FSTYPE:-unknown}'; Aero can make a swap file only on btrfs, ext4 or xfs."; return ;;
+    esac
+    if [[ $method == btrfs ]]; then
+        if [[ $F_DEVS != unknown && $F_DEVS != 1 ]]; then
+            refuse 4 "this btrfs spans $F_DEVS disks; the kernel only allows a swap file on a single-disk btrfs."; return
+        fi
+        if [[ $F_PROFILE == multi ]]; then
+            refuse 4 "this btrfs stores data with a RAID/DUP profile; the kernel only allows a swap file with the 'single' data profile."; return
+        fi
+    fi
+    if [[ -n $F_FOREIGN ]]; then
+        refuse 4 "another disk swap is already on ($F_FOREIGN). Aero keeps a single SSD swap; turn that one off and remove it from /etc/fstab first, or keep using it."; return
+    fi
+
+    case $F_SWAPDIR in
+        symlink|other)
+            refuse 4 "$SWAP_DIR exists but is not a plain folder (it is a link or a file). Move it away first."; return ;;
+    esac
+    # root vai criar, apagar e mudar o dono de arquivos lá dentro: ninguém mais pode mexer na pasta
+    if [[ ${F_SWAPDIR_SAFE:-1} == 0 ]]; then unsafe_dir_reason; return; fi
+    case $F_SWAPDIR in
+        missing)
+            if [[ $method == btrfs ]]; then P_MKSUBVOL=1; else P_MKDIR=1; fi
+            P_MARKER=1 ;;
+        dir)
+            if [[ $method == btrfs ]]; then
+                # pasta comum no btrfs: o swapfile entraria nos snapshots do @ (e os bloquearia)
+                if [[ $F_EXTRA == 0 && $F_FILE == missing ]]; then
+                    P_CONVERT=1 P_MKSUBVOL=1 P_MARKER=1
+                elif [[ $F_EXTRA == unknown || $F_FILE == unknown ]]; then
+                    P_CHECK=1
+                else
+                    refuse 4 "$SWAP_DIR is a normal folder with files in it. On btrfs the swap file needs its own subvolume so snapshots skip it; move $SWAP_DIR away first."; return
+                fi
+            fi ;;
+        subvol|mount) ;;
+    esac
+    if [[ $F_EXTRA == 1 ]]; then
+        refuse 4 "$SWAP_DIR has other files in it that Aero didn't make; it won't touch them."; return
+    fi
+
+    case $F_FILE in
+        other)
+            refuse 4 "$SWAP_FILE exists but is not a regular file. Move it away first."; return ;;
+        missing)
+            P_CREATE=1
+            # a pasta já existia (ex.: um @swap vazio montado em /swap): o marcador diz que o
+            # arquivo é do Aero, senão o --remove o deixaria para trás
+            if [[ $F_MARKER == none ]] && (( ! P_MARKER )); then P_MARKER=1; fi ;;
+        unknown)
+            P_CHECK=1 ;;
+        regular)
+            local foreign_file=0
+            # um swapfile que já existia antes do Aero (ex.: feito à mão como na ArchWiki)
+            [[ $F_MARKER == none || $F_MARKER == adopted ]] && foreign_file=1
+            if (( foreign_file )) && [[ $F_FILE_GOOD == 0 ]]; then
+                refuse 4 "$SWAP_FILE was not made by Aero and is not a working swap file; Aero won't delete it. Move it away first."; return
+            fi
+            [[ $F_MARKER == none ]] && P_ADOPT=1
+            if [[ $F_FILE_GOOD == 0 ]] || ! size_matches "$F_FILE_BYTES" "$WANT_BYTES"; then
+                if (( foreign_file )); then
+                    if (( ! ${SIZE_SET:-0} )); then
+                        refuse 4 "$SWAP_FILE was there before Aero ($(fmt_bytes "$F_FILE_BYTES")), so Aero keeps it as it is. To replace it with a new $(fmt_bytes "$WANT_BYTES") one, run again with --size $SIZE (the new file sits elsewhere on the disk, so a resume_offset= for hibernation would need updating)."
+                        return
+                    fi
+                    NOTES+=("$SWAP_FILE was there before Aero; the new one sits elsewhere on the disk, so a resume_offset= for hibernation needs updating.")
+                fi
+                P_RMFILE=1 P_CREATE=1
+                (( F_ACTIVE )) && P_SWAPOFF=1
+            elif [[ $F_FILE_PERM == 0 ]]; then
+                P_FIXPERM=1
+            elif [[ $F_FILE_PERM == unknown ]]; then
+                NOTES+=("As a normal user this can't see inside $SWAP_DIR; with --apply, root also makes sure only root can read $SWAP_FILE.")
+            fi ;;
+    esac
+
+    if (( P_CREATE )); then
+        if (( F_TOTAL <= 0 )); then
+            refuse 1 "could not measure the free space on the disk (df failed)."; return
+        fi
+        local freed=0
+        (( P_RMFILE )) && freed=$F_FILE_BYTES
+        if ! space_ok $(( F_AVAIL + freed )) "$F_TOTAL" "$WANT_BYTES" "$MIN_FREE_PCT"; then
+            refuse 5 "not enough free space: a $(fmt_bytes "$WANT_BYTES") swap file would leave less than $MIN_FREE_PCT% of the disk free ($(fmt_bytes $(( F_AVAIL + freed ))) free of $(fmt_bytes "$F_TOTAL") now). Try a smaller --size."
+            return
+        fi
+    fi
+
+    local reserve
+    reserve=$(reserve_kib)
+    if (( P_SWAPOFF )) && ! swapoff_safe "$F_USED_KIB" "$F_MEMAVAIL_KIB" "$reserve"; then
+        busy_reason
+        return
+    fi
+
+    if (( ! F_ACTIVE || P_SWAPOFF )); then
+        P_SWAPON=1
+    elif [[ $F_ACTIVE_PRIO != "$PRIO" ]]; then
+        if swapoff_safe "$F_USED_KIB" "$F_MEMAVAIL_KIB" "$reserve"; then
+            P_REPRIO=1
+        else
+            NOTES+=("The SSD swap has priority $F_ACTIVE_PRIO now; it becomes $PRIO after the next reboot.")
+        fi
+    fi
+    [[ $F_FSTAB != exact ]] && P_FSTAB=1
+    decide_hibernation
+    return 0
+}
+
+# o bloqueio da hibernação é do Aero e sai junto com o swap do Aero. Fica se um swap de disco
+# continua ligado depois (o adotado, um que não é do Aero, outro swap) e o boot não sabe voltar
+# dele: apagar o bloqueio aí faria o systemd voltar a hibernar para onde a sessão se perde.
+# uso: remove_sleep_block FICA(0/1)
+remove_sleep_block() {
+    [[ $F_SLEEP == same || $F_SLEEP == ours ]] || return 0
+    if (( $1 )) && [[ $F_RESUME == none ]]; then
+        NOTES+=("Hibernation stays off ($SLEEP_CONF): a disk swap stays on and this system can't resume from it. Delete that file once resume is set up.")
+    else
+        P_NOHIB_RM=1
+    fi
+    return 0
+}
+
+decide_remove() {
+    reset_plan
+    local others=0
+    [[ -n $F_FOREIGN ]] && others=1
+    case $F_SWAPDIR in
+        symlink|other)
+            # não segue links: só tira a linha do fstab, se houver
+            [[ $F_FSTAB != none ]] && P_FSTAB_RM=1
+            NOTES+=("$SWAP_DIR is a link or a file, not Aero's folder; left as it is.")
+            remove_sleep_block $(( others || F_ACTIVE ))
+            return 0 ;;
+    esac
+    if [[ ${F_SWAPDIR_SAFE:-1} == 0 ]]; then unsafe_dir_reason; return; fi
+    case $F_MARKER in
+        adopted)
+            # o swapfile já existia antes do Aero: fica (e continua ligado); a linha antiga volta
+            P_FSTAB_RESTORE=1 P_RMMARKER=1
+            NOTES+=("$SWAP_FILE was there before Aero, so it stays (and stays on); its old line goes back into $FSTAB, and its old priority comes back after a reboot.")
+            remove_sleep_block 1
+            return 0 ;;
+        none)
+            if [[ $F_FILE != missing ]]; then
+                NOTES+=("$SWAP_FILE was not made by aero-swap-setup, so it stays, and so does its line in $FSTAB.")
+                remove_sleep_block 1
+                return 0
+            fi ;;
+    esac
+    if (( F_ACTIVE )); then
+        if ! swapoff_safe "$F_USED_KIB" "$F_MEMAVAIL_KIB" "$(reserve_kib)"; then
+            busy_reason
+            return
+        fi
+        P_SWAPOFF=1
+    fi
+    [[ $F_FSTAB != none ]] && P_FSTAB_RM=1
+    case $F_FILE in
+        regular) P_RMFILE=1 ;;
+        other) refuse 4 "$SWAP_FILE is not a regular file; Aero won't delete it."; return ;;
+        unknown) P_CHECK=1 ;;
+    esac
+    case $F_MARKER in
+        subvol|dir)
+            P_RMMARKER=1
+            if [[ $F_EXTRA == 0 ]]; then
+                if [[ $F_MARKER == subvol && $F_SWAPDIR == subvol ]]; then P_RMSUBVOL=1
+                elif [[ $F_MARKER == dir && $F_SWAPDIR == dir ]]; then P_RMDIR=1; fi
+            else
+                NOTES+=("$SWAP_DIR has other files in it; the folder stays.")
+            fi ;;
+        file)
+            P_RMMARKER=1
+            NOTES+=("$SWAP_DIR was there before Aero; the folder stays.") ;;
+        none)
+            [[ $F_SWAPDIR != missing ]] && NOTES+=("$SWAP_DIR was not made by aero-swap-setup; the folder stays.") ;;
+        unknown) P_CHECK=1 ;;
+    esac
+    remove_sleep_block "$others"
+    return 0
+}
+
+# sem --size, um swapfile que já existe (4..64 GB, tamanho redondo) fica do tamanho que está:
+# rodar de novo (ou o install.sh) nunca encolhe o que a pessoa escolheu no Settings
+adopt_current_size() {
+    (( SIZE_SET )) && return 0
+    [[ $F_FILE == regular && $F_FILE_GOOD != 0 ]] || return 0
+    local cur=$(( (F_FILE_BYTES + 536870912) / 1073741824 ))
+    if (( cur >= SIZE_MIN && cur <= SIZE_MAX )) && size_matches "$F_FILE_BYTES" $(( cur * 1073741824 )); then
+        SIZE=$cur
+        WANT_BYTES=$(( SIZE * 1073741824 ))
+    fi
+    return 0
+}
+
+plan_is_empty() {
+    (( P_CONVERT + P_MKSUBVOL + P_MKDIR + P_MARKER + P_ADOPT + P_SWAPOFF + P_RMFILE + P_CREATE + P_FIXPERM \
+       + P_REPRIO + P_SWAPON + P_FSTAB + P_FSTAB_RM + P_FSTAB_RESTORE + P_RMMARKER + P_RMSUBVOL + P_RMDIR \
+       + P_CHECK + P_NOHIB + P_NOHIB_RM == 0 ))
+}
+
+# ---------- leitura do sistema (só leitura; funciona sem root, com menos detalhes) ----------
+
+swap_fact_lines() { parse_swaps /proc/swaps; }
+
+inspect() {
+    local target name type size used prio
+    F_FOREIGN="" F_ACTIVE=0 F_USED_KIB=0 F_ACTIVE_PRIO="" F_ACTIVE_KIB=0 F_ZRAM=0 F_ZRAM_PRIO=""
+    while read -r name type size used prio; do
+        if is_zram "$name"; then
+            F_ZRAM=1; F_ZRAM_PRIO=$prio
+        elif [[ $name == "$SWAP_FILE" ]]; then
+            F_ACTIVE=1 F_ACTIVE_KIB=$size F_USED_KIB=$used F_ACTIVE_PRIO=$prio
+        else
+            F_FOREIGN+="${F_FOREIGN:+ }$name"
+        fi
+    done < <(swap_fact_lines)
+
+    if [[ -L $SWAP_DIR ]]; then F_SWAPDIR=symlink
+    elif [[ ! -e $SWAP_DIR ]]; then F_SWAPDIR=missing
+    elif [[ ! -d $SWAP_DIR ]]; then F_SWAPDIR=other
+    elif findmnt -n --mountpoint "$SWAP_DIR" >/dev/null 2>&1; then F_SWAPDIR=mount
+    elif [[ $(stat -f -c %T "$SWAP_DIR") == btrfs && $(stat -c %i "$SWAP_DIR") == 256 ]]; then F_SWAPDIR=subvol
+    else F_SWAPDIR=dir; fi
+    F_SWAPDIR_SAFE=1
+    if [[ $F_SWAPDIR == subvol || $F_SWAPDIR == dir || $F_SWAPDIR == mount ]]; then
+        dir_is_safe "$(stat -c '%u %a' -- "$SWAP_DIR" 2>/dev/null || true)" || F_SWAPDIR_SAFE=0
+    fi
+
+    # onde o arquivo vai morar: o próprio /swap, se for uma pasta de verdade; senão o /
+    target=/
+    [[ $F_SWAPDIR == subvol || $F_SWAPDIR == dir || $F_SWAPDIR == mount ]] && target=$SWAP_DIR
+    F_FSTYPE=$(findmnt -n -o FSTYPE -T "$target" 2>/dev/null || true)
+    read -r F_TOTAL F_AVAIL < <(df -B1 --output=size,avail -- "$target" 2>/dev/null | awk 'NR == 2 { print $1, $2 }') || true
+    F_TOTAL=${F_TOTAL:-0} F_AVAIL=${F_AVAIL:-0}
+    F_SOURCE=$(findmnt -n -o SOURCE -T "$target" 2>/dev/null | sed 's/\[.*//' || true)
+
+    F_DEVS=unknown F_PROFILE=unknown
+    if [[ $F_FSTYPE == btrfs ]]; then
+        local uuid
+        uuid=$(findmnt -n -o UUID -T "$target" 2>/dev/null || true)
+        if [[ $uuid =~ ^[0-9a-fA-F-]{36}$ && -d /sys/fs/btrfs/$uuid ]]; then
+            F_DEVS=$(find "/sys/fs/btrfs/$uuid/devices" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l || true)
+            (( F_DEVS > 0 )) || F_DEVS=unknown
+            F_PROFILE=$(btrfs_data_profile "/sys/fs/btrfs/$uuid/allocation/data")
+        fi
+    fi
+
+    F_MEMAVAIL_KIB=$(meminfo_kib /proc/meminfo MemAvailable)
+    F_MEMAVAIL_KIB=${F_MEMAVAIL_KIB:-0}
+    F_MEMTOTAL_KIB=$(meminfo_kib /proc/meminfo MemTotal)
+    F_MEMTOTAL_KIB=${F_MEMTOTAL_KIB:-0}
+    F_WARN_PCT=$(guard_warn_pct "$GUARD_CONF")
+    F_FSTAB=none
+    [[ -f $FSTAB && -r $FSTAB ]] && F_FSTAB=$(fstab_state "$FSTAB")
+
+    # hibernação: que initramfs é este e se ele volta de uma imagem no swapfile
+    local gen=unknown hooks="" cmdline="" efi=0 f confs=()
+    if [[ -f $MKINITCPIO_CONF ]]; then
+        gen=mkinitcpio confs=("$MKINITCPIO_CONF")
+        for f in "$MKINITCPIO_DIR"/*.conf; do [[ -f $f ]] && confs+=("$f"); done
+        hooks=$(mkinitcpio_hooks "${confs[@]}")
+    elif [[ -x /usr/bin/dracut ]]; then gen=dracut
+    elif [[ -x /usr/bin/booster ]]; then gen=booster
+    fi
+    [[ -r /proc/cmdline ]] && cmdline=$(< /proc/cmdline)
+    [[ -d /sys/firmware/efi ]] && efi=1
+    F_RESUME=$(resume_mode "$gen" "$hooks" "$cmdline" "$efi")
+    F_SLEEP=$(sleep_conf_state "$SLEEP_CONF")
+
+    # dentro do /swap (0700 root): só root enxerga; sem root, o que dá para saber vem do /proc/swaps
+    F_FILE=missing F_FILE_BYTES=0 F_FILE_GOOD=unknown F_FILE_PERM=unknown F_EXTRA=0 F_MARKER=none
+    if [[ $F_SWAPDIR == missing || $F_SWAPDIR == symlink || $F_SWAPDIR == other ]]; then
+        :
+    elif [[ ! -x $SWAP_DIR || ! -r $SWAP_DIR ]]; then
+        F_EXTRA=unknown F_MARKER=unknown F_FILE=unknown
+        if (( F_ACTIVE )); then
+            F_FILE=regular F_FILE_GOOD=1 F_FILE_BYTES=$(( F_ACTIVE_KIB * 1024 + PAGE ))
+        fi
+    else
+        if [[ -n $(find "$SWAP_DIR" -mindepth 1 -maxdepth 1 ! -name swapfile ! -name .aero-swap-setup -print -quit 2>/dev/null) ]]; then
+            F_EXTRA=1
+        fi
+        F_MARKER=$(marker_kind "$MARKER")
+        if [[ -L $SWAP_FILE ]]; then F_FILE=other
+        elif [[ -f $SWAP_FILE ]]; then
+            F_FILE=regular
+            F_FILE_BYTES=$(stat -c %s "$SWAP_FILE")
+            [[ $(stat -c '%a %u %g' "$SWAP_FILE") == "600 0 0" ]] && F_FILE_PERM=1 || F_FILE_PERM=0
+            F_FILE_GOOD=$(file_is_good_swap "$SWAP_FILE")
+        elif [[ -e $SWAP_FILE ]]; then F_FILE=other
+        fi
+    fi
+    WANT_BYTES=$(( SIZE * 1073741824 ))
+}
+
+# 1 se o arquivo tem a assinatura de swap (e, no btrfs, não tem copy-on-write); 0 se não; unknown
+# (sem permissão para ler, ou sem o lsattr do e2fsprogs para ver o +C: aí o swapon decide, porque
+# o kernel recusa um swapfile com copy-on-write no btrfs)
+file_is_good_swap() {
+    local f=$1 sig attrs
+    [[ -r $f ]] || { echo unknown; return; }
+    sig=$(head -c "$PAGE" -- "$f" 2>/dev/null | tail -c 10 || true)
+    [[ $sig == SWAPSPACE2 ]] || { echo 0; return; }
+    if [[ $F_FSTYPE == btrfs ]]; then
+        type -P lsattr >/dev/null || { echo unknown; return; }
+        attrs=$(lsattr -- "$f" 2>/dev/null | awk '{ print $1 }' || true)
+        [[ $attrs == *C* ]] || { echo 0; return; }
+    fi
+    echo 1
+}
+
+disk_is_encrypted() {
+    [[ -n ${F_SOURCE:-} && -b $F_SOURCE ]] || return 1
+    lsblk -n -s -o TYPE -- "$F_SOURCE" 2>/dev/null | grep -qx crypt
+}
+
+# ---------- saída ----------
+
+print_tiers() {
+    local lines name type size used prio label
+    lines=$(swap_fact_lines | sort -k5,5nr)
+    say "Swap tiers (used in this order):"
+    if [[ -z $lines ]]; then
+        say "  (no swap is on)"
+    else
+        while read -r name type size used prio; do
+            if is_zram "$name"; then label="Compressed RAM · fast"
+            elif [[ $name == "$SWAP_FILE" ]]; then label="SSD · for things not used in a while"
+            else label="Disk swap · not Aero's"; fi
+            printf '  priority %-6s %-38s %-16s %s of %s used\n' "$prio" "$label" "$name" "$(fmt_kib "$used")" "$(fmt_kib "$size")"
+        done <<< "$lines"
+    fi
+}
+
+tier_warnings() {
+    if (( ! F_ZRAM )); then
+        warn "no compressed RAM swap (zram) is on. Install zram-generator and system/memory/zram-generator.conf first, or the SSD would be the only swap."
+    elif [[ $F_ZRAM_PRIO =~ ^-?[0-9]+$ ]] && (( F_ZRAM_PRIO <= PRIO )); then
+        warn "the compressed RAM swap has priority $F_ZRAM_PRIO; it should be higher than the SSD's ($PRIO) so it is used first."
+    fi
+}
+
+print_plan() {
+    local n=0
+    step() { n=$(( n + 1 )); say "  $n. $*"; }
+    (( P_CHECK )) && step "Check what is inside $SWAP_DIR (needs root; the real run decides from what it finds)"
+    (( P_NOHIB )) && step "Keep hibernation off ($SLEEP_CONF): this system can't resume from the swap file, so hibernating would lose the open session"
+    (( P_SWAPOFF )) && step "Turn off the SSD swap (its $(fmt_kib "$F_USED_KIB") move back to RAM)"
+    (( P_CONVERT )) && step "Remove the empty normal folder $SWAP_DIR"
+    (( P_MKSUBVOL )) && step "Create the btrfs subvolume $SWAP_DIR (snapshots of / will skip it)"
+    (( P_MKDIR )) && step "Create the folder $SWAP_DIR (only root can open it)"
+    (( P_ADOPT )) && step "Note in $MARKER that $SWAP_FILE was there before Aero (--remove then keeps it and puts its old $FSTAB line back)"
+    (( P_RMFILE && P_CREATE )) && step "Delete the old swap file $SWAP_FILE ($(fmt_bytes "$F_FILE_BYTES"))"
+    (( P_CREATE )) && step "Create a $(fmt_bytes "$WANT_BYTES") swap file $SWAP_FILE ($( [[ $F_FSTYPE == btrfs ]] && echo 'no copy-on-write, no compression' || echo 'preallocated'), only root can read it)"
+    (( P_FIXPERM )) && step "Make $SWAP_FILE readable by root only (mode 600)"
+    (( P_REPRIO )) && step "Turn the SSD swap off and on again with priority $PRIO"
+    (( P_SWAPON )) && step "Turn it on with priority $PRIO (used only after compressed RAM) and discard (freed space is trimmed on the SSD)"
+    (( P_FSTAB )) && step "Write one line to $FSTAB (after a backup): $FSTAB_LINE"
+    (( P_FSTAB_RM )) && step "Remove the swap line from $FSTAB (after a backup)"
+    (( P_FSTAB_RESTORE )) && step "Put the old $FSTAB line for $SWAP_FILE back in place of Aero's (after a backup)"
+    (( P_RMFILE && ! P_CREATE )) && step "Delete the swap file $SWAP_FILE"
+    (( P_RMMARKER )) && step "Delete $MARKER"
+    (( P_RMSUBVOL )) && step "Delete the btrfs subvolume $SWAP_DIR"
+    (( P_RMDIR )) && step "Delete the folder $SWAP_DIR"
+    (( P_NOHIB_RM )) && step "Delete Aero's hibernation block $SLEEP_CONF"
+    return 0
+}
+
+# ---------- execução (só com --apply, como root) ----------
+
+APPLY=0
+CREATED_FILE=0
+TMP_FSTAB=""
+TMP_SLEEP=""
+
+# imprime e executa; se falhar, para tudo com código 1 (o código do próprio comando, ex.: o 4 do
+# swapon, se confundiria com os nossos)
+run() {
+    printf '  + %s\n' "$*"
+    "$@" && return 0
+    err "this failed (exit $?): $*"
+    exit 1
+}
+
+cleanup() {
+    local rc=$?
+    [[ -n $TMP_FSTAB && -e $TMP_FSTAB ]] && rm -f -- "$TMP_FSTAB"
+    [[ -n $TMP_SLEEP && -e $TMP_SLEEP ]] && rm -f -- "$TMP_SLEEP"
+    # um arquivo criado agora que não chegou a ser ligado não fica para trás
+    if (( rc != 0 && CREATED_FILE )) && ! swap_fact_lines | awk -v f="$SWAP_FILE" '$1 == f { found = 1 } END { exit !found }'; then
+        rm -f -- "$SWAP_FILE"
+        err "undid: removed the half-made $SWAP_FILE"
+    fi
+    return "$rc"
+}
+
+# a limpeza também com Ctrl+C, SIGTERM e SIGHUP. Sem os traps dos sinais o bash roda o EXIT com
+# $?=0 (testado no bash 5.3) e um swapfile pela metade ficaria no disco. Com eles, o bash espera o
+# comando da vez terminar (um sinal mandado para o grupo todo também interrompe o swapoff, e o
+# kernel devolve a swap como estava) e sai com 128+sinal.
+set_traps() {
+    trap cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+# grava o fstab novo: arquivo temporário na mesma pasta, conferido com findmnt --verify,
+# backup do antigo, troca atômica (mv) — nunca fica um fstab pela metade.
+# Qualquer problema PARA o script (exit 1): chame direto, nunca em "if"/"||" (o bash desliga o
+# set -e dentro de funções chamadas assim).
+write_fstab() {
+    local gen=$1 stamp backup errs_old errs_new
+    if [[ -L $FSTAB || ! -f $FSTAB ]]; then
+        err "$FSTAB is missing or is a link; change this line by hand: $FSTAB_LINE"
+        exit 1
+    fi
+    TMP_FSTAB=$(mktemp "${FSTAB%/*}/.fstab.aero-swap.XXXXXX") || { err "could not make a temporary file next to $FSTAB"; exit 1; }
+    "$gen" "$FSTAB" > "$TMP_FSTAB" || { err "could not write the new $FSTAB"; exit 1; }
+    if cmp -s -- "$TMP_FSTAB" "$FSTAB"; then
+        rm -f -- "$TMP_FSTAB"; TMP_FSTAB=""
+        say "  $FSTAB already right"
+        return 0
+    fi
+    run chmod --reference="$FSTAB" -- "$TMP_FSTAB"
+    run chown --reference="$FSTAB" -- "$TMP_FSTAB"
+    errs_old=$(findmnt --verify --tab-file "$FSTAB" 2>&1 | grep -c '\[E\]' || true)
+    errs_new=$(findmnt --verify --tab-file "$TMP_FSTAB" 2>&1 | grep -c '\[E\]' || true)
+    if (( errs_new > errs_old )); then
+        err "the new $FSTAB would not pass 'findmnt --verify'; it was NOT changed:"
+        findmnt --verify --tab-file "$TMP_FSTAB" 2>&1 | grep '\[E\]' >&2 || true
+        exit 1
+    fi
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="$FSTAB.bak-aero-$stamp"
+    [[ -e $backup ]] && backup="$backup-$$"
+    run cp -a -- "$FSTAB" "$backup"
+    run sync -- "$TMP_FSTAB"
+    run mv -f -- "$TMP_FSTAB" "$FSTAB"
+    TMP_FSTAB=""
+    # o systemd gera as units de swap a partir do fstab
+    if (( EUID == 0 )) && [[ -d /run/systemd/system ]]; then
+        run systemctl daemon-reload
+    fi
+}
+
+swap_is_on() {
+    swap_fact_lines | awk -v f="$SWAP_FILE" -v p="$1" '$1 == f && (p == "" || $5 == p) { found = 1 } END { exit !found }'
+}
+
+# grava o bloqueio da hibernação: temporário na mesma pasta + mv (o logind nunca lê pela metade).
+# Como o write_fstab: qualquer problema PARA o script; chame direto, nunca em "if"/"||".
+write_sleep_conf() {
+    [[ -d $SLEEP_DIR ]] || run install -d -m 755 -- "$SLEEP_DIR"
+    TMP_SLEEP=$(mktemp "$SLEEP_DIR/.aero-swap.XXXXXX") || { err "could not make a temporary file in $SLEEP_DIR"; exit 1; }
+    sleep_conf_text > "$TMP_SLEEP" || { err "could not write $SLEEP_CONF"; exit 1; }
+    run chmod 644 -- "$TMP_SLEEP"
+    run mv -fT -- "$TMP_SLEEP" "$SLEEP_CONF"
+    TMP_SLEEP=""
+    say "  + wrote $SLEEP_CONF (hibernation off)"
+}
+
+# marcador de um swapfile adotado: adopted=1 + as linhas do fstab de antes, como estavam
+# (o /swap é 0700 root e o marcador 0600: só root lê)
+write_adopt_marker() {
+    not_a_link "$MARKER"
+    ( umask 077
+      { printf '%s\n' "# Made by aero-swap-setup. $SWAP_FILE was here before Aero: --remove keeps it" \
+            "# and puts these $FSTAB lines for it back." "adopted=1"
+        fstab_lines_for_file "$FSTAB" | sed 's/^/fstab=/'
+      } > "$MARKER" ) || { err "could not write $MARKER"; exit 1; }
+    say "  + wrote $MARKER (keeps $SWAP_FILE and its old $FSTAB line for --remove)"
+}
+
+# para tudo se o caminho virou um link (os comandos abaixo seguiriam o link como root)
+not_a_link() {
+    if [[ -L $1 ]]; then
+        err "$1 is a link now; stopping without touching it"; exit 1
+    fi
+}
+
+# para tudo (exit 1) se o swapfile recém-criado não é um arquivo comum do tamanho pedido, com a
+# assinatura de swap (e sem copy-on-write no btrfs, quando dá para ver). Chame direto, nunca em
+# "if"/"||".
+check_new_file() {
+    local f=$1 bytes good
+    not_a_link "$f"
+    if [[ ! -f $f ]]; then
+        err "$f was not created"; exit 1
+    fi
+    bytes=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
+    good=$(file_is_good_swap "$f")
+    if [[ $good == 0 ]] || ! size_matches "$bytes" "$WANT_BYTES"; then
+        err "the new $f is not a usable swap file ($(fmt_bytes "$bytes"), wanted $(fmt_bytes "$WANT_BYTES"))"
+        exit 1
+    fi
+}
+
+# o que o systemd-logind responde para "dá para hibernar?" (yes | no | na | challenge), ou nada
+can_hibernate() {
+    [[ -d /run/systemd/system ]] || return 0
+    timeout 10 busctl --timeout=5 call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanHibernate 2>/dev/null | awk '{ gsub(/"/, "", $2); print $2 }' || true
+}
+
+# depois do setup: o systemd não pode achar que hiberna para um arquivo de onde o boot não volta
+check_hibernation() {
+    (( RESUME_OK )) && return 0
+    [[ $(can_hibernate) == yes ]] || return 0
+    warn "systemd still allows hibernation, but this system can't resume from the swap file, so a hibernated session would be lost. Look for AllowHibernation= in /etc/systemd/sleep.conf and $SLEEP_DIR/."
+}
+
+apply_setup() {
+    say "==> Setting up the SSD swap"
+    if (( P_CHECK )); then
+        err "could not read $SWAP_DIR even as root"; exit 1
+    fi
+    # primeiro o bloqueio: em nenhum momento há um swapfile ligado com a hibernação liberada
+    (( P_NOHIB )) && write_sleep_conf
+    (( P_SWAPOFF )) && run swapoff -- "$SWAP_FILE"
+    (( P_CONVERT )) && run rmdir -- "$SWAP_DIR"
+    if (( P_MKSUBVOL )); then
+        run btrfs -q subvolume create -- "$SWAP_DIR"
+        run chmod 700 -- "$SWAP_DIR"
+    fi
+    (( P_MKDIR )) && run install -d -m 700 -o root -g root -- "$SWAP_DIR"
+    if (( P_MARKER )); then
+        # subvol/dir: o Aero criou a pasta agora; file: a pasta já existia, só o arquivo é do Aero
+        local kind=file
+        if (( P_MKSUBVOL )); then kind=subvol; elif (( P_MKDIR )); then kind=dir; fi
+        not_a_link "$MARKER"
+        ( umask 077; printf '# Made by aero-swap-setup; lets --remove know what it may delete.\ncreated=%s\n' "$kind" > "$MARKER" ) \
+            || { err "could not write $MARKER"; exit 1; }
+        say "  + wrote $MARKER"
+    fi
+    (( P_ADOPT )) && write_adopt_marker
+    (( P_RMFILE )) && run rm -f -- "$SWAP_FILE"
+    if (( P_CREATE )); then
+        CREATED_FILE=1
+        not_a_link "$SWAP_FILE"
+        if [[ $F_FSTYPE == btrfs ]]; then
+            run btrfs filesystem mkswapfile --size "${SIZE}g" -- "$SWAP_FILE"
+        else
+            ( umask 077; run fallocate -l "${SIZE}GiB" -- "$SWAP_FILE" )
+            not_a_link "$SWAP_FILE"
+            run mkswap -- "$SWAP_FILE"
+        fi
+        # confere o resultado: o btrfs-progs 7.1 sai com 0 mesmo quando não consegue tirar o
+        # copy-on-write (deixa um arquivo vazio); o trap apaga o arquivo ruim
+        check_new_file "$SWAP_FILE"
+        P_FIXPERM=1
+    fi
+    if (( P_FIXPERM )); then
+        run chown -h root:root -- "$SWAP_FILE"
+        not_a_link "$SWAP_FILE"
+        run chmod 600 -- "$SWAP_FILE"
+    fi
+    (( P_REPRIO )) && run swapoff -- "$SWAP_FILE"
+    if (( P_SWAPON || P_REPRIO )); then
+        run swapon --discard -p "$PRIO" -- "$SWAP_FILE"
+    fi
+    if ! swap_is_on "$PRIO"; then
+        err "$SWAP_FILE is not on with priority $PRIO after swapon"; exit 1
+    fi
+    CREATED_FILE=0
+    if (( P_FSTAB )); then
+        write_fstab fstab_with_ours
+    fi
+    say "==> Done"
+}
+
+apply_remove() {
+    say "==> Removing the SSD swap"
+    if (( P_CHECK )); then
+        err "could not read $SWAP_DIR even as root"; exit 1
+    fi
+    (( P_SWAPOFF )) && run swapoff -- "$SWAP_FILE"
+    if (( P_FSTAB_RM )); then
+        write_fstab fstab_without_ours
+    fi
+    # antes de apagar o marcador: é nele que estão as linhas antigas
+    if (( P_FSTAB_RESTORE )); then
+        write_fstab fstab_restore_original
+    fi
+    (( P_RMFILE )) && run rm -f -- "$SWAP_FILE"
+    (( P_RMMARKER )) && run rm -f -- "$MARKER"
+    (( P_RMSUBVOL )) && run btrfs -q subvolume delete -- "$SWAP_DIR"
+    (( P_RMDIR )) && run rmdir -- "$SWAP_DIR"
+    (( P_NOHIB_RM )) && run rm -f -- "$SLEEP_CONF"
+    say "==> Done"
+}
+
+usage() {
+    cat <<EOF
+Usage: aero-swap-setup [--dry-run | --apply] [--size N]
+       aero-swap-setup --remove [--dry-run | --apply]
+       aero-swap-setup --status
+
+Adds a low-priority swap file on the SSD ($SWAP_FILE, priority $PRIO) behind the
+compressed RAM swap (zram, priority 100). Without --apply it only shows what it would do.
+
+  --apply      do it (needs root)
+  --dry-run    only show the plan (the default)
+  --size N     swap file size in GB, $SIZE_MIN to $SIZE_MAX (default: keep the current
+               file's size, or $SIZE_DEFAULT for a new one)
+  --remove     undo everything (swapoff, the $FSTAB line, the file, the subvolume,
+               the hibernation block). A swap file that was there before Aero stays,
+               with its old $FSTAB line, and then hibernation stays off unless this
+               system can resume from it.
+  --status     show the swap tiers and exit
+
+If this system can't resume from the swap file, setup also turns hibernation off
+($SLEEP_CONF), so a hibernated session is never lost.
+
+Exit codes: 0 ok, 1 a command failed, 2 bad usage, 3 needs root, 4 refused (unsafe),
+5 not enough free space, 6 swap busy (not enough free RAM to turn it off).
+EOF
+}
+
+SIZE=$SIZE_DEFAULT
+SIZE_SET=0
+
+main() {
+    local mode=setup dry=0 size_set=0
+    while (( $# )); do
+        case $1 in
+            --apply) APPLY=1 ;;
+            --dry-run) dry=1 ;;
+            --remove) mode=remove ;;
+            --status) mode=status ;;
+            --size)
+                (( $# >= 2 )) || { err "--size needs a number"; exit 2; }
+                SIZE=$2; size_set=1; shift ;;
+            --size=*) SIZE=${1#--size=}; size_set=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) err "unknown option: $(printf '%q' "$1") (see --help)"; exit 2 ;;
+        esac
+        shift
+    done
+    (( dry )) && APPLY=0
+    if ! valid_size "$SIZE"; then
+        err "--size must be a whole number of GB from $SIZE_MIN to $SIZE_MAX"; exit 2
+    fi
+    if (( size_set )) && [[ $mode != setup ]]; then
+        err "--size only goes with setting up, not with --$mode"; exit 2
+    fi
+    if (( APPLY )) && [[ $mode == status ]]; then
+        err "--status only shows; it has nothing to apply"; exit 2
+    fi
+    if (( APPLY && EUID != 0 )); then
+        err "--apply changes the system and needs root. Run: sudo aero-swap-setup $( [[ $mode == remove ]] && echo '--remove ' )--apply$( (( size_set )) && echo " --size $SIZE" )"
+        exit 3
+    fi
+
+    if (( APPLY )); then
+        exec 9>>"$LOCK"
+        flock -n 9 || { err "another aero-swap-setup is running; try again in a moment"; exit 1; }
+        set_traps
+    fi
+
+    inspect
+    SIZE_SET=$size_set
+    [[ $mode == setup ]] && adopt_current_size
+
+    if [[ $mode == status ]]; then
+        print_tiers
+        tier_warnings
+        exit 0
+    fi
+
+    if [[ $mode == setup ]]; then decide_setup; else decide_remove; fi
+
+    if (( APPLY )); then say "Aero swap setup"; else say "Aero swap setup (dry run: nothing will change)"; fi
+    print_tiers
+    tier_warnings
+    say ""
+    if (( REFUSE )); then
+        err "$REASON"
+        exit "$REFUSE"
+    fi
+    local note
+    for note in "${NOTES[@]}"; do say "Note: $note"; done
+    if plan_is_empty; then
+        if [[ $mode == setup ]]; then
+            say "Nothing to do: the SSD swap is already set up ($(fmt_bytes "$WANT_BYTES"), priority $PRIO)."
+        else
+            say "Nothing to remove: there is no Aero SSD swap."
+        fi
+        exit 0
+    fi
+
+    say "Plan:"
+    print_plan
+    if [[ $mode == setup ]] && (( P_CREATE )); then
+        local freed=0
+        (( P_RMFILE )) && freed=$F_FILE_BYTES
+        local after=$(( F_AVAIL + freed - WANT_BYTES ))
+        (( F_TOTAL > 0 )) && say "Free space: $(fmt_bytes $(( F_AVAIL + freed ))) now, $(fmt_bytes "$after") after ($(( after * 100 / F_TOTAL ))% of the disk; Aero keeps at least $MIN_FREE_PCT%)."
+        if ! disk_is_encrypted; then
+            say "Privacy: this disk is not encrypted, so memory written to the SSD swap can be read from the disk until it is freed and trimmed. Compressed RAM never touches the disk.$( (( RESUME_OK )) && echo ' Hibernating writes all of RAM to the swap file too.')"
+        fi
+    fi
+
+    if (( ! APPLY )); then
+        say ""
+        if [[ $mode == setup ]]; then
+            say "To do it: sudo aero-swap-setup --apply$( (( size_set )) && echo " --size $SIZE" )"
+        else
+            say "To do it: sudo aero-swap-setup --remove --apply"
+        fi
+        exit 0
+    fi
+
+    say ""
+    if [[ $mode == setup ]]; then apply_setup; check_hibernation; else apply_remove; fi
+    say ""
+    print_tiers
+}
+
+# "source aero-swap-setup" (os testes) só carrega as funções
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
