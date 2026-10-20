@@ -4,7 +4,8 @@
 Some audio devices (mostly USB headsets) have a volume control of their own that misbehaves:
 below 100% it plays one side louder than the other, or it comes back at 0% after reconnecting.
 For devices in the list, Aero does the volume in software (PipeWire) and keeps the device's own
-volume pinned at 100%, so the system volume is always the real volume.
+volume pinned at 100%, so the system volume is always the real volume. Their own mic mute is undone
+too: on Aero the mic is muted only from the mic button (sound center or Settings → Sound).
 
   aero-audio list              devices with fixed volume
   aero-audio set CARD on|off   add or remove a card (its PipeWire name, alsa_card.…)
@@ -107,6 +108,26 @@ def playback_controls(card):
     return controls
 
 
+def capture_switches(card):
+    """Controls with a capture (microphone) on/off switch."""
+    r = run(["amixer", "-c", card])
+    out, name = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("Simple mixer control "):
+            name = line[len("Simple mixer control "):]
+        elif name and line.strip().startswith("Capabilities:") and "cswitch" in line:
+            out.append(name)
+            name = None
+    return out
+
+
+def unmute_mic(card):
+    """O botão do próprio fone pode mutar o microfone por dentro dele. No Aero, o microfone só
+    fica mudo pelo botão do microfone na central de som / Settings (isso é o PipeWire, não aqui)."""
+    for c in capture_switches(card):
+        run(["amixer", "-q", "-c", card, "sset", c, "cap"])
+
+
 def pin(card):
     for c in playback_controls(card):
         run(["amixer", "-q", "-c", card, "sset", c, "100%", "unmute"])
@@ -115,12 +136,15 @@ def pin(card):
 def watch(name, card, stop):
     """Pins the card now and again after every change to its playback volume; ends when the card goes."""
     pin(card)
+    unmute_mic(card)
     p = subprocess.Popen(["stdbuf", "-oL", "alsactl", "monitor", "hw:" + card], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     for line in p.stdout:
         if stop.is_set():
             break
         if "Playback Volume" in line or "Playback Switch" in line:
             pin(card)
+        elif "Capture Switch" in line:
+            unmute_mic(card)
     p.kill()
 
 
