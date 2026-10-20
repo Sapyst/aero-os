@@ -1,0 +1,11 @@
+[Unit]
+Description=Aero OS: keep fixed-volume audio devices at 100%
+After=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/aero-audio guard
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

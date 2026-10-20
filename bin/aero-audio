@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""aero-audio: Aero OS fixed device volume.
+
+Some audio devices (mostly USB headsets) have a volume control of their own that misbehaves:
+below 100% it plays one side louder than the other, or it comes back at 0% after reconnecting.
+For devices in the list, Aero does the volume in software (PipeWire) and keeps the device's own
+volume pinned at 100%, so the system volume is always the real volume.
+
+  aero-audio list              devices with fixed volume
+  aero-audio set CARD on|off   add or remove a card (its PipeWire name, alsa_card.…)
+  aero-audio apply             write the WirePlumber rule from the list and reload
+  aero-audio guard             keep listed devices at 100% (run by aero-audio-guard.service)
+
+The list lives in ~/.config/aero/fixed-volume.list, one card name per line.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+LIST = os.path.expanduser("~/.config/aero/fixed-volume.list")
+RULE = os.path.expanduser("~/.config/wireplumber/wireplumber.conf.d/51-aero-fixed-volume.conf")
+SERVICE = "aero-audio-guard.service"
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def listed():
+    try:
+        with open(LIST) as f:
+            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def save(names):
+    os.makedirs(os.path.dirname(LIST), exist_ok=True)
+    with open(LIST, "w") as f:
+        f.write("# Aero OS: devices whose own volume stays at 100% (volume done in software).\n")
+        f.write("".join(n + "\n" for n in sorted(set(names))))
+
+
+def write_rule(names):
+    os.makedirs(os.path.dirname(RULE), exist_ok=True)
+    if not names:
+        if os.path.exists(RULE):
+            os.remove(RULE)
+        return
+    matches = ", ".join('{ device.name = "%s" }' % n for n in names)
+    with open(RULE, "w") as f:
+        f.write("# Written by aero-audio from ~/.config/aero/fixed-volume.list. Don't edit by hand.\n")
+        f.write("# These devices get their volume in software; their own mixer is kept at 100%.\n")
+        f.write("monitor.alsa.rules = [\n  {\n    matches = [ %s ]\n" % matches)
+        f.write("    actions = { update-props = { api.alsa.soft-mixer = true } }\n  }\n]\n")
+
+
+def cards():
+    """PipeWire card name -> ALSA card number, for cards present now."""
+    r = run(["pactl", "-f", "json", "list", "cards"])
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for c in json.loads(r.stdout):
+        n = c.get("properties", {}).get("api.alsa.card")
+        if n is not None:
+            out[c["name"]] = str(n)
+    return out
+
+
+def playback_controls(card):
+    """Simple mixer controls of a card that have a playback volume or switch."""
+    r = run(["amixer", "-c", card])
+    controls, name = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("Simple mixer control "):
+            name = line[len("Simple mixer control "):]
+        elif name and line.strip().startswith("Capabilities:") and ("pvolume" in line or "pswitch" in line):
+            controls.append(name)
+            name = None
+    return controls
+
+
+def pin(card):
+    for c in playback_controls(card):
+        run(["amixer", "-q", "-c", card, "sset", c, "100%", "unmute"])
+
+
+def watch(name, card, stop):
+    """Pins the card now and again after every change to its playback volume; ends when the card goes."""
+    pin(card)
+    p = subprocess.Popen(["stdbuf", "-oL", "alsactl", "monitor", "hw:" + card], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    for line in p.stdout:
+        if stop.is_set():
+            break
+        if "Playback Volume" in line or "Playback Switch" in line:
+            pin(card)
+    p.kill()
+
+
+def guard():
+    running = {}  # card name -> (alsa number, thread, stop flag)
+    while True:
+        want = set(listed())
+        now = cards()
+        for name in want:
+            card = now.get(name)
+            t = running.get(name)
+            if card and (not t or not t[1].is_alive() or t[0] != card):
+                stop = threading.Event()
+                th = threading.Thread(target=watch, args=(name, card, stop), daemon=True)
+                th.start()
+                running[name] = (card, th, stop)
+        for name in list(running):
+            if name not in want:
+                running[name][2].set()
+                del running[name]
+        time.sleep(2)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+    elif args[0] == "list":
+        print("\n".join(listed()))
+    elif args[0] == "set" and len(args) == 3:
+        names = [n for n in listed() if n != args[1]]
+        if args[2] == "on":
+            names.append(args[1])
+        save(names)
+        main_apply()
+    elif args[0] == "apply":
+        main_apply()
+    elif args[0] == "guard":
+        guard()
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+def main_apply():
+    write_rule(listed())
+    run(["systemctl", "--user", "restart", "wireplumber.service"])
+    run(["systemctl", "--user", "restart", SERVICE])
+
+
+if __name__ == "__main__":
+    main()

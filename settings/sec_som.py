@@ -7,13 +7,23 @@ Usa o pactl (a interface "PulseAudio" do PipeWire):
   pactl set-default-sink NOME   escolhe a saída padrão
   pactl set-sink-volume @DEFAULT_SINK@ 50%   volume da saída padrão
   pactl set-sink-mute @DEFAULT_SINK@ 1       mudo (1) ou não (0)
+
+"Fixed device volume" (só saídas): alguns fones USB têm um volume interno que se comporta mal
+(um lado mais alto abaixo de 100%, ou voltam zerados ao reconectar). Ligado, o volume passa a ser
+feito em software e o volume interno do aparelho fica preso em 100% — quem faz isso é o
+componente do sistema `aero-audio` (~/.local/bin/aero-audio + aero-audio-guard.service).
 """
 import json
 import re
 
 from gi.repository import Adw, Gtk
 
-from comum import Secao, limpar_grupo, linha_app, pagina, rodar
+import os
+import time
+
+from comum import Secao, em_segundo_plano, limpar_grupo, linha_app, pagina, rodar
+
+AERO_AUDIO = os.path.expanduser("~/.local/bin/aero-audio")
 
 
 def nome_bonito(desc, nome, entrada):
@@ -118,6 +128,17 @@ class SecaoSom(Secao):
             vol.add_suffix(barra)
             grupo.add(vol)
             self.linhas[tipo].append(vol)
+            # Volume fixo do aparelho: só faz sentido em placas ALSA (USB, HDMI, interna).
+            cartao = padrao.get("properties", {}).get("device.name", "")
+            if not entrada and cartao.startswith("alsa_card.") and os.path.exists(AERO_AUDIO):
+                fixos = rodar([AERO_AUDIO, "list"]).stdout.split()
+                fixo = Adw.SwitchRow(use_markup=False, title="Fixed device volume",
+                                     subtitle="The system does the volume and keeps the device's own at full. "
+                                              "Fixes headsets that go silent or play louder on one side.",
+                                     active=cartao in fixos)
+                fixo.connect("notify::active", self.ao_fixo, cartao, tipo, grupo)
+                grupo.add(fixo)
+                self.linhas[tipo].append(fixo)
         elif not itens:
             vazio = Adw.ActionRow(use_markup=False, title="No devices found")
             grupo.add(vazio)
@@ -142,6 +163,18 @@ class SecaoSom(Secao):
         if not self.atualizando:
             rodar(["pactl", f"set-{sink_ou_source}-volume", f"@DEFAULT_{sink_ou_source.upper()}@",
                    f"{int(barra.get_value())}%"])
+
+    def ao_fixo(self, linha, _param, cartao, tipo, grupo):
+        if self.atualizando:
+            return
+        ligado = linha.get_active()
+        linha.set_sensitive(False)
+        # O aero-audio reinicia o WirePlumber (o som pisca por um instante): fora da janela.
+        def trocar():
+            r = rodar([AERO_AUDIO, "set", cartao, "on" if ligado else "off"])
+            time.sleep(2)  # espera o PipeWire mostrar as saídas de novo
+            return r
+        em_segundo_plano(trocar, lambda _r: self.montar(tipo, grupo))
 
     def ao_mudo(self, botao, sink_ou_source, entrada):
         self.icone_mudo(botao, entrada)

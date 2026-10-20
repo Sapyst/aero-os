@@ -37,6 +37,12 @@ clipboard history, sound/quick center. Review it before logging in with it.
   systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal
   ```
   Firefox: `widget.use-xdg-desktop-portal.file-picker = 1`.
+- **Fixed device volume** (Settings → Sound): for USB headsets whose own volume misbehaves (one side
+  louder below 100%, or silent after reconnecting). Needs `alsa-utils`; turn on the guard once:
+  ```bash
+  cp config/systemd/user/aero-audio-guard.service ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now aero-audio-guard.service
+  ```
 - **Music** (TerMusic / YTMusic) reads your YouTube login from Firefox's cookies at runtime (kept in memory only).
   Without a login it works anonymously.
 
