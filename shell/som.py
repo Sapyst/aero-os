@@ -598,21 +598,37 @@ class CentralRapida(Janelinha):
         # (região de entrada = só os cartões, atualizada a cada quadro em que a altura muda).
         self.altura_conteudo = 0
         self.add_tick_callback(self.ajustar_entrada)
+        vazio = Gtk.GestureClick(button=0)
+        vazio.connect("pressed", self.clique_no_vazio)
+        self.add_controller(vazio)
 
     def ajustar_entrada(self, *_):
         import cairo
-        h, w = self.cartao.get_height(), self.get_width()
+        # NENHUM clique pode varar a central para a janela de trás. Antes, a região que pega cliques
+        # era só a altura dos cartões; quando a central se redesenhava (lista abrindo, aparelho
+        # mudando), essa altura encolhia por um instante e o clique caía no app de trás.
+        # Agora a janela INTEIRA pega cliques, sempre; clicar no vazio abaixo dos cartões só fecha a
+        # central (ver clique_no_vazio), igual a clicar fora dela.
+        ok, caixa = self.cartao.compute_bounds(self)
+        fim = int(caixa.get_y() + caixa.get_height()) if ok else 0
+        if fim > 16 and fim != self.altura_conteudo:
+            self.altura_conteudo = fim
+            try:      # o hypr-botoes também precisa saber até onde vai a central (clique "dentro" ou "fora")
+                with open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "central-altura"), "w") as f:
+                    f.write(str(fim))
+            except OSError:
+                pass
+        w, h = self.get_width(), self.get_height()
         superficie = self.get_surface()
         if superficie is not None and h > 0 and (h, w) != getattr(self, "_entrada", None):
             self._entrada = (h, w)
-            self.altura_conteudo = h
             superficie.set_input_region(cairo.Region(cairo.RectangleInt(0, 0, w, h)))
-            try:      # o hypr-botoes também precisa saber até onde vai a central (clique "dentro" ou "fora")
-                with open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "central-altura"), "w") as f:
-                    f.write(str(h))
-            except OSError:
-                pass
         return GLib.SOURCE_CONTINUE
+
+    def clique_no_vazio(self, _gesto, _n, _x, y):
+        """Clique na parte transparente abaixo dos cartões = clicou fora: fecha (sem passar o clique)."""
+        if self.altura_conteudo and y > self.altura_conteudo:
+            self.fechar()
 
     # ---------- estado do sistema (tudo por comandos simples) ----------
 
@@ -930,10 +946,25 @@ class CentralRapida(Janelinha):
         textos.append(e)
         caixa.append(textos)
         if aba:
+            # A setinha fica DENTRO do botão grande. Um botão dentro de outro deixava o clique valer
+            # para os dois (a setinha abria a lista E o botão desligava o Bluetooth). Aqui ela pega o
+            # clique antes de todo mundo (fase de captura) e não deixa ele chegar ao botão de fora.
             seta = Gtk.Button(icon_name="go-next-symbolic", valign=Gtk.Align.CENTER)
             seta.add_css_class("seta")
-            seta.connect("clicked", lambda *_: self.alternar_sub(aba[4:]) if aba.startswith("sub:")
-                         else self.abrir_settings(aba))
+            pega = Gtk.GestureClick(button=0, propagation_phase=Gtk.PropagationPhase.CAPTURE)
+
+            def apertou(g, *_):
+                g.set_state(Gtk.EventSequenceState.CLAIMED)
+
+            def soltou(g, *_):
+                g.set_state(Gtk.EventSequenceState.CLAIMED)
+                if aba.startswith("sub:"):
+                    self.alternar_sub(aba[4:])
+                else:
+                    self.abrir_settings(aba)
+            pega.connect("pressed", apertou)
+            pega.connect("released", soltou)
+            seta.add_controller(pega)
             caixa.append(seta)
         b.set_child(caixa)
         if isinstance(ao_clicar, str):   # Wi-Fi/Bluetooth/Sound: o clique só abre/fecha a subjanelinha
