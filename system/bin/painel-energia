@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# painel-energia — grava as regras de tampa e botão de energia do systemd-logind e recarrega.
+# Roda como root (chamado pelo app Settings via sudo ou pkexec).
+#
+# Uso: painel-energia <tampa_com_monitor> <tampa_sem_monitor_bateria> <botao_toque> <botao_segurar> [tampa_sem_monitor_tomada]
+# Cada valor precisa ser um destes: ignore suspend poweroff
+# Sem o 5º valor, "na tomada" faz o mesmo que "na bateria" (jeito antigo).
+#
+# Padrão do Aero OS: tampa fechada SEM monitor, NA TOMADA = continuar trabalhando (tela apagada).
+# Quem deixa o PC ligado fazendo algo e desliga o monitor não quer que ele durma: ao desligar o
+# monitor USB-C/HDMI, para o sistema "sumiu o monitor" com a tampa fechada.
+#
+# Como este script roda com poder de root, ele só aceita valores de uma lista fechada:
+# assim ninguém consegue usar ele pra escrever qualquer coisa no sistema.
+set -euo pipefail
+
+[ $# -eq 4 ] || [ $# -eq 5 ] || { echo "uso: $0 <tampa_com_monitor> <tampa_sem_monitor_bateria> <botao_toque> <botao_segurar> [tampa_sem_monitor_tomada]" >&2; exit 2; }
+for v in "$@"; do
+    case "$v" in
+        ignore|suspend|poweroff) ;;
+        *) echo "valor inválido: $v" >&2; exit 2 ;;
+    esac
+done
+TOMADA="${5:-$2}"
+
+mkdir -p /etc/systemd/logind.conf.d
+cat > /etc/systemd/logind.conf.d/10-energia.conf <<CONF
+# Gerado pelo app Settings (painel-energia). Edite pelo app.
+[Login]
+# Tampa fechada COM monitor externo
+HandleLidSwitchDocked=$1
+# Tampa fechada SEM monitor externo: na bateria / na tomada
+HandleLidSwitch=$2
+HandleLidSwitchExternalPower=$TOMADA
+# Botão de energia: um toque / segurar
+HandlePowerKey=$3
+HandlePowerKeyLongPress=$4
+# Nenhum programa pode bloquear o botão
+PowerKeyIgnoreInhibited=yes
+# Nunca dormir sozinho por inatividade
+IdleAction=ignore
+CONF
+
+# reload relê a config sem derrubar a sessão gráfica (restart derrubaria!)
+systemctl reload systemd-logind
+echo "ok"

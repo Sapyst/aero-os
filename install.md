@@ -65,6 +65,14 @@ Emergency: Ctrl+Alt+F2 gives a text login; `sudo systemctl disable greetd` undoe
 Only for the same kind of laptop: GPU device symlinks (udev, check the PCI addresses with `lspci`),
 NVIDIA modprobe options, and lid/power-key behaviour (logind). Read each file before copying it to `/etc`.
 
+Settings → Power changes the lid and power-key rules through a small root helper that only accepts
+fixed values. Install it once:
+```bash
+sudo install -m755 system/bin/painel-energia /usr/local/bin/painel-energia
+```
+Aero's default: with the lid closed and no monitor, a laptop on battery sleeps, but **plugged in it
+keeps working** (screen off), also when you turn the external monitor off.
+
 ## Notes
 
 - Comments mention `doc NN`: those are the author's personal notes, not included.
