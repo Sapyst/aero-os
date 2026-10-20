@@ -949,6 +949,7 @@ class CentralRapida(Janelinha):
             self.procurar_redes()
         elif self.sub == "bt":
             self.procurar_bt()
+            self.buscar_bt()
         self.atualizar_sub()
 
     @staticmethod
@@ -983,33 +984,62 @@ class CentralRapida(Janelinha):
         b.connect("clicked", lambda *_: ao_clicar())
         return b
 
-    def em_thread(self, *comandos, depois=None, espera=600):
+    def em_thread(self, *comandos, depois=None, espera=600, limite=4):
         """Roda comandos em segundo plano e redesenha logo depois (sem travar a central)."""
         import threading
-        threading.Thread(target=lambda: [rodar(*c) for c in comandos] and depois and depois(), daemon=True).start()
+        threading.Thread(target=lambda: [rodar(*c, timeout=limite) for c in comandos] and depois and depois(), daemon=True).start()
         GLib.timeout_add(espera, self.montar_seguro)
 
-    # Bluetooth: aparelhos pareados (clique conecta/desconecta)
+    # Bluetooth: aparelhos pareados (clique conecta/desconecta) e os que estão por perto (clique pareia)
     def procurar_bt(self):
         import threading
 
+        def aparelhos(*filtro):
+            out = []
+            for l in rodar("bluetoothctl", "devices", *filtro).splitlines():
+                partes = l.split(" ", 2)
+                # sem nome de verdade (só o endereço) = não mostra
+                if len(partes) == 3 and partes[0] == "Device" and partes[2].replace("-", ":") != partes[1]:
+                    out.append((partes[1], partes[2]))
+            return out
+
         def trabalho():
-            conectados = {l.split(" ", 2)[1] for l in rodar("bluetoothctl", "devices", "Connected").splitlines()
-                          if l.startswith("Device ")}
-            self.aparelhos = [{"mac": l.split(" ", 2)[1], "nome": l.split(" ", 2)[2],
-                               "uso": l.split(" ", 2)[1] in conectados}
-                              for l in rodar("bluetoothctl", "devices", "Paired").splitlines()
-                              if l.startswith("Device ") and l.count(" ") >= 2]
+            conectados = {m for m, _ in aparelhos("Connected")}
+            pareados = aparelhos("Paired")
+            self.aparelhos = [{"mac": m, "nome": n, "uso": m in conectados} for m, n in pareados]
             self.aparelhos.sort(key=lambda a: not a["uso"])
+            ja = {m for m, _ in pareados}
+            self.por_perto = [{"mac": m, "nome": n} for m, n in aparelhos() if m not in ja]
             GLib.idle_add(self.atualizar_sub)
         threading.Thread(target=trabalho, daemon=True).start()
+
+    def buscar_bt(self):
+        """Abrir a lista já procura aparelhos por perto (20 s), e a lista vai se atualizando sozinha."""
+        import threading
+        if getattr(self, "bt_buscando", False) or not self.estado["bluetooth"][0]:
+            return
+        self.bt_buscando = True
+
+        def busca():
+            rodar("bluetoothctl", "pairable", "on")
+            rodar("bluetoothctl", "--timeout", "20", "scan", "on", timeout=25)
+            self.bt_buscando = False
+            self.procurar_bt()
+        threading.Thread(target=busca, daemon=True).start()
+
+        def atualizar():
+            if not self.bt_buscando or getattr(self, "sub", None) != "bt" or not self.get_visible():
+                return GLib.SOURCE_REMOVE
+            self.procurar_bt()
+            return GLib.SOURCE_CONTINUE
+        GLib.timeout_add(2000, atualizar)
 
     def lista_bt(self, bt_on):
         caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         caixa.add_css_class("redes")
         caixa.append(self.cabecalho("Bluetooth devices", bt_on, "Turn Bluetooth off" if bt_on else "Turn Bluetooth on",
                                     lambda: self.em_thread(("bluetoothctl", "power", "off" if bt_on else "on"),
-                                                           depois=self.procurar_bt)))
+                                                           depois=lambda: (self.procurar_bt(), self.buscar_bt()))))
         aparelhos = getattr(self, "aparelhos", None)
         if not bt_on or not aparelhos:
             caixa.append(Gtk.Label(label="Bluetooth is off" if not bt_on else
@@ -1021,7 +1051,21 @@ class CentralRapida(Janelinha):
                                        lambda a=a: self.em_thread(("bluetoothctl", "disconnect", a["mac"]) if a["uso"] else
                                                                   # aero-bluetooth: liga o Bluetooth, marca como confiável e tenta de novo se falhar
                                                                   (os.path.expanduser("~/.local/bin/aero-bluetooth"), "connect", a["mac"]),
-                                                                  depois=self.procurar_bt, espera=3000)))
+                                                                  depois=self.procurar_bt, espera=3000, limite=45)))
+        if bt_on:
+            perto = getattr(self, "por_perto", [])
+            titulo = Gtk.Label(label="Nearby" + ("  ·  searching…" if getattr(self, "bt_buscando", False) else ""),
+                               xalign=0, margin_start=6, margin_top=6, opacity=0.7)
+            caixa.append(titulo)
+            if not perto and not getattr(self, "bt_buscando", False):
+                caixa.append(Gtk.Label(label="Nothing nearby. Put the device in pairing mode.", xalign=0,
+                                       margin_start=6, opacity=0.6, wrap=True))
+            for a in perto:
+                # clique pareia: o aero-bluetooth pareia, confia e conecta (o agente dele responde ao aparelho)
+                caixa.append(self.item("bluetooth-symbolic", a["nome"], False,
+                                       lambda a=a: self.em_thread((os.path.expanduser("~/.local/bin/aero-bluetooth"), "pair", a["mac"]),
+                                                                  depois=self.procurar_bt, espera=4000, limite=60),
+                                       extra="list-add-symbolic"))
         mais = Gtk.Button(child=Gtk.Label(label="Bluetooth settings", xalign=0))
         mais.add_css_class("rede")
         mais.connect("clicked", lambda *_: self.abrir_settings("bluetooth"))
@@ -1277,7 +1321,8 @@ class CentralRapida(Janelinha):
                               "wifi", "rede"),
             self.botao_grande("bluetooth-active-symbolic" if bt_on else "bluetooth-disabled-symbolic",
                               "Bluetooth", (bt_dev[0] if bt_dev else "On") if bt_on else "Off", bt_on,
-                              "bt", "bluetooth"),
+                              # clique liga/desliga; a setinha ">" abre a lista (e já procura aparelhos)
+                              lambda: rodar("bluetoothctl", "power", "off" if bt_on else "on"), "sub:bt"),
             self.botao_grande("notifications-disabled-symbolic", "Do not disturb", "On" if dnd else "Off", dnd,
                               lambda: (rodar("makoctl", "mode", "-r" if dnd else "-a", "dnd"),
                                        rodar("pkill", "-RTMIN+10", "-x", "waybar"))),
