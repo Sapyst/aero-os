@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-widgets.py — os widgets da área de trabalho (doc 51): Clock, System, Resources, Weather e Pokémon battle.
+widgets.py — os widgets da área de trabalho (doc 51): Clock, System, Resources, Processes e Weather.
+Outros widgets entram sozinhos: qualquer widget_*.py nesta pasta é carregado (ver o fim do arquivo).
 
 Como funciona:
 - Cada widget é uma CAMADA (layer-shell) própria no nível "bottom": fica entre o papel de parede e as
@@ -47,7 +48,7 @@ HYPR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr",
 RAIO = 14                 # cantos do cartão (= o arredondamento das janelas); molduras internas usam 10
 SOMBRA = 14               # margem do cartão dentro da janela: é onde a sombra é desenhada
 LARGURA_ESTREITA = 320    # largura padrão do conteúdo da coluna estreita (System, Resources, Processes)
-LARGURA_LARGA = 518       # ...e da coluna larga (Clock, batalha, Weather)
+LARGURA_LARGA = 518       # ...e da coluna larga (Clock, Weather)
 CORES_BARRA = os.path.expanduser("~/.config/waybar/cores.css")   # cores do tema (o hypr-tema gera)
 MARGEM_TELA = 12          # (reserva; o que vale é a moldura das janelas: gaps_out do Hyprland, lida em moldura())
 GRADE = 8                 # o arraste "gruda" numa grade de 8 px
@@ -197,7 +198,7 @@ def cartao_de(tipo):
 
 
 def layout_padrao(mon):
-    """Primeira vez: à esquerda System, Resources e Processes; à direita Clock, a batalha e Weather — colados na
+    """Primeira vez: à esquerda System, Resources e Processes; à direita Clock e Weather — colados na
     moldura das janelas (gaps_out da tela e da barra) e com o espaço de duas janelas entre eles."""
     x0, y0, x1, _, g = moldura(mon)
     lista, ye, yd = [], y0, y0
@@ -205,7 +206,7 @@ def layout_padrao(mon):
         w, h = cartao_de(tipo)
         lista.append({"id": f"{tipo}-1", "tipo": tipo, "x": x0, "y": ye, "ativo": True, "opcoes": {}})
         ye += h + g
-    for tipo in ("relogio", "batalha", "clima"):
+    for tipo in ("relogio", "clima"):
         w, h = cartao_de(tipo)
         lista.append({"id": f"{tipo}-1", "tipo": tipo, "x": x1 - w, "y": yd, "ativo": True, "opcoes": {}})
         yd += h + g
@@ -501,57 +502,6 @@ def barra_vertical(cr, x, y, w, h, fracao, cor):
         cr.fill()
 
 
-class PixelArt(Gtk.Widget):
-    """Um sprite do pokefetch em escala INTEIRA (filtro NEAREST: pixel art sem borrão). Usado pelo System
-    (o Pokémon do dia) e pela batalha. espelhar=True: olha pra direita."""
-
-    SPRITES = os.path.expanduser("~/.local/share/pokefetch/sprites")
-
-    def __init__(self, caixa, espelhar=False):
-        super().__init__()
-        self.caixa = int(caixa)
-        self.espelhar = espelhar
-        self.textura = None
-        self.dx = self.dy = 0.0
-        self.alfa = 1.0
-        self.brilho = 0.0
-        self.set_size_request(self.caixa, self.caixa)
-
-    def carregar(self, pid):
-        try:
-            self.textura = Gdk.Texture.new_from_filename(os.path.join(self.SPRITES, f"{int(pid):04d}.png"))
-        except GLib.Error:
-            self.textura = None
-        self.queue_draw()
-
-    def do_measure(self, orientacao, _para):
-        return self.caixa, self.caixa, -1, -1
-
-    def do_snapshot(self, snap):
-        if self.textura is None:
-            return
-        w, h = self.textura.get_width(), self.textura.get_height()
-        f = next((c for c in range(8, 1, -1) if w % c == 0 and h % c == 0 and 240 // max(w // c, h // c) == c), 1)
-        ow, oh = w / f, h / f
-        k = max(1, int(self.caixa // max(ow, oh)))
-        dw, dh = ow * k, oh * k
-        x = round((self.caixa - dw) / 2 + self.dx)
-        y = round(self.caixa - dh + self.dy)
-        snap.push_opacity(self.alfa)
-        if self.brilho > 0.01:
-            b = self.brilho * 0.9
-            snap.push_color_matrix(Graphene.Matrix().init_identity(), Graphene.Vec4().init(b, b, b, 0))
-        if self.espelhar:
-            snap.translate(Graphene.Point().init(x + dw, y))
-            snap.scale(-1, 1)
-            snap.append_scaled_texture(self.textura, Gsk.ScalingFilter.NEAREST, Graphene.Rect().init(0, 0, dw, dh))
-        else:
-            snap.append_scaled_texture(self.textura, Gsk.ScalingFilter.NEAREST, Graphene.Rect().init(x, y, dw, dh))
-        if self.brilho > 0.01:
-            snap.pop()
-        snap.pop()
-
-
 class Palco(Gtk.Widget):
     """Um container de tamanho FIXO. Os filhos ficam em (x, y) com o tamanho que eu disser (ou o natural) e o
     que passar da borda é recortado. É o que impede o cartão de "respirar": um rótulo que cresce, um número de
@@ -718,7 +668,7 @@ class Widget(Gtk.Window):
         while (f := self.cartao.get_first_child()) is not None:
             self.cartao.remove(f)
         self.areas.clear()
-        for f in list(self.palco.filhos):             # o palco pode ter filhos além do cartao (batalha)
+        for f in list(self.palco.filhos):             # o palco pode ter filhos além do cartão (widgets com animação)
             if f[0] is not self.cartao:
                 self.palco.remove(f[0])
         self.fundo_pic.set_paintable(None)            # solta a textura velha (senão a janela não encolhe)
@@ -1241,7 +1191,12 @@ if __name__ == "__main__":
     # e o daqui vazio (foi o primeiro bug).
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import widgets as modulo_widgets
-    for modulo in ("widget_relogio", "widget_sistema", "widget_recursos", "widget_processos", "widget_clima", "widget_batalha"):
+    # Os de sempre primeiro (nessa ordem), depois qualquer outro widget_*.py desta pasta: é assim que
+    # pacotes de widgets de terceiros entram (copiam o widget_*.py deles para cá e pronto).
+    pasta = os.path.dirname(os.path.abspath(__file__))
+    nativos = ["widget_relogio", "widget_sistema", "widget_recursos", "widget_processos", "widget_clima"]
+    extras = sorted(f[:-3] for f in os.listdir(pasta) if f.startswith("widget_") and f.endswith(".py") and f[:-3] not in nativos)
+    for modulo in nativos + extras:
         try:
             __import__(modulo)              # cada um se registra em modulo_widgets.TIPOS
         except Exception as erro:  # noqa: BLE001

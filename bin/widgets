@@ -2,7 +2,7 @@
 # Widgets da área de trabalho (doc 51). Código: ~/.local/share/aero-shell/widgets.py (+ widget_*.py)
 # Uso: widgets                 inicia (se já estiver rodando, não faz nada)
 #      widgets --editar        liga/desliga o modo "arrumar" (arrastar widgets)
-#      widgets --adicionar T   adiciona um widget do tipo T (relogio, sistema, recursos, clima, batalha)
+#      widgets --adicionar T   adiciona um widget do tipo T (relogio, sistema, recursos, processos, clima)
 #      widgets --recarregar    relê a configuração e recria tudo
 #      widgets --reiniciar     fecha e abre de novo (pra pegar uma mudança no código)
 # Se fechar sozinho (erro), este lançador abre de novo em 2 s. Registro: ~/.cache/aero-shell/widgets.log

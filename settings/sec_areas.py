@@ -4,7 +4,7 @@ sec_areas.py — Workspaces: cada área de trabalho com o SEU wallpaper e os SEU
 Grava no mesmo ~/.config/aero-shell/widgets.json dos widgets (o daemon vigia e aplica na hora):
   "por_area": {"2": {"wallpaper": "/caminho/imagem.png"}}   área sem wallpaper = o wallpaper normal do sistema
   cada widget: "areas": [1, 3]                               sem "areas" = aparece em todas
-Ao trocar de área, os widgets de fora ficam escondidos (não fecham: a batalha Pokémon continua).
+Ao trocar de área, os widgets de fora ficam escondidos (não fecham: o que estiver rodando neles continua).
 """
 import os
 import subprocess

@@ -21,7 +21,6 @@ CATALOGO = [
     ("sistema", "System", "computer-symbolic", "The PC at a glance, like fastfetch"),
     ("recursos", "Resources", "power-profile-balanced-symbolic", "CPU, memory, temperatures, disks, network, battery"),
     ("clima", "Weather", "weather-clear-symbolic", "Now and the next days (place from Settings → Location)"),
-    ("batalha", "Pokémon battle", "input-gaming-symbolic", "Endless simulated battles, with a scoreboard"),
     ("processos", "Processes", "view-list-symbolic", "Live top: what is using the CPU and memory right now"),
 ]
 # Opções de cada tipo: (chave, título, subtítulo, "combo" + lista (texto, valor) | "switch", valor padrão).
@@ -45,12 +44,30 @@ OPCOES = {
     "clima": [("privado", "Private", "Hide the place name and sunrise/sunset (for screenshots)", "switch", False),
               ("dias", "Days", None, [("5 days", 5), ("7 days", 7)], 7),
               ("detalhes", "Details", "Feels like, humidity, wind, sunrise and sunset", "switch", True)],
-    "batalha": [("velocidade", "Pace", None, [("Slow", "lenta"), ("Normal", "normal"), ("Fast", "rapida")], "normal"),
-                ("cura", "Champion heals between battles", "How much HP the winner recovers before the next fight",
-                 [("Fully", "total"), ("Half", "metade"), ("Nothing", "nenhuma")], "metade"),
-                ("justo", "Fair matchups", "Challengers with a similar total of base stats", "switch", False),
-                ("placar", "Show the scoreboard", "Battle count, record streak and top winners", "switch", True)],
 }
+
+
+def carregar_extras():
+    """Widgets de pacotes de terceiros: cada widget_*.py extra traz um widget_*.json ao lado, com o que
+    o Settings precisa (tipo, nome, ícone, descrição e as opções no mesmo formato do OPCOES acima)."""
+    pasta = os.path.expanduser("~/.local/share/aero-shell")
+    try:
+        nomes = sorted(f for f in os.listdir(pasta) if f.startswith("widget_") and f.endswith(".json"))
+    except OSError:
+        return
+    for nome in nomes:
+        try:
+            with open(os.path.join(pasta, nome), encoding="utf-8") as f:
+                d = json.load(f)
+            if d["tipo"] in {t for t, *_ in CATALOGO}:
+                continue
+            CATALOGO.append((d["tipo"], d["nome"], d.get("icone", "applications-other-symbolic"), d.get("descricao", "")))
+            OPCOES[d["tipo"]] = [tuple(o if not isinstance(o, list) else [tuple(x) for x in o] for o in op) for op in d.get("opcoes", [])]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+
+
+carregar_extras()
 ESCALAS = [("Small", "0.85"), ("Normal", "1"), ("Large", "1.15"), ("Larger", "1.3")]
 VIDROS = [("Terminal", "0.62"), ("Solid", "0.92"), ("Frosted", "0.75"), ("Light", "0.45"), ("Liquid", "0.30")]
 

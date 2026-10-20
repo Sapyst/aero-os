@@ -21,8 +21,8 @@ clipboard history, sound/quick center. Review it before logging in with it.
 
 ## 2. Pieces that need setup
 
-- **Widgets** need `gtk4-layer-shell`. Pokémon data: run `pokefetch-catalogar` once (downloads from PokéAPI),
-  then `pokefetch-golpes` for the battle moves.
+- **Widgets** need `gtk4-layer-shell`. The goddesses of the System widget (`shell/deusas/`, `shell/deusas.json`)
+  come with the shell; nothing to download.
 - **Weather**: Settings → Location. *Automatic* asks ipinfo.io for your city by IP; pick a city to avoid that.
 - **A second disk** in the About page and the Resources widget: `export AERO_DADOS=/your/mount`.
 - **File picker** (xdg-desktop-portal):

@@ -1,0 +1,210 @@
+[
+ {
+  "nome": "Athena",
+  "romano": "Minerva",
+  "rege": "wisdom & war",
+  "obra": "Atena Mattei",
+  "cidade": "Paris",
+  "imagem": "athena.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "Jastrow",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Mattei_Athena_Louvre_Ma530_n2.jpg"
+  }
+ },
+ {
+  "nome": "Aphrodite",
+  "romano": "Venus",
+  "rege": "love & beauty",
+  "obra": "Vênus de Milo",
+  "cidade": "Paris",
+  "imagem": "aphrodite.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Shonagon",
+   "fonte": "https://commons.wikimedia.org/wiki/File:V%C3%A9nus_de_Milo_-_Mus%C3%A9e_du_Louvre_AGER_LL_299_;_N_527_;_Ma_399.jpg"
+  }
+ },
+ {
+  "nome": "Artemis",
+  "romano": "Diana",
+  "rege": "the hunt & moon",
+  "obra": "Diana de Versalhes",
+  "cidade": "Paris",
+  "imagem": "artemis.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Shonagon",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Diane_de_Versailles_-_Mus%C3%A9e_du_Louvre_AGER_Ma_589.jpg"
+  }
+ },
+ {
+  "nome": "Hera",
+  "romano": "Juno",
+  "rege": "queen of the gods",
+  "obra": "Juno Ludovisi",
+  "cidade": "Roma",
+  "imagem": "hera.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Hera_Ludovisi_Altemps_Inv8631.jpg"
+  }
+ },
+ {
+  "nome": "Demeter",
+  "romano": "Ceres",
+  "rege": "the harvest",
+  "obra": "Deméter de Cnido",
+  "cidade": "Londres",
+  "imagem": "demeter.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Raymond.ellis",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Marble_Statue_of_Demeter.jpg"
+  }
+ },
+ {
+  "nome": "Hestia",
+  "romano": "Vesta",
+  "rege": "hearth & home",
+  "obra": "Héstia Giustiniani",
+  "cidade": "Roma",
+  "imagem": "hestia.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "Marie-Lan Taÿ Pamart",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Hestia_Giustiniani_Torlonia_Collection_MT490.jpg"
+  }
+ },
+ {
+  "nome": "Persephone",
+  "romano": "Proserpina",
+  "rege": "the underworld",
+  "obra": "Grande Relevo de Elêusis (Deméter, Triptólemo e Perséfone)",
+  "cidade": "Nova York",
+  "imagem": "persephone.png",
+  "credito": {
+   "licenca": "CC BY 2.5",
+   "fotografo": "",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Great_Eleusinian_relief_fragments_Met_14.130.9_n01.jpg"
+  }
+ },
+ {
+  "nome": "Nike",
+  "romano": "Victoria",
+  "rege": "victory",
+  "obra": "Vitória de Samotrácia",
+  "cidade": "Paris",
+  "imagem": "nike.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Shonagon",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Victoire_de_Samothrace_-_Musee_du_Louvre_-_20190812.jpg"
+  }
+ },
+ {
+  "nome": "Tyche",
+  "romano": "Fortuna",
+  "rege": "fortune",
+  "obra": "Fortuna ou Tutela (MAM 2735)",
+  "cidade": "Arles",
+  "imagem": "tyche.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "Rama",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Fortuna_or_Tutela-MAM_2735-IMG_9179-gradient.jpg"
+  }
+ },
+ {
+  "nome": "Hygieia",
+  "romano": "Salus",
+  "rege": "health",
+  "obra": "Higeia, deusa da saúde (Ra 42)",
+  "cidade": "Toulouse",
+  "imagem": "hygieia.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "Didier Descouens",
+   "fonte": "https://commons.wikimedia.org/wiki/File:(Toulouse)_Hygie,_d%C3%A9esse_de_la_Sant%C3%A9_-_Mus%C3%A9e_Saint-Raymond,_Ra_42.jpg"
+  }
+ },
+ {
+  "nome": "Themis",
+  "romano": "Justitia",
+  "rege": "law & justice",
+  "obra": "Justitia do Landgericht",
+  "cidade": "Berlim",
+  "imagem": "themis.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Genealogist",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Justitia_am_Landgericht_Berlin.JPG"
+  }
+ },
+ {
+  "nome": "Hebe",
+  "romano": "Juventas",
+  "rege": "youth",
+  "obra": "Hebe",
+  "cidade": "Copenhague",
+  "imagem": "hebe.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Bertel Thorvaldsen",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Hebe_by_Bertel_Thorvaldsen_(A874).jpg"
+  }
+ },
+ {
+  "nome": "Selene",
+  "romano": "Luna",
+  "rege": "the moon",
+  "obra": "Selene deitada",
+  "cidade": "Montauban",
+  "imagem": "selene.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "Didier Descouens",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Mus%C3%A9e_Ingres-Bourdelle_-_S%C3%A9l%C3%A9n%C3%A9_couch%C3%A9e,_1917_-_Bourdelle_-_Joconde06070001193.jpg"
+  }
+ },
+ {
+  "nome": "Hecate",
+  "romano": "Trivia",
+  "rege": "magic & crossroads",
+  "obra": "Diana como Hécate",
+  "cidade": "Londres",
+  "imagem": "hecate.png",
+  "credito": {
+   "licenca": "Public domain",
+   "fotografo": "Unknown authorUnknown author",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Estatua_de_Diana_como_H%C3%A9cate,_British_Museum.jpg"
+  }
+ },
+ {
+  "nome": "Nemesis",
+  "romano": "Invidia",
+  "rege": "retribution",
+  "obra": "Nêmesis alada do Egito",
+  "cidade": "Paris",
+  "imagem": "nemesis.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Gary Todd from Xinzheng, China",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Marble_statue_of_Nemesis,_from_Egypt,_2nd_c._AD_(28273794646).jpg"
+  }
+ },
+ {
+  "nome": "Eris",
+  "romano": "Discordia",
+  "rege": "strife & discord",
+  "obra": "Eris com a maçã da discórdia",
+  "cidade": "Bydgoszcz",
+  "imagem": "eris.png",
+  "credito": {
+   "licenca": "CC0",
+   "fotografo": "Pit1233",
+   "fonte": "https://commons.wikimedia.org/wiki/File:Bdg_Gdanska15_Eris_07-2013.jpg"
+  }
+ }
+]

@@ -1,5 +1,6 @@
-"""widget_sistema.py — System: o "fetch" do dashboard. À esquerda, o Pokémon do dia (sprite do pokefetch,
-sorteado pela data: o mesmo o dia inteiro); à direita, um sub-cartão com a ficha do PC em chaves coloridas
+"""widget_sistema.py — System: o "fetch" do dashboard. À esquerda, a deusa grega do dia (uma estátua em
+ASCII, sorteada pela data: a mesma o dia inteiro), com o nome e o que ela rege; à direita, um sub-cartão
+com a ficha do PC em chaves coloridas
 ("os • Arch Aero OS"...). Coleta UMA vez ao abrir (pacman e flatpak rodam só aí); uptime e memória a cada 60 s."""
 import datetime
 import json
@@ -7,11 +8,14 @@ import os
 import re
 import subprocess
 
-from gi.repository import Gtk, Pango
+from gi.repository import GdkPixbuf, Gtk, Pango
 
-from widgets import LARGURA_ESTREITA, PixelArt, Quadro, Widget, hypr, hypr_json, registrar
+from widgets import LARGURA_ESTREITA, Quadro, Widget, hypr, hypr_json, registrar
 
-CATALOGO = os.path.expanduser("~/.local/share/pokefetch/catalogo.json")
+# As deusas: estátuas de fotos de uso livre (domínio público, CC0 ou CC BY), em ASCII
+# (tools/make-goddesses.py; créditos no README).
+PASTA_DEUSAS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deusas")
+DEUSAS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deusas.json")
 
 
 def ler(caminho, padrao=""):
@@ -86,17 +90,15 @@ def tela():
     return f"{m['width']}×{m['height']} {round(m.get('refreshRate', 0))}Hz" if m else "?"
 
 
-def pokemon_do_dia():
-    """(id, nome) sorteado pela data: muda uma vez por dia, igual pra todo mundo que olhar."""
+def deusa_do_dia():
+    """A deusa sorteada pela data: muda uma vez por dia, igual pra todo mundo que olhar."""
     try:
-        with open(CATALOGO) as f:
-            pokes = json.load(f)["pokemon"]
-    except (OSError, ValueError, KeyError):
-        return None, None
-    ids = sorted(pokes, key=int)
+        with open(DEUSAS, encoding="utf-8") as f:
+            deusas = json.load(f)
+    except (OSError, ValueError):
+        return None
     import random
-    pid = random.Random(datetime.date.today().toordinal()).choice(ids)
-    return int(pid), pokes[pid]["nome"]
+    return random.Random(datetime.date.today().toordinal()).choice(deusas) if deusas else None
 
 
 @registrar
@@ -104,7 +106,7 @@ class Sistema(Widget):
     tipo = "sistema"
     nome = "System"
     icone = "computer-symbolic"
-    opcoes_padrao = {"pokemon": True, "pacotes": True, "privado": False}
+    opcoes_padrao = {"deusa": True, "pacotes": True, "privado": False}
     tamanho = (LARGURA_ESTREITA, 222)
 
     def montar(self):
@@ -117,19 +119,27 @@ class Sistema(Widget):
         # linha de prompt, como no terminal: usuario@host ~ ❯ fetch
         prompt = Gtk.Box(spacing=0)
         for s_, cls in ((usuario, "prompt verde"), ("@", "prompt apagado"), (host, "prompt azul"), ("  ~ ", "prompt apagado"),
-                        ("❯ ", "prompt rosa"), ("fetch --pokemon", "prompt")):
+                        ("❯ ", "prompt rosa"), ("fetch --goddess", "prompt")):
             prompt.append(self.rotulo(s_, cls))
         self.cartao.append(prompt)
         corpo = Gtk.Box(spacing=10 * e)
-        if self.opcoes["pokemon"]:
-            pid, nome = pokemon_do_dia()
-            coluna = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4 * e, valign=Gtk.Align.CENTER)
-            sprite = PixelArt(int(96 * e))
-            if pid:
-                sprite.carregar(pid)
-            coluna.append(sprite)
-            coluna.append(self.rotulo((nome or "?").lower(), "mono pequeno", halign=Gtk.Align.CENTER))
-            coluna.append(self.rotulo(f"#{pid:04d}" if pid else "", "mono apagado pequeno", halign=Gtk.Align.CENTER))
+        deusa = deusa_do_dia() if self.opcoes.get("deusa", True) else None
+        if deusa:
+            coluna = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3 * e, valign=Gtk.Align.CENTER)
+            alto = int(104 * e)
+            try:
+                img = GdkPixbuf.Pixbuf.new_from_file_at_scale(os.path.join(PASTA_DEUSAS, deusa["imagem"]), int(100 * e), alto, True)
+                estatua = Gtk.Picture.new_for_pixbuf(img)
+                estatua.set_size_request(img.get_width(), img.get_height())
+                estatua.set_can_shrink(False)
+                coluna.append(estatua)
+            except Exception:  # noqa: BLE001 — sem a imagem, fica só o nome
+                pass
+            coluna.append(self.rotulo(deusa["nome"].lower(), "mono pequeno", halign=Gtk.Align.CENTER))
+            coluna.append(self.rotulo(deusa["rege"], "mono apagado pequeno", halign=Gtk.Align.CENTER))
+            c = deusa["credito"]
+            coluna.set_tooltip_text(f"{deusa['nome']} ({deusa['romano']}), goddess of {deusa['rege']}\n"
+                                    f"{deusa['obra']}, {deusa['cidade']}\nPhoto: {c['fotografo']}, {c['licenca']}")
             coluna.set_size_request(int(100 * e), -1)
             corpo.append(coluna)
         quadro = Quadro("system", e, espaco=0)
