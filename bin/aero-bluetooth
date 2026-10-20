@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""aero-bluetooth: Aero OS Bluetooth helper.
+
+  aero-bluetooth daemon        pairing agent + startup state (run by aero-bluetooth.service)
+  aero-bluetooth pair MAC      pair, trust and connect, with retries
+  aero-bluetooth connect MAC   connect (retries a few times; trusts it so it reconnects by itself)
+  aero-bluetooth startup on|off   whether Bluetooth is turned on at login
+
+Preferences live in ~/.config/aero/bluetooth.conf (startup=on|off).
+"""
+# O agente de pareamento é quem responde quando um aparelho pede um código ou uma confirmação.
+# Sem ele, parear pelo app falha em vários fones/teclados. Aqui ele aceita os pedidos "Just Works"
+# e de confirmação (só acontecem quando VOCÊ mandou parear) e mostra códigos numa notificação.
+import os
+import subprocess
+import sys
+import time
+
+CONF = os.path.expanduser("~/.config/aero/bluetooth.conf")
+AGENT_PATH = "/org/aero/bluetooth/agent"
+AGENT_XML = """
+<node>
+  <interface name="org.bluez.Agent1">
+    <method name="Release"/>
+    <method name="RequestPinCode"><arg type="o" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="DisplayPinCode"><arg type="o" direction="in"/><arg type="s" direction="in"/></method>
+    <method name="RequestPasskey"><arg type="o" direction="in"/><arg type="u" direction="out"/></method>
+    <method name="DisplayPasskey"><arg type="o" direction="in"/><arg type="u" direction="in"/><arg type="q" direction="in"/></method>
+    <method name="RequestConfirmation"><arg type="o" direction="in"/><arg type="u" direction="in"/></method>
+    <method name="RequestAuthorization"><arg type="o" direction="in"/></method>
+    <method name="AuthorizeService"><arg type="o" direction="in"/><arg type="s" direction="in"/></method>
+    <method name="Cancel"/>
+  </interface>
+</node>
+"""
+
+
+def ctl(*args, timeout=None):
+    cmd = ["bluetoothctl"] + (["--timeout", str(timeout)] if timeout else []) + list(args)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def notify(title, body=""):
+    subprocess.run(["notify-send", "-a", "Bluetooth", "-i", "bluetooth", title, body], capture_output=True)
+
+
+def prefs():
+    p = {"startup": "on"}
+    try:
+        for line in open(CONF):
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                p[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return p
+
+
+def save_prefs(p):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        f.write("# Aero OS Bluetooth (written by aero-bluetooth and Settings)\n")
+        f.writelines(f"{k}={v}\n" for k, v in p.items())
+
+
+def info(mac):
+    d = {}
+    for line in ctl("info", mac).stdout.splitlines():
+        if ":" in line:
+            k, v = line.strip().split(":", 1)
+            d.setdefault(k.strip(), v.strip())
+    return d
+
+
+def connect(mac, tries=3):
+    """Conecta e marca como confiável (assim o aparelho volta sozinho das próximas vezes)."""
+    ctl("power", "on")
+    ctl("trust", mac)
+    for i in range(tries):
+        if ctl("connect", mac, timeout=12).returncode == 0 or info(mac).get("Connected") == "yes":
+            return True
+        time.sleep(1.5 + i)
+    return False
+
+
+def pair(mac):
+    ctl("power", "on")
+    ctl("pairable", "on")
+    if info(mac).get("Paired") != "yes":
+        r = ctl("pair", mac, timeout=25)
+        if r.returncode != 0 and info(mac).get("Paired") != "yes":
+            return False
+    return connect(mac)
+
+
+def name_of(conn, path):
+    from gi.repository import Gio, GLib
+    try:
+        v = conn.call_sync("org.bluez", path, "org.freedesktop.DBus.Properties", "Get",
+                           GLib.Variant("(ss)", ("org.bluez.Device1", "Alias")), GLib.VariantType("(v)"),
+                           Gio.DBusCallFlags.NONE, 2000, None)
+        return v.unpack()[0]
+    except Exception:  # noqa: BLE001
+        return "A device"
+
+
+def daemon():
+    from gi.repository import Gio, GLib
+    conn = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    node = Gio.DBusNodeInfo.new_for_xml(AGENT_XML)
+
+    def trust(path):
+        conn.call_sync("org.bluez", path, "org.freedesktop.DBus.Properties", "Set",
+                       GLib.Variant("(ssv)", ("org.bluez.Device1", "Trusted", GLib.Variant("b", True))),
+                       None, Gio.DBusCallFlags.NONE, 2000, None)
+
+    def on_call(_c, _sender, _path, _iface, method, params, inv):
+        args = params.unpack()
+        dev = name_of(conn, args[0]) if args and isinstance(args[0], str) and args[0].startswith("/org/bluez") else ""
+        if method == "RequestPinCode":
+            notify(f"Pairing with {dev}", "Using PIN 0000")
+            inv.return_value(GLib.Variant("(s)", ("0000",)))
+        elif method == "RequestPasskey":
+            inv.return_value(GLib.Variant("(u)", (0,)))
+        elif method in ("DisplayPinCode", "DisplayPasskey"):
+            code = args[1] if method == "DisplayPinCode" else f"{args[1]:06d}"
+            notify(f"Pairing with {dev}", f"Type {code} on the device, then press Enter")
+            inv.return_value(None)
+        elif method == "RequestConfirmation":
+            notify(f"Paired with {dev}", f"Code {args[1]:06d}")
+            try:
+                trust(args[0])
+            except Exception:  # noqa: BLE001
+                pass
+            inv.return_value(None)
+        elif method in ("RequestAuthorization", "AuthorizeService", "Release", "Cancel"):
+            inv.return_value(None)
+        else:
+            inv.return_dbus_error("org.bluez.Error.Rejected", "Rejected")
+
+    conn.register_object(AGENT_PATH, node.interfaces[0], on_call, None, None)
+
+    def register():
+        try:
+            for m, a in (("RegisterAgent", GLib.Variant("(os)", (AGENT_PATH, "KeyboardDisplay"))),
+                         ("RequestDefaultAgent", GLib.Variant("(o)", (AGENT_PATH,)))):
+                conn.call_sync("org.bluez", "/org/bluez", "org.bluez.AgentManager1", m, a, None, Gio.DBusCallFlags.NONE, 3000, None)
+            print("pairing agent registered", flush=True)
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"pairing agent not registered: {e}", flush=True)
+            return False
+
+    # bluez pode reiniciar (ou ainda não estar pronto): registra de novo quando ele voltar.
+    Gio.bus_watch_name_on_connection(conn, "org.bluez", Gio.BusNameWatcherFlags.NONE, lambda *_: register(), None)
+    if prefs().get("startup", "on") == "on":
+        ctl("power", "on")
+    GLib.MainLoop().run()
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+    elif a[0] == "daemon":
+        daemon()
+    elif a[0] == "pair" and len(a) == 2:
+        sys.exit(0 if pair(a[1]) else 1)
+    elif a[0] == "connect" and len(a) == 2:
+        sys.exit(0 if connect(a[1]) else 1)
+    elif a[0] == "startup" and len(a) == 2 and a[1] in ("on", "off"):
+        p = prefs()
+        p["startup"] = a[1]
+        save_prefs(p)
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -37,6 +37,13 @@ clipboard history, sound/quick center. Review it before logging in with it.
   systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal
   ```
   Firefox: `widget.use-xdg-desktop-portal.file-picker = 1`.
+- **Bluetooth**: a pairing agent (answers devices that ask for a code or a confirmation), Bluetooth on at login
+  and retries when connecting. Settings → Bluetooth uses it; needs `bluez` and `bluez-utils`:
+  ```bash
+  sudo systemctl enable --now bluetooth
+  cp config/systemd/user/aero-bluetooth.service ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now aero-bluetooth.service
+  ```
 - **Fixed device volume** (Settings → Sound): for USB headsets whose own volume misbehaves (one side
   louder below 100%, or silent after reconnecting). Needs `alsa-utils`; turn on the guard once:
   ```bash

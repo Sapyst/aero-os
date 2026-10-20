@@ -1018,8 +1018,10 @@ class CentralRapida(Janelinha):
         else:
             for a in aparelhos:
                 caixa.append(self.item("bluetooth-active-symbolic", a["nome"], a["uso"],
-                                       lambda a=a: self.em_thread(("bluetoothctl", "disconnect" if a["uso"] else "connect",
-                                                                   a["mac"]), depois=self.procurar_bt, espera=3000)))
+                                       lambda a=a: self.em_thread(("bluetoothctl", "disconnect", a["mac"]) if a["uso"] else
+                                                                  # aero-bluetooth: liga o Bluetooth, marca como confiável e tenta de novo se falhar
+                                                                  (os.path.expanduser("~/.local/bin/aero-bluetooth"), "connect", a["mac"]),
+                                                                  depois=self.procurar_bt, espera=3000)))
         mais = Gtk.Button(child=Gtk.Label(label="Bluetooth settings", xalign=0))
         mais.add_css_class("rede")
         mais.connect("clicked", lambda *_: self.abrir_settings("bluetooth"))
