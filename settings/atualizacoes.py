@@ -220,14 +220,9 @@ read -r -p ">> Done. Press Enter to close. " _
 """
 
 
-def passo_autenticar():
-    # sudo -v = só "validar": pede a senha (se precisar; o sudo a lembra pelo tempo configurado), sem rodar nada
-    return ("Authenticate", ["sudo", "-A", "-v"])
-
-
 def passo_sistema():
     # -S sync, -y baixa a lista nova de pacotes, -u atualiza tudo. --noconfirm = sem perguntas
-    return ("Upgrade system packages (pacman -Syu)", como_root(["pacman", "-Syu", "--noconfirm"]))
+    return ("Upgrade system packages (pacman -Syu)", como_root(["/usr/bin/pacman", "-Syu", "--noconfirm"]))
 
 
 def passo_individual(p):
@@ -254,6 +249,5 @@ def passos_para(programas, so_sistema=False, unico=None):
         if not so_sistema:
             # AUR fica de fora: cada pacote do AUR é revisado e confirmado no botão dele
             passos += [passo_individual(p) for p in pendentes if p.individual and p.fonte != "aur"]
-    if any(cmd[0] == "sudo" or cmd[0] == "bash" for _, cmd in passos):
-        passos.insert(0, passo_autenticar())   # pede a senha logo no começo, uma vez só
+    # A senha de admin é pedida pelo polkit no próprio passo de root (pkexec), sem guardar para depois
     return passos

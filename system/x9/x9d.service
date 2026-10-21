@@ -1,0 +1,43 @@
+[Unit]
+Description=X9 - archive of every sudo, pkexec and su call
+Documentation=file:///usr/local/lib/x9/x9core.py
+After=systemd-journald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/x9/x9d
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=128M
+# Only reads the journal and writes its own folders
+ProtectSystem=strict
+ReadWritePaths=/var/log/x9 /var/lib/x9
+StateDirectory=x9
+LogsDirectory=x9
+LogsDirectoryMode=0750
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_READ_SEARCH
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

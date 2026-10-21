@@ -1,0 +1,163 @@
+#!/usr/bin/env -S python3 -I
+"""
+x9d — X9's root service. Follows the system journal (journalctl), picks the lines written by
+sudo, pkexec and su, turns them into events (x9core) and appends them to the daily archive
+/var/log/x9/YYYY-MM-DD.jsonl. Once an hour it applies the auto-delete rules.
+
+It only READS the journal and only WRITES under /var/log/x9 and /var/lib/x9 (the systemd unit
+enforces that). No network, no commands besides journalctl.
+"""
+import grp
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, "/usr/local/lib/x9")
+import x9core as x  # noqa: E402
+
+CURSOR = os.path.join(x.ESTADO, "cursor")
+GRUPO = "wheel"                    # who may read the archive (the admins); the app runs as one of them
+FILTROS = ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec", "SYSLOG_IDENTIFIER=su"]
+RETENCAO_A_CADA = 3600
+parar = False
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def gid_do_grupo():
+    try:
+        return grp.getgrnam(GRUPO).gr_gid
+    except KeyError:
+        return 0
+
+
+def preparar(gid):
+    os.makedirs(x.ARQUIVO, mode=0o750, exist_ok=True)
+    os.chown(x.ARQUIVO, 0, gid)
+    os.chmod(x.ARQUIVO, 0o750)
+    os.makedirs(x.TRAVAS, mode=0o755, exist_ok=True)
+    os.chmod(x.ESTADO, 0o755)
+    os.chmod(x.TRAVAS, 0o755)
+
+
+def ler_cursor():
+    try:
+        with open(CURSOR) as f:
+            c = f.read().strip()
+        return c if c and len(c) < 512 and "\n" not in c else ""
+    except OSError:
+        return ""
+
+
+def gravar_cursor(c):
+    tmp = CURSOR + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(c)
+    os.replace(tmp, CURSOR)
+
+
+def ids_recentes():
+    """ids already in the last two days: after a restart the journal can repeat a few lines."""
+    vistos = set()
+    for dia in x.dias()[:2]:
+        vistos.update(e["id"] for e in x.ler_dia(dia))
+    return vistos
+
+
+def abrir_journal(cursor):
+    cmd = ["journalctl", "-o", "json", "-f", "-q", "--no-pager"]
+    cmd += ["--after-cursor", cursor] if cursor else ["-n", "all"]
+    return subprocess.Popen(cmd + FILTROS, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, bufsize=0)
+
+
+def principal():
+    global parar
+    gid = gid_do_grupo()
+    preparar(gid)
+    vistos = ids_recentes()
+    juntador = x.Juntador()
+    proxima_limpeza = 0.0
+    ultimo_cursor = salvo = ler_cursor()
+
+    def sair(*_):
+        global parar
+        parar = True
+    signal.signal(signal.SIGTERM, sair)
+    signal.signal(signal.SIGINT, sair)
+
+    def guardar(eventos):
+        novos = [e for e in eventos if e["id"] not in vistos]
+        if not novos:
+            return
+        with x.Trava():
+            x.acrescentar(novos, gid=gid)
+        vistos.update(e["id"] for e in novos)
+        if len(vistos) > 50000:
+            vistos.clear()
+            vistos.update(ids_recentes())
+
+    log(f"x9d: following sudo, pkexec and su ({'from saved position' if ultimo_cursor else 'importing history'})")
+    while not parar:
+        proc = abrir_journal(ultimo_cursor)
+        resto = b""
+        while not parar:
+            agora = time.time()
+            if agora >= proxima_limpeza:
+                try:
+                    with x.Trava():
+                        n = x.aplicar_retencao(x.ler_retencao(), gid=gid)
+                    if n:
+                        log(f"x9d: auto-delete removed {n} entries")
+                except OSError as erro:
+                    log(f"x9d: auto-delete failed: {erro}")
+                proxima_limpeza = agora + RETENCAO_A_CADA
+            pronto, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if pronto:
+                bloco = os.read(proc.stdout.fileno(), 65536)
+                if not bloco:
+                    break                                    # journalctl ended
+                resto += bloco
+                *linhas, resto = resto.split(b"\n")
+                for linha in linhas:
+                    try:
+                        e = json.loads(linha)
+                    except ValueError:
+                        continue
+                    peca = x.ler_linha(e)
+                    if peca:
+                        guardar(juntador.receber(peca))
+                    c = e.get("__CURSOR")
+                    if isinstance(c, str):
+                        ultimo_cursor = c
+            guardar(juntador.vencidos(time.time()))
+            if not juntador.abertos and ultimo_cursor and ultimo_cursor != salvo:
+                try:
+                    gravar_cursor(ultimo_cursor)
+                    salvo = ultimo_cursor
+                except OSError:
+                    pass
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if not parar:
+            log("x9d: journalctl stopped, starting it again in 5 s")
+            time.sleep(5)
+    guardar(juntador.todos())
+    if ultimo_cursor:
+        gravar_cursor(ultimo_cursor)
+    log("x9d: stopped")
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("x9d: must run as root (it is a system service)")
+    principal()

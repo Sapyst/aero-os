@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Aero OS</vendor>
+  <!-- The Settings app runs these root helpers with pkexec. auth_admin = the admin password is asked
+       EVERY time; nothing is remembered, and a sudo ticket that is still open does not count. -->
+  <action id="com.aero.settings.power">
+    <description>Change power settings (lid and power button)</description>
+    <message>Settings wants to change what the lid and the power button do.</message>
+    <icon_name>preferences-system</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/painel-energia</annotate>
+  </action>
+  <action id="com.aero.settings.memory">
+    <description>Change memory settings</description>
+    <message>Settings wants to change the memory guard or the swap.</message>
+    <icon_name>preferences-system</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/aero-memory-config</annotate>
+  </action>
+</policyconfig>

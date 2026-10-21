@@ -73,6 +73,23 @@ sudo install -m755 system/bin/painel-energia /usr/local/bin/painel-energia
 Aero's default: with the lid closed and no monitor, a laptop on battery sleeps, but **plugged in it
 keeps working** (screen off), also when you turn the external monitor off.
 
+## 5. Admin password and X9 (`system/x9/`)
+
+Settings never uses `sudo`: every root change (power, memory, system upgrade) goes through
+`pkexec`, and polkit asks the admin password **every time** (`auth_admin`, nothing remembered).
+An open sudo ticket does not count there.
+
+X9 is the admin activity log: a small root service (`x9d`) archives every sudo, pkexec and su call
+(one file per day in `/var/log/x9`, readable by the `wheel` group), and the X9 app shows them with
+filters, deletion and auto-delete rules. Deleting or changing the rules asks the admin password.
+```bash
+sudo bash system/x9/install.sh            # dry run: shows what it would do
+sudo bash system/x9/install.sh --apply    # X9 service + polkit rules (X9 and Settings)
+bash x9/install-app.sh                    # the app (no root)
+```
+The X9 password locks the app on your screen; it is not encryption. What protects the logs is that
+only root can change them. Lines that only claim to come from sudo (`logger -t sudo`) are ignored.
+
 ## Notes
 
 - Comments mention `doc NN`: those are the author's personal notes, not included.

@@ -1,0 +1,133 @@
+#!/usr/bin/env -S python3 -I
+"""
+x9-admin — the only way to change X9's archive. Runs as root through pkexec, and the polkit
+rule (com.aero.x9.manage) asks for the admin password EVERY time.
+
+  x9-admin delete          ids on stdin, as a JSON list
+  x9-admin delete-all
+  x9-admin set-retention   settings on stdin, as JSON (checked by x9core.validar_retencao)
+  x9-admin reset-lock      new X9 password on stdin (the "Forgot password?" button)
+
+Every change leaves one "X9" entry in the archive saying what was done (deleting only X9's
+own entries leaves none, or cleaning would never end).
+"""
+import grp
+import hashlib
+import json
+import os
+import pwd
+import sys
+import time
+
+sys.path.insert(0, "/usr/local/lib/x9")
+import x9core as x  # noqa: E402
+
+LIMITE_ENTRADA = 1024 * 1024
+
+
+def quem():
+    for var in ("PKEXEC_UID", "SUDO_UID"):
+        v = os.environ.get(var, "")
+        if v.isdigit():
+            return int(v)
+    sys.exit("x9-admin: run it through pkexec")
+
+
+def gid_wheel():
+    try:
+        return grp.getgrnam("wheel").gr_gid
+    except KeyError:
+        return 0
+
+
+def ler_entrada():
+    dados = sys.stdin.buffer.read(LIMITE_ENTRADA + 1)
+    if len(dados) > LIMITE_ENTRADA:
+        sys.exit("x9-admin: input too large")
+    return dados.decode("utf-8", "strict")
+
+
+def registrar(uid, proposito, detalhe):
+    try:
+        nome = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        nome = str(uid)
+    agora = time.time()
+    ev = {"id": hashlib.sha256(f"x9-admin {agora} {os.getpid()} {proposito}".encode()).hexdigest()[:16],
+          "ts": round(agora, 3), "tool": "x9", "user": nome, "as": "root", "result": "allowed", "reason": "",
+          "command": detalhe[:2000], "cwd": "", "tty": "none", "terminal": False, "app": "X9",
+          "category": "X9", "purpose": proposito, "risk": "medium"}
+    x.acrescentar([ev], gid=gid_wheel())
+
+
+def apagar(ids, uid):
+    alvo = set(ids)
+    removidos = so_do_x9 = 0
+    with x.Trava():
+        for dia in x.dias():
+            eventos = x.ler_dia(dia)
+            ficam = [e for e in eventos if e["id"] not in alvo]
+            if len(ficam) != len(eventos):
+                saem = [e for e in eventos if e["id"] in alvo]
+                removidos += len(saem)
+                so_do_x9 += sum(1 for e in saem if e.get("category") == "X9")
+                x.regravar_dia(dia, ficam, gid=gid_wheel())
+        if removidos and removidos != so_do_x9:
+            registrar(uid, f"Deleted {removidos} log entr{'y' if removidos == 1 else 'ies'}",
+                      f"x9-admin delete ({removidos})")
+    return removidos
+
+
+def principal(args):
+    if os.geteuid() != 0:
+        sys.exit("x9-admin: must run as root (through pkexec)")
+    if len(args) != 1:
+        sys.exit(__doc__)
+    uid = quem()
+    os.makedirs(x.ARQUIVO, mode=0o750, exist_ok=True)
+    acao = args[0]
+    if acao == "delete":
+        try:
+            ids = json.loads(ler_entrada())
+        except ValueError:
+            sys.exit("x9-admin: expected a JSON list of ids")
+        if not isinstance(ids, list) or not all(isinstance(i, str) and x.ID_RE.match(i) for i in ids):
+            sys.exit("x9-admin: bad ids")
+        print(apagar(ids, uid))
+    elif acao == "delete-all":
+        n = 0
+        with x.Trava():
+            for dia in x.dias():
+                n += len(x.ler_dia(dia))
+                x.regravar_dia(dia, [])
+            registrar(uid, f"Deleted all logs ({n} entries)", "x9-admin delete-all")
+        print(n)
+    elif acao == "set-retention":
+        try:
+            nova = x.validar_retencao(json.loads(ler_entrada()))
+        except ValueError as erro:
+            sys.exit(f"x9-admin: {erro}")
+        os.makedirs(os.path.dirname(x.RETENCAO), mode=0o755, exist_ok=True)
+        tmp = x.RETENCAO + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(nova, f, indent=1)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, x.RETENCAO)
+        with x.Trava():
+            registrar(uid, "Changed auto-delete rules", json.dumps(nova, separators=(",", ":")))
+            x.aplicar_retencao(nova, gid=gid_wheel())
+    elif acao == "reset-lock":
+        senha = ler_entrada().rstrip("\n")
+        problema = x.senha_boa(senha)
+        if problema:
+            sys.exit(f"x9-admin: {problema}")
+        os.makedirs(x.TRAVAS, mode=0o755, exist_ok=True)
+        x.gravar_trava(uid, pwd.getpwuid(uid).pw_gid, x.hash_senha(senha))
+        with x.Trava():
+            registrar(uid, "Reset the X9 password", "x9-admin reset-lock")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    principal(sys.argv[1:])

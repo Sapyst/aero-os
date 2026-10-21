@@ -15,7 +15,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 PASTA_APP = os.path.dirname(os.path.abspath(__file__))
-ASKPASS = os.path.expanduser("~/.local/bin/aero-askpass")   # janela de senha (askpass.py)
+PKEXEC = "/usr/bin/pkexec"   # pede a senha de admin pelo polkit, TODA vez (sem cache)
 
 
 # ---------- comandos ----------
@@ -26,21 +26,25 @@ def rodar(cmd, **kw):
 
 
 def ambiente_root():
-    """Ambiente com SUDO_ASKPASS: quando o sudo precisar de senha e não houver terminal,
-    ele chama o nosso askpass.py, que mostra uma janelinha de senha."""
+    """Ambiente para comandos de root. Sem SUDO_ASKPASS de propósito: o Settings não usa mais o sudo,
+    então nunca aproveita uma senha que o sudo ainda lembra (um ticket de sudo aberto não vale aqui)."""
     env = dict(os.environ)
-    env["SUDO_ASKPASS"] = ASKPASS
+    env.pop("SUDO_ASKPASS", None)
     return env
 
 
 def como_root(cmd):
-    """sudo -A = "se precisar de senha, peça pelo programa do SUDO_ASKPASS".
-    Se o sudo ainda lembra a senha, nem pergunta."""
-    return ["sudo", "-A"] + cmd
+    """pkexec = o polkit pede a senha de admin numa janela, a cada vez (a regra das ações
+    com.aero.* é auth_admin, que não guarda a senha). Só aceita caminho absoluto: nada de PATH,
+    que um programa qualquer do usuário poderia trocar.
+    Saídas do pkexec: 126 = senha cancelada/negada, 127 = sem permissão ou sem janela de senha."""
+    if not cmd or not os.path.isabs(cmd[0]):
+        raise ValueError(f"root command needs an absolute path: {cmd[:1]}")
+    return [PKEXEC] + list(cmd)
 
 
 def rodar_como_root(cmd):
-    return rodar(como_root(cmd), env=ambiente_root())
+    return rodar(como_root(cmd), env=ambiente_root(), stdin=subprocess.DEVNULL)
 
 
 def em_segundo_plano(funcao, depois=None):

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=X9
+GenericName=Admin activity log
+Comment=See every sudo, pkexec and su call: who asked, what for, and when
+Exec=@HOME@/.local/bin/x9
+Icon=security-high
+Terminal=false
+Categories=System;Security;Monitor;
+Keywords=sudo;log;audit;root;admin;security;
+StartupWMClass=com.aero.X9

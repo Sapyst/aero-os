@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Aero OS</vendor>
+  <!-- Deleting logs, changing auto-delete, resetting the X9 password: admin password EVERY time
+       (auth_admin, never auth_admin_keep). -->
+  <action id="com.aero.x9.manage">
+    <description>Change the X9 log archive</description>
+    <message>X9 wants to change the admin activity log. Type your password to allow it.</message>
+    <icon_name>security-high</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/x9/x9-admin</annotate>
+  </action>
+  <!-- Creating/changing your own X9 password (the old one is checked by the helper itself). -->
+  <action id="com.aero.x9.lock">
+    <description>Set your X9 password</description>
+    <message>X9 wants to save your X9 password.</message>
+    <icon_name>security-high</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/x9/x9-setlock</annotate>
+  </action>
+</policyconfig>

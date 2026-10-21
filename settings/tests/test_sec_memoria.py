@@ -380,7 +380,8 @@ class TestTextos(unittest.TestCase):
     def test_motivo_da_falha(self):
         def r(codigo, err=""):
             return subprocess.CompletedProcess([], codigo, "", err)
-        self.assertEqual(m.motivo_da_falha(r(1, "sudo: a password is required\n")), "password cancelled")
+        self.assertEqual(m.motivo_da_falha(r(126, "Error executing command as another user: Request dismissed\n")), "password cancelled")
+        self.assertEqual(m.motivo_da_falha(r(127, "Error executing command as another user: Not authorized\n")), "not authorized")
         self.assertEqual(m.motivo_da_falha(r(3, "warning: x\nnot now: aero-swap-setup: error: not enough free "
                                                "space: a 32.0 GB swap file would leave less than 20%\n\n")),
                          "not enough free space: a 32.0 GB swap file would leave less than 20%")
@@ -393,7 +394,7 @@ class TestTextos(unittest.TestCase):
         self.assertEqual(m.motivo_da_falha(r(4, "failed: aero-swap-setup took too long")),
                          "aero-swap-setup took too long")
         # sem motivo, código estranho, exceção ou saída que não é texto: genérico
-        for ruim in (r(4, ""), r(4, None), r(4, b"x"), r(127, "sudo: x"), r(-9), FileNotFoundError("sudo"), None):
+        for ruim in (r(4, ""), r(4, None), r(4, b"x"), r(1, "x"), r(-9), FileNotFoundError("pkexec"), None):
             self.assertEqual(m.motivo_da_falha(ruim), "something went wrong")
         # longo e com controles: limpo e curto (vai num aviso)
         longo = m.motivo_da_falha(r(2, "refused: \x1b[31m<b>" + "x" * 500 + "\n"))
@@ -866,7 +867,7 @@ class TestPagina(unittest.TestCase):
         self.pasta = tempfile.TemporaryDirectory()
         d = self.pasta.name
         self.chamadas_root, self.abertos = [], []
-        self.resposta_root, self.erro_root = 1, ""
+        self.resposta_root, self.erro_root = 126, ""   # pkexec: senha cancelada
         ajudante = os.path.join(d, "aero-memory-config")
         with open(ajudante, "w") as f:
             f.write("#!/bin/sh\nexit 1\n")
@@ -977,7 +978,7 @@ class TestPagina(unittest.TestCase):
         sw = s.chaves["kill_on_critical"]
         self.assertTrue(sw.get_active() and sw.get_sensitive())
         threads = threading.active_count()
-        self.resposta_root = 1                            # senha cancelada
+        self.resposta_root = 126                           # senha cancelada
         sw.set_active(False)
         self.assertFalse(sw.get_sensitive())              # ocupado: um comando por vez
         self.assertFalse(s.chaves["enabled"].get_sensitive())
@@ -1133,7 +1134,7 @@ class TestPagina(unittest.TestCase):
         self.assertEqual(m.escolhido(s.tamanho_ssd, s.opcoes_ssd), 16)
         explicados = []
         s.explicar = lambda titulo, texto: explicados.append((titulo, texto))
-        s.trocar_ssd(32)                                  # o "Change" do diálogo; senha cancelada (sudo: 1)
+        s.trocar_ssd(32)                                  # o "Change" do diálogo; senha cancelada (pkexec: 126)
         self.assertTrue(girar(lambda: not s.ocupado))
         self.assertEqual(self.chamadas_root, [[self.ajudante, "swap-size", "32"]])
         self.assertEqual(self.janela.avisos, ["Swap not changed: password cancelled"])

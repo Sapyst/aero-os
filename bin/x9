@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# X9 — admin activity log (sudo / pkexec / su)
+exec python3 "$HOME/.local/share/x9/x9.py" "$@"

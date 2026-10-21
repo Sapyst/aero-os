@@ -477,13 +477,15 @@ def texto_fechar(com_agente, servico_agente, agente):
 
 def motivo_da_falha(r):
     """Por que o comando de root não deu certo, em texto curto (vai num aviso sem markup).
-    sudo sai com 1 quando a senha é cancelada. O aero-memory-config sai com 2 (recusado), 3 (agora não)
+    pkexec sai com 126 quando a senha é cancelada e 127 sem permissão. O aero-memory-config sai com 2 (recusado), 3 (agora não)
     ou 4 (um passo falhou) e põe o motivo na última linha do stderr; os prefixos saem aqui:
     "not now: aero-swap-setup: error: not enough free space ..." -> "not enough free space ...".
-    r também pode ser uma exceção (o sudo nem rodou)."""
+    r também pode ser uma exceção (o pkexec nem rodou)."""
     codigo = getattr(r, "returncode", None)
-    if codigo == 1:
+    if codigo == 126:
         return "password cancelled"
+    if codigo == 127:
+        return "not authorized"
     texto = ""
     if codigo in (2, 3, 4):
         saida = getattr(r, "stderr", "")
@@ -1157,7 +1159,7 @@ class SecaoMemoria(Secao):
             self.montar_ssd(ler_swaps(ler_texto("/proc/swaps")))
             self.sensibilidade()
             self.atualizar()
-        # Sem limite de tempo de propósito: matar o sudo no meio de um swapoff deixaria o swap pela metade
+        # Sem limite de tempo de propósito: matar o pkexec no meio de um swapoff deixaria o swap pela metade
         em_segundo_plano(lambda: rodar_como_root(cmd), depois)
 
     def explicar(self, titulo, texto):

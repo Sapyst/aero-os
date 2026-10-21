@@ -1,0 +1,45 @@
+#!/usr/bin/env -S python3 -I
+"""
+x9-setlock — creates or changes the X9 app password of the person who calls it (pkexec gives
+their uid). No admin password needed (polkit com.aero.x9.lock), so it is kept tiny:
+- no password yet: sets the new one;
+- a password exists: only changes it if the OLD one is right.
+stdin: {"old": "..." or null, "new": "..."}. The file is /var/lib/x9/locks/<uid>.json, owned by root,
+readable by the person (the app checks the password itself). Forgot it? That is x9-admin reset-lock.
+"""
+import json
+import os
+import pwd
+import sys
+
+sys.path.insert(0, "/usr/local/lib/x9")
+import x9core as x  # noqa: E402
+
+
+def principal():
+    if os.geteuid() != 0:
+        sys.exit("x9-setlock: must run as root (through pkexec)")
+    uid = os.environ.get("PKEXEC_UID", "")
+    if not uid.isdigit():
+        sys.exit("x9-setlock: run it through pkexec")
+    uid = int(uid)
+    bruto = sys.stdin.buffer.read(4097)
+    if len(bruto) > 4096:
+        sys.exit("x9-setlock: input too large")
+    try:
+        dados = json.loads(bruto.decode("utf-8"))
+        velha, nova = dados.get("old"), dados["new"]
+    except (ValueError, KeyError, AttributeError):
+        sys.exit("x9-setlock: bad input")
+    problema = x.senha_boa(nova)
+    if problema:
+        sys.exit(f"x9-setlock: {problema}")
+    atual = x.ler_trava(uid)
+    if atual is not None and not (isinstance(velha, str) and x.confere_senha(velha, atual)):
+        sys.exit(3)                                   # wrong old password
+    os.makedirs(x.TRAVAS, mode=0o755, exist_ok=True)
+    x.gravar_trava(uid, pwd.getpwuid(uid).pw_gid, x.hash_senha(nova))
+
+
+if __name__ == "__main__":
+    principal()
