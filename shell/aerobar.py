@@ -118,11 +118,16 @@ CLARA = {"FG": (0.07, 0.07, 0.08), "DIM": (0.28, 0.28, 0.27), "RED": (0.85, 0.09
          "BLUE": (0.0, 0.42, 0.95), "YELLOW": (0.72, 0.5, 0.0), "GREEN": (0.0, 0.6, 0.3)}
 
 
-def usar_paleta(clara):
-    """Switches the drawing colours (module-level names the modules read) for the next module."""
+def usar_paleta(k):
+    """Drawing colours for the next module: k = 0 dark-background palette, 1 light-background palette,
+    anything between while the bar is changing (the colours blend)."""
     global FG, DIM, RED, BLUE, YELLOW, GREEN
-    pal = CLARA if clara else ESCURA
-    FG, DIM, RED, BLUE, YELLOW, GREEN = pal["FG"], pal["DIM"], pal["RED"], pal["BLUE"], pal["YELLOW"], pal["GREEN"]
+    k = float(k)
+
+    def mix(nome):
+        a, b = ESCURA[nome], CLARA[nome]
+        return tuple(a[i] + (b[i] - a[i]) * k for i in range(3))
+    FG, DIM, RED, BLUE, YELLOW, GREEN = (mix(n) for n in ("FG", "DIM", "RED", "BLUE", "YELLOW", "GREEN"))
 
 
 def luz_do_papel(caminho, largura, altura_tela, faixa, colunas=256):
@@ -222,19 +227,24 @@ def lancar(cmd):
 # ---------- drawing helpers ----------
 
 def halo(cr, x, y, raio, cor, forca=0.55):
-    """A soft glow behind a coloured dot (so colours shine on the black bar)."""
+    """A soft glow behind a coloured dot: a gaussian fall-off in many steps, so it melts into whatever
+    is behind with no visible edge."""
     import cairo
+    raio *= 1.35
     g = cairo.RadialGradient(x, y, 0, x, y, raio)
-    g.add_color_stop_rgba(0, *cor, forca)
-    g.add_color_stop_rgba(0.45, *cor, forca * 0.35)
-    g.add_color_stop_rgba(1, *cor, 0)
+    for k in range(13):
+        t = k / 12
+        g.add_color_stop_rgba(t, *cor, forca * 0.8 * math.exp(-4.2 * t * t) * (1 - t ** 6))
     cr.set_source(g)
     cr.arc(x, y, raio, 0, 2 * math.pi)
     cr.fill()
 
 
 def colorida(cor):
-    return CFG["glow"] and cor not in (FG, DIM)
+    return CFG["glow"] and cor not in (FG, DIM) and not CLARO_AGORA[0]
+
+
+CLARO_AGORA = [False]          # glows only on dark backgrounds (on light ones they look muddy)
 
 
 def icone(cr, nome_ou_linhas, x, y, tamanho, cor, alfa=1.0):
@@ -495,6 +505,7 @@ class Barra(Gtk.Window):
         self.sobre = None
         self.pulso = None
         self.papel, self.luz = "", None
+        self.mistura, self.alvos, self.trocas, self.tique_troca = {}, {}, {}, None
 
         cfg = os.path.join(BIN, "configuracoes")
         som = os.path.join(BIN, "som")
@@ -591,7 +602,8 @@ class Barra(Gtk.Window):
         for m in self.visiveis(self.esquerda + self.centro + self.direita):
             if m.w <= 0:
                 continue
-            usar_paleta(self.claro_em(m.x, m.x + m.w, w))
+            usar_paleta(self.mistura_de(m, self.claro_em(m.x, m.x + m.w, w), w))
+            CLARO_AGORA[0] = self.mistura.get(m.nome, 0) > 0.5
             if m is self.sobre and CFG["hover"] and not isinstance(m, EspacoBandeja):
                 cr.set_source_rgba(*FG, 0.08)
                 rr = 9
@@ -603,7 +615,8 @@ class Barra(Gtk.Window):
                 cr.close_path()
                 cr.fill()
             m.desenhar(cr, m.x)
-        usar_paleta(False)
+        usar_paleta(0)
+        CLARO_AGORA[0] = False
 
     def claro_em(self, x0, x1, w):
         """Is the wallpaper light under [x0, x1]? Only with no background (or glass) and auto contrast on."""
@@ -616,6 +629,37 @@ class Barra(Gtk.Window):
         if CFG["background"] == "glass":                     # the dark glass darkens what is behind it
             media *= 1 - CFG["opacity"] * 0.55
         return media > 0.55
+
+    TROCA, ONDA_TROCA = 0.45, 0.4        # each icon blends in 0.45 s; the change sweeps left->right in 0.4 s
+
+    def mistura_de(self, m, claro, w):
+        """Current blend for module m (0 dark .. 1 light). A change starts an animated sweep."""
+        alvo = 1.0 if claro else 0.0
+        agora = time.monotonic()
+        if self.alvos.get(m.nome) != alvo:
+            if m.nome not in self.alvos:                      # first draw: no animation
+                self.mistura[m.nome] = alvo
+            else:
+                atraso = (m.x / max(w, 1)) * self.ONDA_TROCA
+                self.trocas[m.nome] = (agora + atraso, self.mistura.get(m.nome, 1 - alvo))
+                if self.tique_troca is None:
+                    self.tique_troca = self.area.add_tick_callback(self._quadro_troca)
+            self.alvos[m.nome] = alvo
+        if m.nome in self.trocas:
+            inicio, de = self.trocas[m.nome]
+            t = min(1.0, max(0.0, (agora - inicio) / self.TROCA))
+            t = t * t * (3 - 2 * t)
+            self.mistura[m.nome] = de + (alvo - de) * t
+            if t >= 1:
+                del self.trocas[m.nome]
+        return self.mistura.get(m.nome, alvo)
+
+    def _quadro_troca(self, *_):
+        self.area.queue_draw()
+        if not self.trocas:
+            self.tique_troca = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
 
     def ler_papel(self):
         """Current wallpaper (hyprpaper) -> brightness of the strip under the bar. Runs in a thread."""
