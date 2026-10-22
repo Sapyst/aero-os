@@ -309,71 +309,105 @@ class Nuvem(Gtk.Window):
                 cr.fill()
 
     def semear_enfeites(self, w, h):
-        """Decorative dots that live AROUND the cloud: each one has a home on a halo hugging the cloud
-        (denser near its edge, a few further out), is pulled back to it like gravity, slowly orbits,
-        is pushed away by the pointer and never sits inside a bubble. They are flung out of the centre
-        when the menu opens and fall back into it when it closes."""
-        rnd = random.Random(int(time.time()))
-        raio_nuvem = max((math.hypot(b.x, b.y) + b.r for b in self.bolhas), default=300)
-        self.raio_nuvem = raio_nuvem
+        """The halftone filler: a grid of dots that fills the gaps between the bubbles and spills out around
+        the cloud. Big dots right against the bubbles, getting smaller and fainter the farther they are,
+        until they vanish. Every dot is alive: pulled back to its place (gravity), pushed away by the
+        pointer and by bubbles growing under the lens, condensing in when the menu opens and dissolving
+        when it closes."""
+        rnd = random.Random(len(self.bolhas))
+        passo, alcance = 14, 170
+        lim = max((math.hypot(b.x, b.y) + b.r for b in self.bolhas), default=300) + alcance
         self.enfeites = []
-        for _ in range(160):
-            ang = rnd.uniform(0, 2 * math.pi)
-            dist = raio_nuvem * (0.97 + abs(rnd.gauss(0, 0.16)))           # a tight halo hugging the cloud
-            hx, hy = math.cos(ang) * dist * 1.08, math.sin(ang) * dist * 0.9
-            tam = rnd.random()
-            r = 1.4 + tam ** 3 * 9                                   # mostly specks, a few soft discs
-            fora = rnd.uniform(3, 8)
-            self.enfeites.append({"hx": hx, "hy": hy, "x": rnd.gauss(0, 8), "y": rnd.gauss(0, 8),
-                                  "vx": math.cos(ang) * fora, "vy": math.sin(ang) * fora, "r": r,
-                                  "a": rnd.uniform(0.12, 0.34) * (0.7 if r > 6 else 1.0),
-                                  "giro": rnd.choice((-1, 1)) * rnd.uniform(0.002, 0.006)})
+        y = -lim
+        while y <= lim:
+            x = -lim + (passo / 2 if int((y + lim) / passo) % 2 else 0)        # hex-ish grid
+            while x <= lim:
+                # distance to the nearest bubble edge, and the 3 nearest bubbles (for collisions)
+                dists = sorted(((math.hypot(x - b.x, y - b.y) - b.r, i) for i, b in enumerate(self.bolhas)))
+                borda = dists[0][0] if dists else 999
+                if 5 < borda < alcance:
+                    t = borda / alcance
+                    if t < 0.35 or rnd.random() > (t - 0.35) * 1.2:            # sparser far out
+                        ang = rnd.uniform(0, 2 * math.pi)
+                        longe = rnd.uniform(180, 420)
+                        self.enfeites.append({
+                            "hx": x, "hy": y, "x": x + math.cos(ang) * longe, "y": y + math.sin(ang) * longe,
+                            "vx": 0.0, "vy": 0.0,
+                            "r": 1.0 + 3.6 * (1 - t) ** 1.6,
+                            "a": 0.06 + 0.36 * (1 - t) ** 1.3,
+                            "viz": [i for _, i in dists[:3]],
+                            "atraso": math.hypot(x, y) / lim * 0.35 + rnd.uniform(0, 0.06)})
+                x += passo
+            y += passo * 0.87
         self._t_fisica = time.monotonic()
 
     def desenhar_enfeites(self, cr, w, h, agora, geral):
-        if not getattr(self, "enfeites", None):
+        if getattr(self, "enfeites", None) is None:
             self.semear_enfeites(w, h)
-        dt = min(2.0, max(0.25, (agora - self._t_fisica) * 60))      # frames at 60 Hz
+        dt = min(2.0, max(0.25, (agora - self._t_fisica) * 60))       # in 60 Hz frames
         self._t_fisica = agora
         cx, cy = self._centro()
         fechando = self.t_fechar is not None
-        espalhar = 1.45 if self.busca else 1.0
-        rn = self.raio_nuvem
+        espalhar = 1.18 if self.busca else 1.0
+        mx = my = None
+        if self.mouse is not None and not fechando:
+            mx, my = self.mouse[0] - cx, self.mouse[1] - cy
+        bolhas = self.bolhas
+        amort = 0.8 ** dt
+        t_abriu = agora - self.t_abrir
+        # bubbles that are moving or magnified right now: only dots next to them need collision work
+        agitadas = {i for i, b in enumerate(bolhas)
+                    if b.lente > 0.01 or abs(b.ox) > 0.3 or abs(b.oy) > 0.3 or abs(b.vx) > 0.05 or abs(b.vy) > 0.05}
         for e in self.enfeites:
-            # slow orbit: the home itself turns around the cloud
-            c, s_ = math.cos(e["giro"] * dt), math.sin(e["giro"] * dt)
-            e["hx"], e["hy"] = e["hx"] * c - e["hy"] * s_, e["hx"] * s_ + e["hy"] * c
-            if fechando:                                              # everything falls into the centre
-                ax, ay = -e["x"] * 0.06, -e["y"] * 0.06
+            # resting fast path: at home, still, no pointer nearby, no moving bubble next to it
+            if (not fechando and not self.busca and abs(e["x"] - e["hx"]) < 0.3 and abs(e["y"] - e["hy"]) < 0.3
+                    and abs(e["vx"]) < 0.03 and abs(e["vy"]) < 0.03
+                    and (mx is None or abs(e["x"] - mx) > 170 or abs(e["y"] - my) > 170)
+                    and not agitadas.intersection(e["viz"])):
+                a = e["a"] * min(1.0, max(0.0, (t_abriu - e["atraso"]) / 0.25))
+                if a > 0.01:
+                    cr.set_source_rgba(*FG, a)
+                    cr.arc(cx + e["x"], cy + e["y"], e["r"], 0, 2 * math.pi)
+                    cr.fill()
+                continue
+            if fechando:
+                ax, ay = -e["x"] * 0.05, -e["y"] * 0.05               # everything falls into the centre
             else:
-                ax = (e["hx"] * espalhar - e["x"]) * 0.04             # gravity toward its home
-                ay = (e["hy"] * espalhar - e["y"]) * 0.04
-            px, py = cx + e["x"], cy + e["y"]
-            if self.mouse is not None and not fechando:               # the pointer pushes them away
-                dx, dy = px - self.mouse[0], py - self.mouse[1]
-                d = math.hypot(dx, dy)
-                if 1 < d < 190:
-                    f = (1 - d / 190) ** 2 * 3.2
-                    ax += dx / d * f
-                    ay += dy / d * f
-            if math.hypot(e["x"], e["y"]) < rn + 30 and not fechando:  # never inside a bubble
-                for b in self.bolhas:
+                ax = (e["hx"] * espalhar - e["x"]) * 0.07             # gravity back to its place
+                ay = (e["hy"] * espalhar - e["y"]) * 0.07
+            if mx is not None:                                        # the pointer pushes them away
+                dx, dy = e["x"] - mx, e["y"] - my
+                if -170 < dx < 170 and -170 < dy < 170:
+                    d = math.hypot(dx, dy)
+                    if 1 < d < 170:
+                        f = (1 - d / 170) ** 2 * 7
+                        ax += dx / d * f
+                        ay += dy / d * f
+            if not fechando:                                          # bubbles (and the lens) push them out
+                for i in e["viz"]:
+                    b = bolhas[i]
                     if b.escala < 0.5:
                         continue
                     dx, dy = e["x"] - (b.cx + b.ox), e["y"] - (b.cy + b.oy)
-                    d = math.hypot(dx, dy)
-                    lim = b.r * (1 + 0.5 * b.lente) + e["r"] + 4
-                    if 0.1 < d < lim:
-                        f = (lim - d) * 0.22
-                        ax += dx / d * f
-                        ay += dy / d * f
-            e["vx"] = (e["vx"] + ax * dt) * (0.84 ** dt)
-            e["vy"] = (e["vy"] + ay * dt) * (0.84 ** dt)
+                    lim = b.r * (1 + 0.5 * b.lente) + e["r"] + 3
+                    if -lim < dx < lim and -lim < dy < lim:
+                        d = math.hypot(dx, dy)
+                        if 0.1 < d < lim:
+                            f = (lim - d) * 0.35
+                            ax += dx / d * f
+                            ay += dy / d * f
+            e["vx"] = (e["vx"] + ax * dt) * amort
+            e["vy"] = (e["vy"] + ay * dt) * amort
             e["x"] += e["vx"] * dt
             e["y"] += e["vy"] * dt
-            vel = math.hypot(e["vx"], e["vy"])
-            brilho = min(1.0, 0.75 + vel * 0.08)                      # moving dots light up a little
-            cr.set_source_rgba(*FG, e["a"] * geral * brilho)
+            if fechando:
+                a = e["a"] * geral
+            else:
+                a = e["a"] * min(1.0, max(0.0, (t_abriu - e["atraso"]) / 0.25))
+            if a <= 0.01:
+                continue
+            vel = abs(e["vx"]) + abs(e["vy"])
+            cr.set_source_rgba(*FG, min(1.0, a * (1 + vel * 0.08)))    # moving dots light up a little
             cr.arc(cx + e["x"], cy + e["y"], e["r"], 0, 2 * math.pi)
             cr.fill()
 
@@ -394,7 +428,6 @@ class Nuvem(Gtk.Window):
             b.x, b.y = x, y
             b.cx, b.cy = x, y
             b.atraso = min(0.42, math.hypot(x, y) / 1400) + 0.18 + random.uniform(0, 0.04)
-        self.montar_vidro()
         self.reorganizar()
 
     def icone(self, b):
@@ -455,7 +488,7 @@ class Nuvem(Gtk.Window):
     def abrir(self):
         self.busca = ""
         self.carregar()
-        self.enfeites = None
+        self.enfeites = None                       # re-seeded around the new layout on the first frame
         for b in self.bolhas:                      # born at the centre: the spring throws them out to their place
             b.cx, b.cy = b.x * 0.35, b.y * 0.35
         self.t_abrir, self.t_fechar = time.monotonic(), None
@@ -616,7 +649,6 @@ class Nuvem(Gtk.Window):
             fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
         cr.set_source_rgba(0.02, 0.02, 0.025, 0.12 * fundo)
         cr.paint()
-        self.desenhar_vidro(cr, w, h, agora)
         self.desenhar_enfeites(cr, w, h, agora, fundo)
         sobre = self.bolha_em(*self.mouse) if self.mouse else None
         foco = sobre if sobre is not None else (self.sel if (self.busca or getattr(self, "navegou", False)) else None)
