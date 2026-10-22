@@ -305,7 +305,9 @@ def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar, claro=False):
     hermes.limpar_markup made safe."""
     cores_hex = config["colors_light" if claro else "colors"]
     cores = {k: rgb(v) for k, v in cores_hex.items()}
-    caixa = hd.CartaoDots(cores, config["radius"], critica=n.urgencia == 2)
+    pos = posicao(config)
+    lado = "right" if pos.endswith("right") else "left" if pos.endswith("left") else "center"
+    caixa = hd.CartaoDots(cores, config["radius"], critica=n.urgencia == 2, semente=n.id, origem=lado)
     caixa.set_size_request(config["width"], -1)
     dentro = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7, margin_top=12, margin_bottom=12,
                      margin_start=14, margin_end=12)

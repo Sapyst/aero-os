@@ -149,21 +149,27 @@ class TestDots(unittest.TestCase):
         i = s.notificar("Discord", 0, "", "Nova mensagem", "oi", [], {}, -1, ":1")
         c = ui.montar_cartao(s.ativas[i], s.config, lambda i: None, lambda i, k: None, lambda i: None)
         self.assertIsInstance(c, hd.CartaoDots)
-        contorno, conteudo = c.fases()
-        self.assertLess(conteudo, 0.2)                              # just born: outline first
+        forma, conteudo, contorno = c.fases()
+        self.assertEqual((forma, conteudo), (0.0, 0.0))            # just born: only bubbles
+        self.assertEqual(len(c.bolhas), c.N_BOLHAS)
         c.t_entrada -= 1
-        self.assertEqual(c.fases(), (1.0, 1.0))
+        self.assertEqual(c.fases(), (1.0, 1.0, 1.0))
+        self.assertEqual(hd.bolha(0), 0.0)
+        self.assertAlmostEqual(hd.bolha(1), 1.0)
         fim = []
         c.sair(lambda: fim.append(1))
         c.t_saida -= 1
-        self.assertEqual(c.fases(), (0.0, 0.0))
+        self.assertEqual(c.fases(), (0.0, 0.0, 0.0))
         c._quadro()
         ctx = __import__("gi.repository.GLib", fromlist=["GLib"]).MainContext.default()
         for _ in range(20):
             ctx.iteration(False)
         self.assertEqual(fim, [1])
         c.sobre(True)
-        self.assertEqual(c.alvo, 1.03)
+        self.assertEqual(c.alvo, 1.0)                               # leaving: hover is ignored
+        c2 = ui.montar_cartao(s.ativas[i], s.config, lambda i: None, lambda i, k: None, lambda i: None)
+        c2.sobre(True)
+        self.assertEqual(c2.alvo, 1.03)
 
     def test_sino(self):
         import json

@@ -453,7 +453,7 @@ class CentralNotificacoes(Janelinha):
         while (filho := self.cartao.get_first_child()) is not None:
             self.cartao.remove(filho)
         historico = notif_historico()
-        corte = self.limpas_ate()
+        corte = self.limpas_ate() if HERMES is None else 0      # o Hermes limpa de verdade (sem corte por id)
         itens = [n for n in historico if n.get("id", 0) > corte]
 
         topo = Gtk.Box(spacing=8, margin_start=4)
@@ -519,6 +519,11 @@ class CentralNotificacoes(Janelinha):
             subprocess.Popen(["hyprctl", "dispatch", "exec", f"gtk-launch {app}"], stdout=subprocess.DEVNULL)
 
     def limpar(self, historico):
+        if HERMES is not None:
+            HERMES.limpar_historico()
+            HERMES.dispensar_tudo()
+            self.montar()
+            return
         os.makedirs(os.path.dirname(self.LIMPAS), exist_ok=True)
         with open(self.LIMPAS, "w") as f:
             f.write(str(max((n.get("id", 0) for n in historico), default=0)))
@@ -1925,6 +1930,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
             print(f"hermes: not loaded: {erro!r}", flush=True)
             return
         servico = hermes.Hermes()
+        servico.carregar_historico()
 
         def ganhou():
             global HERMES

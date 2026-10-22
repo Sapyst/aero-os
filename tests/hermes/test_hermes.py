@@ -172,6 +172,32 @@ class TestLista(unittest.TestCase):
         self.assertEqual(ev[-1], ("show", c))                # critical passes DND
         self.assertEqual(len(ev), 2)
 
+    def test_historico_em_disco(self):
+        import tempfile
+        caminho = os.path.join(tempfile.mkdtemp(), "h.json")
+        s, r, _ = novo()
+        s.carregar_historico(caminho)
+        for k in range(3):
+            s.notificar("App", 0, "", f"n{k}", "<b>x</b>", [], {}, -1, ":1")
+        s.gravar_historico()
+        self.assertEqual(oct(os.stat(caminho).st_mode & 0o777), "0o600")
+        s2, _, _ = novo()
+        s2.carregar_historico(caminho)
+        self.assertEqual([x["summary"] for x in s2.historico], ["n0", "n1", "n2"])
+        i = s2.notificar("App", 0, "", "nova", "", [], {}, -1, ":1")
+        self.assertEqual(i, 4)                                  # numbering continues
+        s2.limpar_historico()
+        s2.gravar_historico()
+        s3, _, _ = novo()
+        s3.carregar_historico(caminho)
+        self.assertEqual(len(s3.historico), 0)
+        self.assertGreaterEqual(s3.proximo, 5)
+        with open(caminho, "w") as f:
+            f.write('{"items": [{"id": "x"}, {"id": 9, "summary": 3}, 5], "next": "bad"}')
+        s4, _, _ = novo()
+        s4.carregar_historico(caminho)                           # garbage ignored
+        self.assertEqual(len(s4.historico), 0)
+
     def test_spam(self):
         s, _, ev = novo()
         ids = [s.notificar("Spam", 0, "", str(k), "", [], {}, -1, ":1.9") for k in range(100)]

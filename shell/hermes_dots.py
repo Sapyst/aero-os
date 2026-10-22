@@ -162,21 +162,41 @@ def suave(a, b, x):
 
 # ---------- the card ----------
 
+def bolha(t):
+    """Pop-in scale for a bubble: 0 -> overshoots a little -> 1 (t in seconds since it started)."""
+    if t <= 0:
+        return 0.0
+    k = min(1.0, t / 0.22)
+    return k * (1 + 0.35 * math.sin(k * math.pi) * (1 - k))
+
+
 class CartaoDots(Gtk.Box):
     """Card container in DotStyle.
-    - entrance: the outline's dots light up around the card (a running head), then the content fades in;
+    - entrance: big dots pop up around the card's place in no particular order (bubbles); one of them,
+      on the bell's side, swells and stretches into the card while the others drift away and fade;
+      then the content fades in and the outline settles as small dots;
     - hover: a springy micro zoom (≈3%) and a shimmer running along the outline;
-    - exit: content fades, the outline's dots go out, then ao_sumir() is called."""
+    - exit: the reverse: the content goes, the card shrinks back into a dot, which bursts into bubbles."""
 
-    ENTRADA, SAIDA = 0.42, 0.34          # seconds
-    MARGEM = 7                           # room around the card for the zoom (px)
+    ENTRADA, SAIDA = 0.85, 0.6           # seconds
+    MARGEM = 18                          # room around the card for bubbles and the zoom (px)
+    N_BOLHAS = 13
 
-    def __init__(self, cores, raio, critica=False):
+    def __init__(self, cores, raio, critica=False, semente=0, origem="right"):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.fundo, self.texto, self.acento = cores["background"], cores["text"], cores["accent"]
-        self.raio, self.critica = raio, critica
+        self.raio, self.critica, self.origem = raio, critica, origem
         for m in ("top", "bottom", "start", "end"):
             getattr(self, f"set_margin_{m}")(self.MARGEM)
+        import random
+        rnd = random.Random(semente)
+        # bubbles: position (fraction of the card, may go a bit outside), size, delay, drift direction
+        self.bolhas = []
+        for _ in range(self.N_BOLHAS):
+            fx, fy = rnd.uniform(-0.05, 1.05), rnd.uniform(-0.15, 1.15)
+            ang = math.atan2(fy - 0.5, fx - 0.5) + rnd.uniform(-0.5, 0.5)
+            self.bolhas.append((fx, fy, rnd.uniform(3.0, 7.5), rnd.uniform(0.0, 0.26), math.cos(ang),
+                                math.sin(ang), rnd.uniform(0.6, 1.0)))
         self.t_entrada = time.monotonic()
         self.t_saida = None
         self.ao_sumir = None
@@ -193,6 +213,8 @@ class CartaoDots(Gtk.Box):
     # --- state ---
 
     def sobre(self, dentro):
+        if self.t_saida is not None:
+            return
         self.alvo = 1.03 if dentro else 1.0
         if dentro:
             self.vel += 0.6                                   # the little "tap" kick of the bounce
@@ -203,6 +225,7 @@ class CartaoDots(Gtk.Box):
         if self.t_saida is None:
             self.t_saida = time.monotonic()
             self.ao_sumir = ao_sumir
+            self.alvo = 1.0
             self.animar()
 
     def animar(self):
@@ -214,21 +237,20 @@ class CartaoDots(Gtk.Box):
         agora = time.monotonic()
         dt = min(0.05, agora - self._ultimo)
         self._ultimo = agora
-        # damped spring toward the target scale
-        k, amort = 260.0, 15.0
+        k, amort = 260.0, 15.0                                # damped spring toward the target scale
         acel = k * (self.alvo - self.escala) - amort * self.vel
         self.vel += acel * dt
         self.escala += self.vel * dt
         self.queue_draw()
-        entrando = agora - self.t_entrada < self.ENTRADA + 0.05
-        brilhando = self.brilho_t0 is not None and agora - self.brilho_t0 < 0.9
-        mola = abs(self.alvo - self.escala) > 0.0005 or abs(self.vel) > 0.002
         if self.t_saida is not None and agora - self.t_saida >= self.SAIDA:
             self.tique = None
             if self.ao_sumir:
                 f, self.ao_sumir = self.ao_sumir, None
                 GLib.idle_add(lambda: (f(), False)[1])
             return GLib.SOURCE_REMOVE
+        entrando = agora - self.t_entrada < self.ENTRADA + 0.05
+        brilhando = self.brilho_t0 is not None and agora - self.brilho_t0 < 0.9
+        mola = abs(self.alvo - self.escala) > 0.0005 or abs(self.vel) > 0.002
         if not (entrando or brilhando or mola or self.t_saida is not None):
             self.escala, self.vel = self.alvo, 0.0
             self.tique = None
@@ -236,71 +258,120 @@ class CartaoDots(Gtk.Box):
         return GLib.SOURCE_CONTINUE
 
     def fases(self):
-        """(outline 0..1, content alpha 0..1) for this instant."""
+        """(forma 0..1 = dot -> card, conteudo 0..1, contorno 0..1) for this instant."""
         agora = time.monotonic()
-        contorno = suave(0, self.ENTRADA * 0.8, agora - self.t_entrada)
-        conteudo = suave(self.ENTRADA * 0.45, self.ENTRADA, agora - self.t_entrada)
+        e = agora - self.t_entrada
+        forma = suave(0.26, 0.6, e)
+        conteudo = suave(0.58, 0.82, e)
+        contorno = suave(0.55, 0.8, e)
         if self.t_saida is not None:
             p = (agora - self.t_saida) / self.SAIDA
-            conteudo *= 1 - suave(0.0, 0.5, p)
-            contorno *= 1 - suave(0.25, 1.0, p)
-        return contorno, conteudo
+            conteudo *= 1 - suave(0.0, 0.3, p)
+            contorno *= 1 - suave(0.0, 0.25, p)
+            forma *= 1 - suave(0.18, 0.55, p)
+        return forma, conteudo, contorno
 
     # --- drawing ---
 
     def do_snapshot(self, snap):
         w, h = self.get_width(), self.get_height()
-        contorno, conteudo = self.fases()
+        forma, conteudo, contorno = self.fases()
         snap.save()
         cx, cy = w / 2, h / 2
         snap.translate(Graphene.Point().init(cx, cy))
         snap.scale(self.escala, self.escala)
         snap.translate(Graphene.Point().init(-cx, -cy))
-        ret = Graphene.Rect().init(-self.MARGEM, -self.MARGEM, w + 2 * self.MARGEM, h + 2 * self.MARGEM)
-        cr = snap.append_cairo(ret)
-        self._fundo_e_contorno(cr, w, h, contorno, conteudo)
-        snap.push_opacity(conteudo)
-        Gtk.Box.do_snapshot(self, snap)
-        snap.pop()
+        m = self.MARGEM
+        cr = snap.append_cairo(Graphene.Rect().init(-m, -m, w + 2 * m, h + 2 * m))
+        self._bolhas(cr, w, h)
+        self._forma(cr, w, h, forma, contorno)
+        if conteudo > 0.001:
+            snap.push_opacity(conteudo)
+            Gtk.Box.do_snapshot(self, snap)
+            snap.pop()
         snap.restore()
 
-    def _fundo_e_contorno(self, cr, w, h, contorno, conteudo):
-        r = self.raio
-        # glass background (appears with the content)
-        if conteudo > 0:
-            cr.new_sub_path()
-            for (ax, ay, a0) in ((w - r, r, -math.pi / 2), (w - r, h - r, 0), (r, h - r, math.pi / 2), (r, r, math.pi)):
-                cr.arc(ax, ay, r, a0, a0 + math.pi / 2)
-            cr.close_path()
-            cr.set_source_rgba(*self.fundo, 0.93 * conteudo)
+    def _cor(self):
+        return self.acento if self.critica else self.texto
+
+    def _ponto_origem(self, w, h):
+        """Where the swelling dot starts: the corner on the bell's side."""
+        return (w - 22, 18) if self.origem == "right" else (22, 18) if self.origem == "left" else (w / 2, 18)
+
+    def _bolhas(self, cr, w, h):
+        agora = time.monotonic()
+        e = agora - self.t_entrada
+        cor = self._cor()
+        saindo = self.t_saida is not None
+        p = (agora - self.t_saida) / self.SAIDA if saindo else 0
+        for fx, fy, r, atraso, dx, dy, peso in self.bolhas:
+            x, y = fx * w, fy * h
+            if not saindo:
+                escala = bolha(e - atraso)
+                deriva = max(0.0, e - 0.3) * 60 * peso                 # drift away once the card forms
+                alfa = 0.55 * (1 - suave(0.4, 0.78, e))
+            else:
+                # bursting out of the shrinking dot: from the origin point outward, then fading
+                ox, oy = self._ponto_origem(w, h)
+                k = suave(0.42, 1.0, p)
+                x, y = ox + (x - ox) * k, oy + (y - oy) * k
+                escala = bolha(p * self.SAIDA - 0.25 - atraso * 0.4)
+                deriva = max(0.0, p - 0.6) * 50 * peso
+                alfa = 0.5 * (1 - suave(0.7, 1.0, p))
+            if escala <= 0 or alfa <= 0.005:
+                continue
+            cr.set_source_rgba(*cor, alfa)
+            cr.arc(x + dx * deriva, y + dy * deriva, r * escala, 0, 2 * math.pi)
             cr.fill()
-            # faint dot texture inside
-            for x in range(10, int(w) - 6, 12):
-                for y in range(10, int(h) - 6, 12):
-                    cr.set_source_rgba(*self.texto, 0.035 * conteudo)
-                    cr.arc(x, y, 0.8, 0, 2 * math.pi)
+
+    def _forma(self, cr, w, h, forma, contorno):
+        if forma <= 0.001:
+            return
+        ox, oy = self._ponto_origem(w, h)
+        r0 = 7.0
+        # dot -> card: centre, size and corner radius all travel together
+        cx = ox + (w / 2 - ox) * forma
+        cy = oy + (h / 2 - oy) * forma
+        ww = 2 * r0 + (w - 2 * r0) * forma
+        hh = 2 * r0 + (h - 2 * r0) * forma
+        r = min(r0 + (self.raio - r0) * forma, ww / 2, hh / 2)
+        x0, y0 = cx - ww / 2, cy - hh / 2
+        cr.new_sub_path()
+        for (ax, ay, a0) in ((x0 + ww - r, y0 + r, -math.pi / 2), (x0 + ww - r, y0 + hh - r, 0),
+                             (x0 + r, y0 + hh - r, math.pi / 2), (x0 + r, y0 + r, math.pi)):
+            cr.arc(ax, ay, r, a0, a0 + math.pi / 2)
+        cr.close_path()
+        cor = self._cor()
+        if forma < 1:
+            # while it swells, the shape is the dot's own colour turning into glass
+            mistura = suave(0.5, 1.0, forma)
+            cr.set_source_rgba(*(cor[i] + (self.fundo[i] - cor[i]) * mistura for i in range(3)),
+                               0.9 - 0.0 * mistura)
+        else:
+            cr.set_source_rgba(*self.fundo, 0.93)
+        cr.fill()
+        if forma >= 1:
+            for x in range(14, int(w) - 8, 13):                 # faint dot texture inside
+                for y in range(14, int(h) - 8, 13):
+                    cr.set_source_rgba(*self.texto, 0.04)
+                    cr.arc(x, y, 0.9, 0, 2 * math.pi)
                     cr.fill()
         if contorno <= 0:
             return
-        cor = self.acento if self.critica else self.texto
-        pontos = perimetro(0.5, 0.5, w - 1, h - 1, r, 6.0)
+        pontos = perimetro(0.5, 0.5, w - 1, h - 1, self.raio, 7.0)
         n = len(pontos)
         agora = time.monotonic()
-        acesos = contorno * n
         brilho = None
         if self.brilho_t0 is not None and agora - self.brilho_t0 < 0.9:
-            brilho = (agora - self.brilho_t0) / 0.9 * n            # shimmer position along the outline
+            brilho = (agora - self.brilho_t0) / 0.9 * n
+        base = 0.75 if self.critica else 0.34
         for i, (x, y) in enumerate(pontos):
-            if i > acesos:
-                break
-            cabeca = max(0.0, 1 - (acesos - i) / 6) if contorno < 1 else 0.0   # bright running head
-            a = (0.32 if not self.critica else 0.75) + 0.6 * cabeca
-            raio = 1.15 + 0.6 * cabeca
+            a, raio = base * contorno, 1.5
             if brilho is not None:
                 d = min(abs(i - brilho), n - abs(i - brilho))
                 onda = max(0.0, 1 - d / 5)
                 a += 0.55 * onda
-                raio += 0.7 * onda
+                raio += 0.9 * onda
             cr.set_source_rgba(*cor, min(1.0, a))
             cr.arc(x, y, raio, 0, 2 * math.pi)
             cr.fill()

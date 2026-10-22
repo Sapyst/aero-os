@@ -379,6 +379,8 @@ class Hermes:
         self.dono = None
         self.taxa = {}                       # sender -> (second, count)
         self.modos = set(["dnd"] if self.config["dnd"]["enabled"] else [])
+        self.arquivo_historico = None
+        self._gravar_id = 0
         self.segurar = lambda n: False       # UI sets: True = the card is held (fullscreen); its timer
                                              # starts only when the card really shows (armar)
 
@@ -512,6 +514,59 @@ class Hermes:
         self.historico = deque((x for x in self.historico if x["id"] != n.id), maxlen=self.historico.maxlen)
         if self.config["history"]["size"]:
             self.historico.append(n.resumo())
+        self._agendar_gravacao()
+
+    # --- history on disk (only readable by you), so restarts don't lose it ---
+
+    def carregar_historico(self, caminho=HISTORICO):
+        """Reads the saved history and continues the numbering after its highest id."""
+        self.arquivo_historico = caminho
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                dados = json.load(f)
+        except (OSError, ValueError):
+            return
+        itens = dados.get("items") if isinstance(dados, dict) else None
+        if not isinstance(itens, list):
+            return
+        bons = []
+        for x in itens[-self.historico.maxlen:]:
+            if isinstance(x, dict) and isinstance(x.get("id"), int) and isinstance(x.get("summary"), str):
+                bons.append({"id": x["id"], "app": texto_puro(x.get("app", ""), 120),
+                             "summary": texto_puro(x["summary"]), "body": texto_puro(x.get("body", ""), 2000),
+                             "urgency": x.get("urgency") if x.get("urgency") in ("low", "normal", "critical")
+                             else "normal", "category": texto_puro(x.get("category") or "", 64),
+                             "icon": texto_puro(x.get("icon") or "", 500),
+                             "desktop_entry": texto_puro(x.get("desktop_entry") or "", 128),
+                             "time": x.get("time") if isinstance(x.get("time"), (int, float)) else 0,
+                             "actions": []})
+        self.historico = deque(bons, maxlen=self.historico.maxlen)
+        prox = dados.get("next") if isinstance(dados.get("next"), int) else 1
+        self.proximo = max(self.proximo, prox, max((x["id"] for x in bons), default=0) + 1)
+
+    def _agendar_gravacao(self):
+        if self.arquivo_historico is None or self._gravar_id:
+            return
+        self._gravar_id = self.agendar(1500, self.gravar_historico)
+
+    def gravar_historico(self):
+        self._gravar_id = 0
+        if self.arquivo_historico is None:
+            return
+        try:
+            pasta = os.path.dirname(self.arquivo_historico)
+            os.makedirs(pasta, mode=0o700, exist_ok=True)
+            tmp = self.arquivo_historico + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"next": self.proximo, "items": list(self.historico)}, f, ensure_ascii=False)
+            os.replace(tmp, self.arquivo_historico)
+        except OSError as erro:
+            print(f"hermes: history not saved: {erro}", flush=True)
+
+    def limpar_historico(self):
+        self.historico.clear()
+        self._agendar_gravacao()
 
     def _parar_timer(self, id_):
         t = self.timers.pop(id_, None)
