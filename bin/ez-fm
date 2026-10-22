@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # Gerenciador de arquivos (EZ File Manager, doc 43). O app mora em ~/.local/share/ez-fm (cópia nossa,
 # revisada e com correções de segurança). Uso: ez-fm [pasta]   (sem pasta = a sua pasta pessoal)
-# GDK_WAYLAND_DISABLE não afeta (Electron não é GTK4); o run-electron.sh liga o modo Wayland.
-exec "$HOME/.local/share/ez-fm/scripts/run-electron.sh" "$@"
+# Se ele estiver "morno" (fechado há menos de 10 min, só escondido), o pedido vai pelo socket e a janela
+# volta na hora; senão o Electron inicia normalmente.
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/ez-fm.sock"
+args=()
+for a in "$@"; do
+    if [[ $a != -* && -e $a ]]; then args+=("$(realpath -- "$a")"); else args+=("$a"); fi
+done
+if [ -S "$SOCK" ] && printf '%s\0' "${args[@]}" | socat -t2 - UNIX-CONNECT:"$SOCK" 2>/dev/null; then
+    exit 0
+fi
+exec "$HOME/.local/share/ez-fm/scripts/run-electron.sh" "${args[@]}"

@@ -1,0 +1,105 @@
+/* [Aero] DotStyle for the file manager: loaded on top of aero.css only when the system visual is DotStyle
+   (main.js adds the "dotstyle" class to <html> and injects this file). OLED-black glass, Doto titles,
+   files that pop in, a soft lift on hover, a dotted ring on the selection, scrollbars made of dots. */
+
+html.dotstyle {
+    --bg-primary: rgba(11, 11, 12, 0.9);
+    --bg-secondary: rgba(236, 235, 232, 0.025);
+    --bg-tertiary: rgba(236, 235, 232, 0.05);
+    --menu-bg: rgba(14, 14, 15, 0.97);
+    --menu-overlay-bg: rgba(14, 14, 15, 0.98);
+    --bg-hover: rgba(236, 235, 232, 0.07);
+    --bg-active: rgba(236, 235, 232, 0.13);
+    --text-primary: #ecebe8;
+    --text-secondary: rgba(236, 235, 232, 0.72);
+    --text-muted: rgba(236, 235, 232, 0.45);
+    --border-color: rgba(236, 235, 232, 0.08);
+    --accent-color: rgba(236, 235, 232, 0.16);
+    --accent-hover: rgba(236, 235, 232, 0.28);
+    --linha: #ecebe8;
+    --pasta: #ecebe8;
+    --dot-red: #ff3b30;
+    --spring: cubic-bezier(0.34, 1.36, 0.64, 1);
+    scroll-behavior: smooth;
+}
+html.dotstyle body { font-family: "Geist", "Inter", system-ui, sans-serif; }
+html.dotstyle .sidebar-title, html.dotstyle .ops-section-title, html.dotstyle .theme-modal-title,
+html.dotstyle .breadcrumb-item, html.dotstyle .group-header {
+    font-family: "Doto", "Geist Mono", monospace; font-weight: 900; letter-spacing: 1px;
+}
+html.dotstyle .header-size, html.dotstyle .header-date, html.dotstyle .header-added,
+html.dotstyle .file-item .file-size, html.dotstyle .file-item .file-date {
+    font-family: "Geist Mono", monospace; font-size: 0.92em;
+}
+
+/* files pop in, a few at a time (only the first screenful is staggered) */
+@keyframes dot-pop {
+    from { opacity: 0; transform: scale(0.86) translateY(6px); }
+    70%  { opacity: 1; transform: scale(1.02) translateY(0); }
+    to   { opacity: 1; transform: scale(1); }
+}
+html.dotstyle .file-item { animation: dot-pop 340ms var(--spring) both; border-radius: 14px;
+    transition: background 160ms ease, transform 220ms var(--spring), box-shadow 220ms ease; }
+html.dotstyle .file-item:nth-child(1)  { animation-delay: 0ms; }
+html.dotstyle .file-item:nth-child(2)  { animation-delay: 12ms; }
+html.dotstyle .file-item:nth-child(3)  { animation-delay: 24ms; }
+html.dotstyle .file-item:nth-child(4)  { animation-delay: 36ms; }
+html.dotstyle .file-item:nth-child(5)  { animation-delay: 48ms; }
+html.dotstyle .file-item:nth-child(6)  { animation-delay: 60ms; }
+html.dotstyle .file-item:nth-child(7)  { animation-delay: 72ms; }
+html.dotstyle .file-item:nth-child(8)  { animation-delay: 84ms; }
+html.dotstyle .file-item:nth-child(9)  { animation-delay: 96ms; }
+html.dotstyle .file-item:nth-child(10) { animation-delay: 108ms; }
+html.dotstyle .file-item:nth-child(n+11) { animation-delay: 120ms; }
+html.dotstyle .file-item:hover { background: var(--bg-hover); transform: translateY(-1px) scale(1.012); }
+html.dotstyle .file-item.selected {
+    background: rgba(236, 235, 232, 0.1);
+    outline: 2px dotted rgba(236, 235, 232, 0.6); outline-offset: -2px;
+    box-shadow: 0 0 22px rgba(236, 235, 232, 0.08);
+}
+
+/* sidebar: a lit dot marks where you are */
+html.dotstyle .sidebar-item { border-radius: 12px; transition: background 160ms ease, transform 220ms var(--spring); position: relative; }
+html.dotstyle .sidebar-item:hover { transform: translateX(3px); }
+html.dotstyle .sidebar-item.active { background: rgba(236, 235, 232, 0.09); }
+html.dotstyle .sidebar-item.active::before {
+    content: ""; position: absolute; left: 3px; top: 50%; width: 6px; height: 6px; margin-top: -3px;
+    border-radius: 99px; background: #ecebe8; box-shadow: 0 0 10px rgba(236, 235, 232, 0.7);
+}
+
+/* round, springy buttons */
+html.dotstyle .nav-btn, html.dotstyle .action-btn, html.dotstyle .status-bar-icon-btn, html.dotstyle .ops-icon-btn {
+    border-radius: 99px; transition: background 160ms ease, transform 220ms var(--spring);
+}
+html.dotstyle .nav-btn:hover, html.dotstyle .action-btn:hover, html.dotstyle .status-bar-icon-btn:hover,
+html.dotstyle .ops-icon-btn:hover { transform: scale(1.1); }
+html.dotstyle .nav-btn:active, html.dotstyle .action-btn:active { transform: scale(0.94); }
+
+/* menus and toasts: dotted rim, pop in */
+html.dotstyle .context-menu, html.dotstyle .view-menu, html.dotstyle .notification, html.dotstyle .theme-modal-panel {
+    border: 2px dotted rgba(236, 235, 232, 0.22) !important; border-radius: 18px !important;
+    animation: dot-pop 260ms var(--spring) both;
+}
+html.dotstyle .notification.error { border-color: var(--dot-red) !important; }
+
+/* scrollbars: a column of dots */
+html.dotstyle ::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+html.dotstyle ::-webkit-scrollbar-track { background: transparent; }
+html.dotstyle ::-webkit-scrollbar-thumb {
+    background-color: transparent;
+    background-image: radial-gradient(circle, rgba(236, 235, 232, 0.65) 1.8px, transparent 2.4px);
+    background-size: 10px 8px; background-repeat: repeat-y; border: none;
+}
+html.dotstyle ::-webkit-scrollbar-thumb:hover {
+    background-image: radial-gradient(circle, rgba(236, 235, 232, 0.95) 2.2px, transparent 2.8px);
+}
+html.dotstyle .file-list-container, html.dotstyle .sidebar { scroll-behavior: smooth; }
+
+/* the separators become dotted */
+html.dotstyle hr, html.dotstyle .ops-section + .ops-section { border: none;
+    background-image: radial-gradient(circle, rgba(236, 235, 232, 0.22) 0.9px, transparent 1.3px);
+    background-size: 6px 2px; background-repeat: repeat-x; background-position: top; }
+
+@media (prefers-reduced-motion: reduce) {
+    html.dotstyle .file-item, html.dotstyle .context-menu, html.dotstyle .notification { animation: none; }
+}

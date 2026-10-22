@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Warms the disk cache for apps that start slowly the first time after boot (the file manager is an
+# Electron app: ~300 MB of runtime read from the SSD on its first launch). Runs once, 25 s after login,
+# at the lowest CPU and I/O priority, then exits. It only fills the page cache, which the kernel gives
+# back on its own whenever memory is needed: no process stays resident.
+sleep 25
+for d in /usr/lib/electron44 "$HOME/.local/share/ez-fm"; do
+    [ -d "$d" ] || continue
+    find "$d" -type f -size -120M -print0 2>/dev/null | nice -n 19 ionice -c3 xargs -0 -r cat > /dev/null 2>&1
+done

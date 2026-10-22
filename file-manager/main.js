@@ -21,6 +21,11 @@ const sizeOf = require("image-size");
 const shq = (t) => "'" + String(t).replace(/'/g, "'\\''") + "'";
 const { fileURLToPath } = require("url");
 
+// [Aero] Smoother drawing and scrolling (GPU rasterization; the app is all scrolling lists of thumbnails)
+if (!process.env.AERO_FM_SEM_GPU) app.commandLine.appendSwitch("enable-gpu-rasterization");
+if (!process.env.AERO_FM_SEM_GPU) app.commandLine.appendSwitch("enable-zero-copy");
+app.commandLine.appendSwitch("enable-smooth-scrolling");
+
 let isPicker = false;
 let isDev = false;
 
@@ -48,10 +53,13 @@ function toFileUrl(p) {
   );
 }
 
+// [Aero] A warm window can be reused by a later launch: its arguments replace the original ones.
+let argvAtual = process.argv;
+
 function getUserArgs() {
   const appPath = app.getAppPath();
   const exePath = app.getPath("exe");
-  return process.argv.filter((arg, idx) => {
+  return argvAtual.filter((arg, idx) => {
     if (idx === 0) return false;
     if (arg === appPath || arg === exePath) return false;
   return true;
@@ -203,8 +211,60 @@ function registerDevtoolsShortcuts() {
 }
 
 
+// [Aero] DotStyle: when the system visual is DotStyle, its CSS goes on top of aero.css
+function visualDoSistema() {
+  try {
+    const m = fsSync.readFileSync(path.join(require("os").homedir(), ".config", "hypr", "painel.conf"), "utf8")
+      .match(/^VISUAL=(.*)$/m);
+    return m ? m[1].replace(/"/g, "").trim() : "";
+  } catch { return ""; }
+}
+function aplicarVisual(win) {
+  if (!win || win.isDestroyed()) return;
+  const css = path.join(__dirname, "aero-dotstyle.css");
+  if (visualDoSistema() === "DotStyle" && fsSync.existsSync(css)) {
+    win.webContents.insertCSS(fsSync.readFileSync(css, "utf8")).catch(() => {});
+    win.webContents.executeJavaScript("document.documentElement.classList.add('dotstyle')").catch(() => {});
+  }
+}
+
+// [Aero] Warm window: closing it only HIDES it for 10 minutes, so the next Super+E shows it at once
+// (no new Electron to start). After 10 minutes without use the app quits and gives the memory back.
+// The file picker (portal) never stays warm. A launch while warm comes through ez-fm.sock (see below).
+const MORNO_MS = 10 * 60 * 1000;
+let saindoDeVez = false;
+let timerMorno = null;
+function esconderMorno(win) {
+  win.hide();
+  clearTimeout(timerMorno);
+  timerMorno = setTimeout(() => { saindoDeVez = true; app.quit(); }, MORNO_MS);
+}
+function reabrir(argv) {
+  if (!mainWindow || mainWindow.isDestroyed()) { argvAtual = argv; createWindow(); return; }
+  clearTimeout(timerMorno);
+  argvAtual = argv;
+  const query = buildWindowQuery(resolveStartPath(getUserArgs()), getPickerOptions(getUserArgs()));
+  mainWindow.loadFile("index.html", { query });
+  mainWindow.webContents.once("did-finish-load", () => { aplicarVisual(mainWindow); mainWindow.show(); mainWindow.focus(); });
+}
+function ouvirSocket() {
+  const sock = path.join(process.env.XDG_RUNTIME_DIR || "/tmp", "ez-fm.sock");
+  try { fsSync.unlinkSync(sock); } catch {}
+  const srv = require("net").createServer((c) => {
+    let dados = "";
+    c.on("data", (d) => { dados += d; if (dados.length > 8192) c.destroy(); });
+    c.on("end", () => {
+      const args = dados.split("\0").filter((a) => a.length > 0 && a.length < 4096);
+      reabrir([process.argv[0], app.getAppPath(), ...args]);
+    });
+  });
+  srv.listen(sock, () => { try { fsSync.chmodSync(sock, 0o600); } catch {} });
+  app.on("will-quit", () => { try { fsSync.unlinkSync(sock); } catch {} });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
+    show: false,
     width: 1200,
     height: 800,
     minWidth: 360,
@@ -240,6 +300,15 @@ function createWindow() {
   const query = buildWindowQuery(startPath, pickerOptions);
 
   mainWindow.loadFile("index.html", { query });
+  // shown only once the page is ready: no empty frame, no flash
+  mainWindow.once("ready-to-show", () => { aplicarVisual(mainWindow); mainWindow.show(); });
+  if (!isPicker) {
+    mainWindow.on("close", (e) => {
+      if (saindoDeVez) return;
+      e.preventDefault();
+      esconderMorno(mainWindow);
+    });
+  }
 
   mainWindow.webContents.on("did-finish-load", () => {
     if (isPicker) {
@@ -293,6 +362,95 @@ function ouvirTemaDoSistema() {
   app.on("will-quit", () => vigia.kill());
 }
 
+// [Aero/doc 43] Configurações num ARQUIVO comum (ajustes.json), não só no localStorage do Chromium: o banco
+// do localStorage fica trancado pela janela aberta, e o seletor de arquivos (outra instância) via tudo zerado.
+// O arquivo é a fonte da verdade; cada janela manda só as chaves que mudou (uma não apaga a mudança da outra).
+const AJUSTES = path.join(app.getPath("userData"), "ajustes.json");
+function lerAjustes() {
+  try { return JSON.parse(fsSync.readFileSync(AJUSTES, "utf8")); } catch { return null; }
+}
+ipcMain.on("ajustes-ler", (event) => { event.returnValue = lerAjustes(); });
+ipcMain.on("ajustes-mudar", (event, delta) => {
+  try {
+    const a = lerAjustes() || {};
+    for (const [k, v] of Object.entries(delta || {})) {
+      if (v === null) delete a[k]; else a[k] = String(v);
+    }
+    const tmp = AJUSTES + ".tmp";
+    fsSync.writeFileSync(tmp, JSON.stringify(a));
+    fsSync.renameSync(tmp, AJUSTES);
+    event.returnValue = true;
+  } catch (e) {
+    event.returnValue = false;
+  }
+});
+
+// [Aero] Clique direito › Properties: tudo o que dá pra saber de um arquivo ou pasta
+ipcMain.handle("propriedades", async (event, alvo) => {
+  const { execFile } = require("child_process");
+  const run = (cmd, args, ms = 4000) => new Promise((ok) => {
+    execFile(cmd, args, { timeout: ms }, (err, out) => ok(err ? "" : String(out).trim()));
+  });
+  try {
+    const st = await fs.lstat(alvo);
+    const real = st.isSymbolicLink() ? await fs.realpath(alvo).catch(() => "") : "";
+    const info = {
+      nome: path.basename(alvo) || alvo, pasta: path.dirname(alvo), caminho: alvo,
+      pastaQ: st.isDirectory(), link: st.isSymbolicLink() ? real : "",
+      tamanho: st.size, criado: st.birthtimeMs, modificado: st.mtimeMs, acessado: st.atimeMs,
+      modo: st.mode & 0o7777, uid: st.uid, gid: st.gid,
+    };
+    const passwd = fsSync.existsSync("/etc/passwd") ? fsSync.readFileSync("/etc/passwd", "utf8") : "";
+    const grupo = fsSync.existsSync("/etc/group") ? fsSync.readFileSync("/etc/group", "utf8") : "";
+    const nomeDe = (txt, id) => (txt.split("\n").find((l) => l.split(":")[2] === String(id)) || "").split(":")[0] || String(id);
+    info.dono = nomeDe(passwd, st.uid);
+    info.grupo = nomeDe(grupo, st.gid);
+    info.mime = await run("xdg-mime", ["query", "filetype", alvo]);
+    const desc = await run("gio", ["info", "-a", "standard::description", alvo]);
+    info.descricao = (desc.match(/standard::description:\s*(.+)/) || [])[1] || "";
+    if (info.mime) {
+      const desk = await run("xdg-mime", ["query", "default", info.mime]);
+      info.app = "";
+      if (desk) {
+        for (const base of [path.join(require("os").homedir(), ".local/share/applications"), "/usr/share/applications"]) {
+          const f = path.join(base, desk);
+          if (fsSync.existsSync(f)) {
+            const m = fsSync.readFileSync(f, "utf8").match(/^Name=(.+)$/m);
+            info.app = m ? m[1] : desk;
+            break;
+          }
+        }
+      }
+    }
+    if (st.isDirectory()) {
+      try { info.itens = (await fs.readdir(alvo)).length; } catch { info.itens = null; }
+    } else if (/^image\//.test(info.mime || "")) {
+      try { const d = sizeOf(alvo); info.dimensoes = `${d.width} × ${d.height}`; } catch {}
+    }
+    return { ok: true, info };
+  } catch (e) {
+    return { ok: false, erro: e.message };
+  }
+});
+// tamanho total de uma pasta (pode demorar: separado, com limite de tempo)
+ipcMain.handle("tamanho-pasta", async (event, alvo) => new Promise((ok) => {
+  require("child_process").execFile("du", ["-sb", "--", alvo], { timeout: 30000 }, (err, out) => {
+    const n = parseInt(String(out || "").split(/\s/)[0], 10);
+    ok(Number.isFinite(n) ? n : null);
+  });
+}));
+
+// [Aero] Clique direito › Open With…: o diálogo do sistema (abrir-com), com "Just once" e "Always"
+ipcMain.handle("abrir-com", (event, caminhos) => {
+  const lista = (Array.isArray(caminhos) ? caminhos : []).filter((c) => typeof c === "string" && c.startsWith("/"));
+  if (!lista.length) return false;
+  const bin = path.join(require("os").homedir(), ".local", "bin", "abrir-com");
+  const p = require("child_process").spawn(fsSync.existsSync(bin) ? bin : "abrir-com", lista, { detached: true, stdio: "ignore" });
+  p.on("error", () => {});
+  p.unref();
+  return true;
+});
+
 // [Aero/doc 43] Botões ✖ ▲ ▼ ● da barra de cima: os mesmos comandos do sistema (agem na janela ativa)
 ipcMain.handle("janela-acao", (event, acao) => {
   const bin = path.join(require("os").homedir(), ".local", "bin");
@@ -308,6 +466,7 @@ app.whenReady().then(() => {
   ouvirTemaDoSistema();
   isDev = process.env.EZFM_DEVTOOLS === "1";
   createWindow();
+  if (!isPicker) ouvirSocket();
 
   if (isDev) {
     registerDevtoolsShortcuts();
@@ -319,6 +478,7 @@ app.on("window-all-closed", () => {
     app.quit();
   }
 });
+app.on("before-quit", () => { saindoDeVez = true; });
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
