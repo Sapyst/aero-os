@@ -211,6 +211,15 @@ def cor_ultrasu(minutos):
     return GREEN if h > 15 else BLUE if h > 7 else YELLOW if h > 3 else RED
 
 
+def suave_(a, b, x):
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (x - a) / (b - a)
+    return t * t * (3 - 2 * t)
+
+
 def rodar(*cmd, timeout=4):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
@@ -1017,6 +1026,27 @@ class Barra(Gtk.Window):
             self.redesenhar()
 
 
+class Pegador(Gtk.Window):
+    """An invisible full-screen layer under a popup: a click anywhere outside the popup lands here and
+    closes it. Exists only while the popup is open."""
+
+    def __init__(self, ao_clicar):
+        super().__init__(decorated=False)
+        Camada.init_for_window(self)
+        Camada.set_layer(self, Camada.Layer.OVERLAY)
+        Camada.set_namespace(self, "aerobar-pegador")
+        for borda in (Camada.Edge.TOP, Camada.Edge.BOTTOM, Camada.Edge.LEFT, Camada.Edge.RIGHT):
+            Camada.set_anchor(self, borda, True)
+        Camada.set_exclusive_zone(self, -1)
+        Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
+        self.add_css_class("aerobar-gota")
+        area = Gtk.DrawingArea(hexpand=True, vexpand=True)
+        self.set_child(area)
+        c = Gtk.GestureClick(button=0)
+        c.connect("pressed", lambda *_: ao_clicar())
+        area.add_controller(c)
+
+
 class Calendario(Gtk.Window):
     """A month in dots under the clock: today is a lit dot with a red ring, weekends dimmer, the other
     days small dots with their number in Doto. Scroll or the arrows change month; a click outside closes.
@@ -1033,6 +1063,7 @@ class Calendario(Gtk.Window):
         Camada.set_anchor(self, Camada.Edge.TOP, True)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.ON_DEMAND)
         self.add_css_class("aerobar-gota")
+        self.pegador = Pegador(self.esconder)
         self.largura = self.COL * self.PASSO + 36
         self.altura = self.TOPO_GRADE + self.LIN * self.PASSO + 20
         self.area = Gtk.DrawingArea(content_width=self.largura, content_height=self.altura)
@@ -1062,13 +1093,17 @@ class Calendario(Gtk.Window):
         self.ano, self.mes = hoje.tm_year, hoje.tm_mon
         Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA + 6)
         self.t0, self.saindo = time.monotonic(), False
+        self.pegador.present()                      # first the click-catcher, then the calendar above it
         self.set_visible(True)
         self.present()
         self.animar()
 
+    SAIDA = 0.5
+
     def esconder(self):
         if self.get_visible() and not self.saindo:
             self.saindo, self.t0 = True, time.monotonic()
+            self.pegador.set_visible(False)         # clicks go back to the desktop right away
             self.animar()
 
     def mudar_mes(self, d):
@@ -1087,7 +1122,7 @@ class Calendario(Gtk.Window):
     def _quadro(self, *_):
         e = time.monotonic() - self.t0
         self.area.queue_draw()
-        if self.saindo and e > 0.3:
+        if self.saindo and e > self.SAIDA:
             self.tique = None
             self.set_visible(False)
             return GLib.SOURCE_REMOVE
@@ -1116,16 +1151,23 @@ class Calendario(Gtk.Window):
         import calendar
         e = time.monotonic() - self.t0
         if self.saindo:
-            geral = max(0.0, 1 - e / 0.3)
+            # leaving: the days go out last-to-first (rising and shrinking into dots), then the panel
+            # folds up toward the clock and fades
+            geral = 1 - suave_(0.25, self.SAIDA, e)
+            dobra = 1 - suave_(0.22, self.SAIDA, e) * 0.85
         else:
             geral = min(1.0, e / 0.2)
+            dobra = 0.75 + 0.25 * (1 - (1 - min(1.0, e / 0.3)) ** 3)   # unfolds down from the clock
         r = 22
+        hh = h * dobra
         cr.new_sub_path()
-        for (ax, ay, a0) in ((w - r, r, -math.pi / 2), (w - r, h - r, 0), (r, h - r, math.pi / 2), (r, r, math.pi)):
+        for (ax, ay, a0) in ((w - r, r, -math.pi / 2), (w - r, hh - r, 0), (r, hh - r, math.pi / 2), (r, r, math.pi)):
             cr.arc(ax, ay, r, a0, a0 + math.pi / 2)
         cr.close_path()
         cr.set_source_rgba(0.043, 0.043, 0.047, 0.93 * geral)
-        cr.fill()
+        cr.fill_preserve()
+        cr.save()
+        cr.clip()
         # month title and arrows
         titulo = time.strftime("%B %Y", (self.ano, self.mes, 1, 0, 0, 0, 0, 1, -1)).upper()
         texto(cr, None, "<", 22, 30, "Doto Black 16", ESCURA["DIM"], geral)
@@ -1144,11 +1186,18 @@ class Calendario(Gtk.Window):
                     continue
                 cx = 18 + i * self.PASSO + self.PASSO / 2
                 cy = self.TOPO_GRADE + j * self.PASSO + self.PASSO / 2
-                atraso = (j * 7 + i) * 0.012
-                k = 1.0 if self.saindo else min(1.0, max(0.0, (e - atraso) / 0.22))
-                k = 1 - (1 - k) ** 3
-                if k <= 0:
+                if self.saindo:
+                    ordem = (len(semanas) * 7 - (j * 7 + i)) * 0.006       # the last day leaves first
+                    k = 1 - suave_(ordem, ordem + 0.18, e)
+                    sobe = (1 - k) * 10
+                else:
+                    atraso = (j * 7 + i) * 0.012
+                    k = min(1.0, max(0.0, (e - atraso) / 0.22))
+                    k = 1 - (1 - k) ** 3
+                    sobe = -4 * (1 - k)
+                if k <= 0.01:
                     continue
+                cy -= sobe
                 eh_hoje = (self.ano, self.mes, dia) == (hoje.tm_year, hoje.tm_mon, hoje.tm_mday)
                 fim_semana = i >= 5
                 if eh_hoje:
@@ -1168,7 +1217,8 @@ class Calendario(Gtk.Window):
                     cor_num, a_num = ESCURA["FG"], 0.55 if fim_semana else 0.9
                 num = str(dia)
                 nw = texto(cr, None, num, 0, 0, "Doto Black 15", cor_num, medir=True)
-                texto(cr, None, num, cx - nw / 2, cy - 4 * (1 - k), "Doto Black 15", cor_num, a_num * geral * k)
+                texto(cr, None, num, cx - nw / 2, cy, "Doto Black 15", cor_num, a_num * k)
+        cr.restore()
 
 
 class Gota(Gtk.Window):
