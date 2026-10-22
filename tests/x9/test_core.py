@@ -86,6 +86,22 @@ class TestLeitura(unittest.TestCase):
         self.assertEqual(nao["result"], "denied")
         self.assertEqual(nao["category"], "Root shell")
 
+    def test_pkexec_que_ja_virou_o_programa(self):
+        sessao = j("pam_unix(polkit-1:session): session opened for user root(uid=0) by alice(uid=1000)",
+                   fonte="pkexec", pid="77")
+        execucao = j("alice: Executing command [USER=root] [TTY=unknown] [CWD=/] "
+                     "[COMMAND=/usr/local/bin/aero-memory-config set enabled 0]", fonte="pkexec", pid="77")
+        execucao["_EXE"] = "/usr/bin/python3.14"            # journald saw it after the exec
+        evs = eventos([sessao, execucao])
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["purpose"], "Change memory settings: set enabled 0")
+        # without the real PAM line from the same pid it is ignored (could be forged)
+        self.assertEqual(eventos([execucao]), [])
+        outra = dict(sessao, _PID="78")
+        self.assertEqual(eventos([outra, execucao]), [])
+        falsa = dict(sessao, _EXE="/usr/bin/python3.14")
+        self.assertEqual(eventos([falsa, execucao]), [])
+
     def test_pkexec_env_sem_aspas(self):
         e = eventos([j("alice: Executing command [USER=root] [TTY=unknown] [CWD=/] [COMMAND=/usr/bin/env "
                        "SHELL=/usr/bin/bash HYPRLAND_CMD=Hyprland --watchdog-fd 4 XDG=x /usr/bin/python3 "
@@ -163,6 +179,11 @@ class TestCategorias(unittest.TestCase):
         ("/usr/bin/env FOO=1 /usr/bin/pacman -S vim", "Packages", "Install packages: vim"),
         ("/usr/bin/nice -n 5 /usr/bin/ls /root", "Inspect (read-only)", None),
         ("/usr/local/lib/x9/x9-admin delete", "X9", "Delete X9 log entries"),
+        ("/usr/local/lib/x9/x9-setlock", "X9", "Set the X9 password"),
+        ("/usr/local/bin/aero-snap 'X9 fix' bash system/x9/install.sh --apply", "Scripts & code",
+         "Run script install.sh (with snapshots: X9 fix)"),
+        ("/usr/local/bin/aero-snap undo 2 3", "Disks & storage", "Undo changes from a snapshot"),
+        ("/usr/bin/cat /var/log/x9/2026-10-21.jsonl", "Inspect (read-only)", None),
         ("/opt/weird/thing --x", "Other", None),
         ("", "Other", None),
         ("'unbalanced", "Other", None),

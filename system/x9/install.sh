@@ -3,16 +3,18 @@
 #   sudo bash system/x9/install.sh            -> shows what it would do (dry run)
 #   sudo bash system/x9/install.sh --apply    -> installs and starts x9d
 #   sudo bash system/x9/install.sh --uninstall --apply
+#   ... --reimport  -> reads the whole journal again (fills gaps; entries you deleted in X9 come back)
 # The archive (/var/log/x9) is kept on uninstall; delete it yourself if you want it gone.
 # The app (no root) is installed by x9/install-app.sh.
 set -euo pipefail
 aqui="$(cd "$(dirname "$0")" && pwd)"
 raiz="$(cd "$aqui/../.." && pwd)"
-aplicar=0; remover=0
+aplicar=0; remover=0; reimportar=0
 for a in "$@"; do
   case "$a" in
     --apply) aplicar=1 ;;
     --uninstall) remover=1 ;;
+    --reimport) reimportar=1 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -44,6 +46,7 @@ faz install -m644 -o root -g root "$raiz/system/polkit/com.aero.settings.policy"
   /usr/share/polkit-1/actions/com.aero.settings.policy
 faz install -m644 -o root -g root "$aqui/x9d.service" /etc/systemd/system/x9d.service
 faz systemctl daemon-reload
+[ $reimportar -eq 1 ] && faz rm -f /var/lib/x9/history-imported
 faz systemctl enable x9d.service
 faz systemctl restart x9d.service   # picks up a new version when reinstalling
 

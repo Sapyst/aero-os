@@ -107,13 +107,18 @@ def ler_linha(e):
         return None
     # Anyone can write "sudo: ..." to the journal (logger -t sudo). _EXE is filled in by journald
     # from the real process, so it can't be faked: only the real programs count.
-    if _texto(e.get("_EXE")) not in EXECUTAVEIS[fonte]:
+    # pkexec is special: it logs "Executing command" and turns into that command right away, so
+    # journald often sees the new program. Its PAM line just before (same process) still shows the
+    # real pkexec: the Juntador only accepts that "Executing" line if the PAM line proved the pid.
+    confiavel = _texto(e.get("_EXE")) in EXECUTAVEIS[fonte]
+    if not confiavel and fonte != "pkexec":
         return None
     try:
         ts = int(e.get("__REALTIME_TIMESTAMP", "0")) / 1e6
     except ValueError:
         return None
     base = {"tool": fonte, "pid": _texto(e.get("_PID")), "ts": ts, "cursor": _texto(e.get("__CURSOR")),
+            "trusted": confiavel,
             "app": app_da_unidade(_texto(e.get("_SYSTEMD_USER_UNIT")) or _texto(e.get("_SYSTEMD_UNIT"))),
             "cmdline": _texto(e.get("_CMDLINE"))[:2000]}
 
@@ -161,6 +166,7 @@ class Juntador:
 
     def __init__(self):
         self.abertos = {}            # (tool, pid) -> event being built
+        self.pkexec_reais = {}       # pid -> when its PAM line came from the real pkexec
 
     def receber(self, p, agora=None):
         """Returns the events that are finished now. `agora` = when the line ARRIVED (wall clock):
@@ -168,6 +174,16 @@ class Juntador:
         agora = time.time() if agora is None else agora
         prontos = []
         chave = (p["tool"], p["pid"])
+        if p["tool"] == "pkexec":
+            if p["kind"] == "session" and p["trusted"]:
+                self.pkexec_reais[p["pid"]] = agora
+                if len(self.pkexec_reais) > 1000:
+                    for pid in sorted(self.pkexec_reais, key=self.pkexec_reais.get)[:500]:
+                        del self.pkexec_reais[pid]
+            if not p["trusted"] and not (p["kind"] == "main" and self.pkexec_reais.pop(p["pid"], None) is not None):
+                return prontos                                  # not proven to come from pkexec
+            if p["kind"] == "main" and p["trusted"]:
+                self.pkexec_reais.pop(p["pid"], None)
         atual = self.abertos.get(chave)
         if p["kind"] == "continued":
             if atual is not None:
@@ -348,11 +364,21 @@ def classificar(comando, ferramenta="sudo"):
     texto = " ".join(p)
     toca_sensivel = any(s in texto for s in SENSIVEIS)
 
-    if prog.startswith("x9") or "/x9/" in comando:
+    if prog == "x9-setlock":
+        return "X9", "Set the X9 password", "low"
+    if prog == "x9-admin":
         acao = args[0] if args else "?"
         return "X9", {"delete": "Delete X9 log entries", "delete-all": "Delete all X9 logs",
                       "set-retention": "Change X9 auto-delete rules",
                       "reset-lock": "Reset the X9 password"}.get(acao, f"X9: {acao}"), "medium"
+    if prog == "aero-snap":
+        if args[:1] in (["list"], ["undo"]):
+            return "Disks & storage", ("Undo changes from a snapshot" if args[0] == "undo"
+                                       else "Look at the snapshots"), "medium" if args[0] == "undo" else "low"
+        dentro = classificar(" ".join(shlex.quote(a) for a in args[1:]), ferramenta) if len(args) > 1 else None
+        if dentro:
+            return dentro[0], f"{dentro[1]} (with snapshots: {args[0]})", dentro[2]
+        return "Disks & storage", "Take a snapshot", "low"
     eh_aero = prog.startswith("aero-") or prog == "painel-energia" or \
         (prog in SHELLS and any("aero" in a for a in _alvos(args)[:1]))
     if eh_aero:
