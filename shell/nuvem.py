@@ -315,7 +315,7 @@ class Nuvem(Gtk.Window):
         pointer and by bubbles growing under the lens, condensing in when the menu opens and dissolving
         when it closes."""
         rnd = random.Random(len(self.bolhas))
-        passo, alcance = 14, 170
+        passo, alcance = 16, 170
         lim = max((math.hypot(b.x, b.y) + b.r for b in self.bolhas), default=300) + alcance
         self.enfeites = []
         y = -lim
@@ -330,13 +330,11 @@ class Nuvem(Gtk.Window):
                     if t < 0.35 or rnd.random() > (t - 0.35) * 1.2:            # sparser far out
                         ang = rnd.uniform(0, 2 * math.pi)
                         longe = rnd.uniform(180, 420)
-                        self.enfeites.append({
-                            "hx": x, "hy": y, "x": x + math.cos(ang) * longe, "y": y + math.sin(ang) * longe,
-                            "vx": 0.0, "vy": 0.0,
-                            "r": 1.0 + 3.6 * (1 - t) ** 1.6,
-                            "a": 0.06 + 0.36 * (1 - t) ** 1.3,
-                            "viz": [i for _, i in dists[:3]],
-                            "atraso": math.hypot(x, y) / lim * 0.35 + rnd.uniform(0, 0.06)})
+                        # [hx, hy, x, y, vx, vy, r, a, neighbours, delay] (a list: much faster than a dict)
+                        self.enfeites.append([
+                            x, y, x + math.cos(ang) * longe, y + math.sin(ang) * longe, 0.0, 0.0,
+                            1.0 + 3.8 * (1 - t) ** 1.6, 0.06 + 0.36 * (1 - t) ** 1.3,
+                            [i for _, i in dists[:3]], math.hypot(x, y) / lim * 0.35 + rnd.uniform(0, 0.06)])
                 x += passo
             y += passo * 0.87
         self._t_fisica = time.monotonic()
@@ -358,25 +356,26 @@ class Nuvem(Gtk.Window):
         # bubbles that are moving or magnified right now: only dots next to them need collision work
         agitadas = {i for i, b in enumerate(bolhas)
                     if b.lente > 0.01 or abs(b.ox) > 0.3 or abs(b.oy) > 0.3 or abs(b.vx) > 0.05 or abs(b.vy) > 0.05}
+        grupos = [[] for _ in range(12)]          # dots grouped by brightness: one fill per group, not per dot
+        ativos = 0
         for e in self.enfeites:
             # resting fast path: at home, still, no pointer nearby, no moving bubble next to it
-            if (not fechando and not self.busca and abs(e["x"] - e["hx"]) < 0.3 and abs(e["y"] - e["hy"]) < 0.3
-                    and abs(e["vx"]) < 0.03 and abs(e["vy"]) < 0.03
-                    and (mx is None or abs(e["x"] - mx) > 170 or abs(e["y"] - my) > 170)
-                    and not agitadas.intersection(e["viz"])):
-                a = e["a"] * min(1.0, max(0.0, (t_abriu - e["atraso"]) / 0.25))
+            if (not fechando and not self.busca and abs(e[2] - e[0]) < 0.3 and abs(e[3] - e[1]) < 0.3
+                    and abs(e[4]) < 0.03 and abs(e[5]) < 0.03
+                    and (mx is None or abs(e[2] - mx) > 170 or abs(e[3] - my) > 170)
+                    and not agitadas.intersection(e[8])):
+                a = e[7] * min(1.0, max(0.0, (t_abriu - e[9]) / 0.25))
                 if a > 0.01:
-                    cr.set_source_rgba(*FG, a)
-                    cr.arc(cx + e["x"], cy + e["y"], e["r"], 0, 2 * math.pi)
-                    cr.fill()
+                    grupos[min(11, int(a * 22))].append((cx + e[2], cy + e[3], e[6]))
                 continue
+            ativos += 1
             if fechando:
-                ax, ay = -e["x"] * 0.05, -e["y"] * 0.05               # everything falls into the centre
+                ax, ay = -e[2] * 0.05, -e[3] * 0.05               # everything falls into the centre
             else:
-                ax = (e["hx"] * espalhar - e["x"]) * 0.07             # gravity back to its place
-                ay = (e["hy"] * espalhar - e["y"]) * 0.07
+                ax = (e[0] * espalhar - e[2]) * 0.07             # gravity back to its place
+                ay = (e[1] * espalhar - e[3]) * 0.07
             if mx is not None:                                        # the pointer pushes them away
-                dx, dy = e["x"] - mx, e["y"] - my
+                dx, dy = e[2] - mx, e[3] - my
                 if -170 < dx < 170 and -170 < dy < 170:
                     d = math.hypot(dx, dy)
                     if 1 < d < 170:
@@ -384,31 +383,43 @@ class Nuvem(Gtk.Window):
                         ax += dx / d * f
                         ay += dy / d * f
             if not fechando:                                          # bubbles (and the lens) push them out
-                for i in e["viz"]:
+                for i in e[8]:
                     b = bolhas[i]
                     if b.escala < 0.5:
                         continue
-                    dx, dy = e["x"] - (b.cx + b.ox), e["y"] - (b.cy + b.oy)
-                    lim = b.r * (1 + 0.5 * b.lente) + e["r"] + 3
+                    dx, dy = e[2] - (b.cx + b.ox), e[3] - (b.cy + b.oy)
+                    lim = b.r * (1 + 0.5 * b.lente) + e[6] + 3
                     if -lim < dx < lim and -lim < dy < lim:
                         d = math.hypot(dx, dy)
                         if 0.1 < d < lim:
                             f = (lim - d) * 0.35
                             ax += dx / d * f
                             ay += dy / d * f
-            e["vx"] = (e["vx"] + ax * dt) * amort
-            e["vy"] = (e["vy"] + ay * dt) * amort
-            e["x"] += e["vx"] * dt
-            e["y"] += e["vy"] * dt
+            e[4] = (e[4] + ax * dt) * amort
+            e[5] = (e[5] + ay * dt) * amort
+            e[2] += e[4] * dt
+            e[3] += e[5] * dt
             if fechando:
-                a = e["a"] * geral
+                a = e[7] * geral
             else:
-                a = e["a"] * min(1.0, max(0.0, (t_abriu - e["atraso"]) / 0.25))
+                a = e[7] * min(1.0, max(0.0, (t_abriu - e[9]) / 0.25))
             if a <= 0.01:
                 continue
-            vel = abs(e["vx"]) + abs(e["vy"])
-            cr.set_source_rgba(*FG, min(1.0, a * (1 + vel * 0.08)))    # moving dots light up a little
-            cr.arc(cx + e["x"], cy + e["y"], e["r"], 0, 2 * math.pi)
+            vel = abs(e[4]) + abs(e[5])
+            a = min(1.0, a * (1 + vel * 0.08))                         # moving dots light up a little
+            grupos[min(11, int(a * 22))].append((cx + e[2], cy + e[3], e[6]))
+        self._ativos = ativos
+        if t_abriu < 1.0:
+            self._ativos += 1                      # still fading in
+        dois_pi = 2 * math.pi
+        for k, grupo in enumerate(grupos):
+            if not grupo:
+                continue
+            cr.new_path()
+            for x, y, r in grupo:
+                cr.new_sub_path()
+                cr.arc(x, y, r, 0, dois_pi)
+            cr.set_source_rgba(*FG, (k + 0.5) / 22)
             cr.fill()
 
     def carregar(self):
@@ -560,7 +571,8 @@ class Nuvem(Gtk.Window):
             if f:
                 GLib.idle_add(lambda: (f(), False)[1])
             return GLib.SOURCE_REMOVE
-        if not (mexendo or abrindo or lente or self.t_fechar is not None or self.get_visible()):
+        # still: every dot at rest, nothing moving, pointer quiet -> stop drawing (0 CPU) until something moves
+        if not (mexendo or abrindo or lente or self.t_fechar is not None or getattr(self, "_ativos", 1) > 0):
             self.tique = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
