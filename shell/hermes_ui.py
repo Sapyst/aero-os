@@ -299,14 +299,18 @@ def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar):
             img.set_valign(Gtk.Align.START)
             meio.append(img)
     textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+    # a wrapping label asks for its whole text as one line unless told otherwise: cap it by the card width
+    colunas = max(12, int((config["width"] - 30 - (46 if config["icons"] else 0)) / 8.6))   # ~px per char at 13 px
     if n.titulo:
         t = Gtk.Label(label=n.titulo, xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2,
-                      ellipsize=Pango.EllipsizeMode.END, use_markup=False)
+                      ellipsize=Pango.EllipsizeMode.END, use_markup=False, max_width_chars=colunas,
+                      natural_wrap_mode=Gtk.NaturalWrapMode.WORD)
         t.add_css_class("hermes-titulo")
         textos.append(t)
     if n.corpo:
         c = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=4,
-                      ellipsize=Pango.EllipsizeMode.END)
+                      ellipsize=Pango.EllipsizeMode.END, max_width_chars=colunas,
+                      natural_wrap_mode=Gtk.NaturalWrapMode.WORD)
         c.set_markup(n.corpo)
         c.add_css_class("hermes-corpo")
         textos.append(c)
