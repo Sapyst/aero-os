@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# AeroBar — the DotStyle top bar (shell/aerobar.py). Started by aero-barra, never twice.
+# If it crashes it comes back in 2 s; a normal stop (aero-barra switching to Waybar) ends it for good.
+# Log: ~/.cache/aero-shell/aerobar.log
+mkdir -p "$HOME/.cache/aero-shell"
+LOG="$HOME/.cache/aero-shell/aerobar.log"
+PIDS="${XDG_RUNTIME_DIR:-/tmp}/aerobar.pid"
+exec 9> "${XDG_RUNTIME_DIR:-/tmp}/aerobar.trava"
+flock -n 9 || exit 0
+echo $$ > "$PIDS"
+filho=0
+trap 'kill "$filho" 2>/dev/null; rm -f "$PIDS"; exit 0' TERM INT
+while true; do
+    LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$HOME/.local/share/aero-shell/aerobar.py" >> "$LOG" 2>&1 9>&- &
+    filho=$!
+    wait "$filho"; codigo=$?
+    [ "$codigo" -eq 0 ] && break
+    echo "=== $(date '+%F %T') aerobar exited ($codigo), starting again" >> "$LOG"
+    sleep 2
+done
+rm -f "$PIDS"

@@ -1897,6 +1897,17 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         threading.Thread(target=self.vigiar, daemon=True).start()
 
     def lembrar_sino(self):
+        # a barra (AeroBar) tira a bolinha vermelha do sino: tudo até a última notificação foi visto
+        if HERMES is not None:
+            try:
+                ultimo = max((x["id"] for x in HERMES.historico), default=0)
+                with open(os.path.expanduser("~/.cache/aero-shell/sino-visto"), "w") as f:
+                    f.write(str(ultimo))
+            except OSError:
+                pass
+        self._lembrar_posicao_do_sino()
+
+    def _lembrar_posicao_do_sino(self):
         """O sino da barra acabou de ser clicado: o mouse está em cima dele. Anota onde (em coordenadas
         do monitor), pra o Hermes soltar a onda e os cartões dali (~/.cache/aero-shell/sino.json)."""
         def trabalho():

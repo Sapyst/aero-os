@@ -219,16 +219,23 @@ def recarregar_shell():
     """Soft reload depois de trocar o visual: a barra primeiro (os outros se alinham a ela), depois
     bandeja, Dock, Super Menu, central, Alt+Tab e Command Bar — cada um relê cores e posições.
     Os widgets relêem sozinhos (vigiam o widgets.json); aqui só recebem o --recarregar."""
+    import signal
     rodar = lambda *c: subprocess.run(list(c), capture_output=True)  # noqa: E731
+    # a barra do visual: AeroBar no DotStyle, Waybar nos outros (aero-barra decide e fecha a outra)
+    pid_aerobar = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aerobar.pid")
+    if os.path.exists(pid_aerobar):
+        try:
+            os.kill(int(open(pid_aerobar).read().strip()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
     rodar("pkill", "-x", "waybar")
-    time.sleep(0.3)
-    rodar("hyprctl", "dispatch", "exec", "waybar")
+    time.sleep(0.4)
+    rodar("hyprctl", "dispatch", "exec", os.path.join(BIN, "aero-barra"))
     for _ in range(30):                                   # espera a barra existir (a bandeja se mede por ela)
         camadas = subprocess.run(["hyprctl", "layers"], capture_output=True, text=True).stdout
         if "namespace: waybar" in camadas:
             break
         time.sleep(0.1)
-    import signal
     reabrir = {"bandeja": "~/.local/bin/bandeja", "supermenu": "~/.local/bin/supermenu --daemon",
                "som": "~/.local/bin/som --daemon", "alttab": "~/.local/bin/alttab --daemon",
                "comando": "~/.local/bin/comando --daemon", "dock": None}       # o Dock tem vigia que reabre sozinho

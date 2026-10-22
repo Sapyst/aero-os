@@ -37,6 +37,7 @@ XML = """
     <method name="SetModes"><arg type="as" name="modes" direction="in"/></method>
     <method name="DismissAll"/>
     <method name="Reload"/>
+    <method name="LatestId"><arg type="u" direction="out"/></method>
   </interface>
   <interface name="org.freedesktop.Notifications">
     <method name="GetCapabilities"><arg type="as" direction="out"/></method>
@@ -90,6 +91,8 @@ PADRAO = {
         "reduced_motion": "auto",        # auto (follow the system) | on | off
         "fullscreen": "faded",           # over a fullscreen app (game, video): faded | normal | off
         "fullscreen_intensity": 0.22,    # how bright the faded wave is
+        "under_bar": "soft",             # where it crosses the top bar: soft (blurred, never over the icons'
+                                         # crispness) | normal | hide
     },
     "colors": {"background": "#0b0b0c", "text": "#ecebe8", "dim": "#8c8b88", "accent": "#e8312a"},
     "colors_light": {"background": "#f4f4f1", "text": "#151516", "dim": "#6b6a67", "accent": "#d42a22"},
@@ -160,6 +163,8 @@ def validar_config(bruto):
         cw["width"] = _num(w.get("width"), cw["width"], 0.02, 0.5, False)
         if w.get("reduced_motion") in ("auto", "on", "off"):
             cw["reduced_motion"] = w["reduced_motion"]
+        if w.get("under_bar") in ("soft", "normal", "hide"):
+            cw["under_bar"] = w["under_bar"]
         if w.get("fullscreen") in ("faded", "normal", "off"):
             cw["fullscreen"] = w["fullscreen"]
         cw["fullscreen_intensity"] = _num(w.get("fullscreen_intensity"), cw["fullscreen_intensity"], 0.02, 1.0, False)
@@ -664,6 +669,9 @@ class Hermes:
             elif metodo == "DismissAll":
                 self.dispensar_tudo()
                 invocacao.return_value(None)
+            elif metodo == "LatestId":
+                ultimo = max((x["id"] for x in self.historico), default=0)
+                invocacao.return_value(GLib.Variant("(u)", (ultimo,)))
             elif metodo == "Reload":
                 self.recarregar()
                 invocacao.return_value(None)

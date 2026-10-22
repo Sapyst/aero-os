@@ -28,6 +28,7 @@ ESTILOS = [("DotStyle", "dotstyle"), ("AeroTerm", "aeroterm"), ("AeroCloud", "ae
 ORIGENS = [("Where the card appears", "notification"), ("Center of the screen", "screen-center")]
 SOBRE_CHEIA = [("Faded", "faded"), ("Normal", "normal"), ("Off", "off")]
 CARTAO_CHEIA = [("Hold until I leave fullscreen", "hold"), ("Show anyway", "show")]
+SOB_BARRA = [("Soft (blurred)", "soft"), ("Same as the rest", "normal"), ("Hidden", "hide")]
 MOVIMENTO = [("Follow the system", "auto"), ("Always reduced", "on"), ("Never reduced", "off")]
 STEAM = [("Wave where they appear", "wave"), ("Move them next to the quick center", "move"),
          ("Leave them alone", "off")]
@@ -125,8 +126,9 @@ class SecaoNotificacoes(Secao):
         self.o_espaco = self.spin("Space between dots", 8, 80, 1, ("wave", "dot_spacing"), "px")
         self.o_tamanho = self.escala("Dot size", 0.05, 0.5, ("wave", "dot_size"))
         self.o_movimento = self.combo("Reduced motion", MOVIMENTO, ("wave", "reduced_motion"))
+        self.o_barra = self.combo("Where it crosses the top bar", SOB_BARRA, ("wave", "under_bar"))
         for w in (self.o_ligada, self.o_origem, self.o_cor, self.o_urgente, self.o_forca, self.o_alcance,
-                  self.o_duracao, self.o_espaco, self.o_tamanho, self.o_movimento):
+                  self.o_duracao, self.o_espaco, self.o_tamanho, self.o_movimento, self.o_barra):
             onda.add(w)
         conteudo.add(onda)
 
@@ -256,7 +258,8 @@ class SecaoNotificacoes(Secao):
         self.linha_status.set_subtitle({"hermes": "Hermes is showing your notifications",
                                         "mako": "mako is showing them now (Hermes takes over when it's switched on)"
                                         }.get(quem, "No notification service is running"))
-        for w in (self.estilo, self.posicao, self.o_origem, self.o_movimento, self.c_onda, self.c_cartao, self.steam):
+        for w in (self.estilo, self.posicao, self.o_origem, self.o_movimento, self.o_barra, self.c_onda, self.c_cartao,
+                  self.steam):
             atual = self._valor(w.caminho)
             w.set_selected(next((i for i, (_, v) in enumerate(w.opcoes) if v == atual), 0))
         for w in (self.icones, self.o_ligada, self.dnd_critica):

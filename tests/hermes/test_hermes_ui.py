@@ -63,6 +63,24 @@ class TestOnda(unittest.TestCase):
         self.assertEqual(ui.suave(0, 1, 1.0), 1.0)
         self.assertEqual(ui.suave(0, 1, 0.0), 0.0)
 
+    def test_macia_sob_a_barra(self):
+        cfg = h.validar_config({})["wave"]
+
+        def borda_da_barra(modo):
+            c = dict(cfg, under_bar=modo)
+            sup = cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 300)
+            ui.desenhar_onda(cairo.Context(sup), 600, 300, 0.25, (560, 20), c, (1, 1, 1), 1.0, (12, 8, 588, 42))
+            dados = sup.get_data()
+            faixa = sum(dados[(y * 600 + x) * 4 + 3] for y in range(8, 42) for x in range(12, 588))
+            fora = sum(dados[(y * 600 + x) * 4 + 3] for y in range(60, 300) for x in range(0, 600))
+            return faixa, fora
+        dura, _ = borda_da_barra("normal")
+        macia, fora_macia = borda_da_barra("soft")
+        escondida, fora_esc = borda_da_barra("hide")
+        self.assertEqual(escondida, 0)
+        self.assertGreater(macia, 0)
+        self.assertEqual(fora_macia, fora_esc)            # outside the bar nothing changes
+
     def test_origem(self):
         c = h.validar_config({"position": "bottom-left", "margin": 10})
         self.assertEqual(ui.origem_da_onda(c, 1000, 600), (34, 566))

@@ -108,7 +108,22 @@ def suave(a, b, x):
     return t * t * (3 - 2 * t)
 
 
-def desenhar_onda(cr, w, h, p, origem, cfg, cor, forca=1.0):
+def faixa_da_barra(w):
+    """The top bar's rectangle on screen (AeroBar's settings, else the Waybar defaults it shares)."""
+    import json
+    g = {"height": 34, "margin_top": 8, "margin_sides": 12}
+    try:
+        with open(os.path.expanduser("~/.config/aero/aerobar.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        for k in g:
+            if isinstance(d.get(k), int) and not isinstance(d.get(k), bool):
+                g[k] = d[k]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return g["margin_sides"], g["margin_top"], w - g["margin_sides"], g["margin_top"] + g["height"]
+
+
+def desenhar_onda(cr, w, h, p, origem, cfg, cor, forca=1.0, barra=None):
     """One frame of the wave. p = progress 0..1, origem = (x, y) in px, cfg = settings["wave"],
     forca = 1 normally, fullscreen_intensity/intensity over a fullscreen app."""
     if not 0 <= p < 1:
@@ -139,8 +154,24 @@ def desenhar_onda(cr, w, h, p, origem, cfg, cor, forca=1.0):
             if banda <= 0:
                 continue
             banda = banda * banda * (3 - 2 * banda)          # soft edges on both sides of the ring
+            raio = raio_base * (0.4 + 0.6 * banda)
+            if barra is not None and barra[0] <= x <= barra[2] and barra[1] <= y <= barra[3]:
+                modo = cfg.get("under_bar", "soft")
+                if modo == "hide":
+                    continue
+                if modo == "soft":
+                    # a blurred blob instead of a crisp dot: the wave keeps passing, the bar stays readable
+                    import cairo
+                    grad = cairo.RadialGradient(x, y, 0, x, y, raio * 2.8)
+                    grad.add_color_stop_rgba(0, r, g, b, brilho * banda * 0.45)
+                    grad.add_color_stop_rgba(1, r, g, b, 0)
+                    cr.set_source(grad)
+                    cr.arc(x, y, raio * 2.8, 0, 2 * math.pi)
+                    cr.fill()
+                    desenhados += 1
+                    continue
             cr.set_source_rgba(r, g, b, brilho * banda)
-            cr.arc(x, y, raio_base * (0.4 + 0.6 * banda), 0, 2 * math.pi)
+            cr.arc(x, y, raio, 0, 2 * math.pi)
             cr.fill()
             desenhados += 1
     return desenhados
@@ -231,7 +262,7 @@ class Onda(Gtk.Window):
                 cr.arc(origem[0], origem[1], self.config["wave"]["dot_spacing"] * 0.4, 0, 2 * math.pi)
                 cr.fill()
                 continue
-            desenhar_onda(cr, w, h, (agora - t0) / dur, origem, self.config["wave"], cor, forca)
+            desenhar_onda(cr, w, h, (agora - t0) / dur, origem, self.config["wave"], cor, forca, faixa_da_barra(w))
 
 
 # ---------- cards ----------
