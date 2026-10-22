@@ -56,10 +56,11 @@ class TestConfig(unittest.TestCase):
 
     def test_personalizacao_valida(self):
         c = h.validar_config({"style": "aeroterm", "position": "top-center", "wave": {"color": "#00ff88",
-                              "origin": "screen-center", "enabled": False}, "fullscreen": "show"})
+                              "origin": "screen-center", "enabled": False, "fullscreen": "off"}, "fullscreen": "show"})
         self.assertEqual((c["style"], c["position"], c["fullscreen"]), ("aeroterm", "top-center", "show"))
-        self.assertEqual((c["wave"]["color"], c["wave"]["origin"], c["wave"]["enabled"]),
-                         ("#00ff88", "screen-center", False))
+        self.assertEqual((c["wave"]["color"], c["wave"]["origin"], c["wave"]["enabled"], c["wave"]["fullscreen"]),
+                         ("#00ff88", "screen-center", False, "off"))
+        self.assertEqual(h.validar_config({"fullscreen": "wave-only"})["fullscreen"], "hold")
 
     def test_regras(self):
         self.assertIsNone(h.validar_regra({"match": {"app": "("}, "set": {"hide": True}}))

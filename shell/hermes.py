@@ -66,7 +66,8 @@ PADRAO = {
     "timeout": {"low": 3000, "normal": 5000, "critical": 0},       # ms; 0 = stays until closed
     "history": {"size": 100},
     "dnd": {"enabled": False, "allow_critical": True},
-    "fullscreen": "hold",                # hold (keep for later, quietly) | wave-only | show
+    "fullscreen": "hold",                # the CARD while a fullscreen app has focus: hold (keep it for
+                                         # later, quietly) | show. The wave is separate, see wave.fullscreen
     "wave": {
         "enabled": True,
         "origin": "notification",        # notification (where the card appears) | screen-center | off-card
@@ -79,6 +80,8 @@ PADRAO = {
         "intensity": 0.55,               # 0..1, how bright the ring is (subtle by default)
         "width": 0.11,                   # thickness of the ring, fraction of the reach
         "reduced_motion": "auto",        # auto (follow the system) | on | off
+        "fullscreen": "faded",           # over a fullscreen app (game, video): faded | normal | off
+        "fullscreen_intensity": 0.22,    # how bright the faded wave is
     },
     "colors": {"background": "#0b0b0c", "text": "#ecebe8", "dim": "#8c8b88", "accent": "#e8312a"},
     "font": {"title": "Doto", "body": "Geist", "mono": "Geist Mono"},
@@ -127,7 +130,7 @@ def validar_config(bruto):
         for k in ("enabled", "allow_critical"):
             if isinstance(d.get(k), bool):
                 c["dnd"][k] = d[k]
-    if bruto.get("fullscreen") in ("hold", "wave-only", "show"):
+    if bruto.get("fullscreen") in ("hold", "show"):
         c["fullscreen"] = bruto["fullscreen"]
     w = bruto.get("wave")
     if isinstance(w, dict):
@@ -148,6 +151,9 @@ def validar_config(bruto):
         cw["width"] = _num(w.get("width"), cw["width"], 0.02, 0.5, False)
         if w.get("reduced_motion") in ("auto", "on", "off"):
             cw["reduced_motion"] = w["reduced_motion"]
+        if w.get("fullscreen") in ("faded", "normal", "off"):
+            cw["fullscreen"] = w["fullscreen"]
+        cw["fullscreen_intensity"] = _num(w.get("fullscreen_intensity"), cw["fullscreen_intensity"], 0.02, 1.0, False)
     cores = bruto.get("colors")
     if isinstance(cores, dict):
         for k in c["colors"]:
