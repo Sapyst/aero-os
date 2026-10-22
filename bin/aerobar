@@ -11,7 +11,8 @@ echo $$ > "$PIDS"
 filho=0
 trap 'kill "$filho" 2>/dev/null; rm -f "$PIDS"; exit 0' TERM INT
 while true; do
-    LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$HOME/.local/share/aero-shell/aerobar.py" >> "$LOG" 2>&1 9>&- &
+    # cairo renderer: a bar of dots needs no GPU pipeline, and GL/Vulkan costs ~100 MB more RAM
+    GSK_RENDERER=cairo LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$HOME/.local/share/aero-shell/aerobar.py" >> "$LOG" 2>&1 9>&- &
     filho=$!
     wait "$filho"; codigo=$?
     [ "$codigo" -eq 0 ] && break
