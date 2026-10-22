@@ -555,6 +555,10 @@ class Barra(Gtk.Window):
 
         self.gota = Gota()
         self.calendario = Calendario()
+        # hypr-botoes (the click watcher) sends SIGUSR1 when a click lands outside an open popup:
+        # in Hyprland an invisible layer can't catch clicks, so this is how "click outside closes" works
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                             lambda: (self.calendario.esconder(), True)[1])
         self._sino_escrito = None
         self.iniciar_fontes()
         self.present()
@@ -1063,7 +1067,6 @@ class Calendario(Gtk.Window):
         Camada.set_anchor(self, Camada.Edge.TOP, True)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.ON_DEMAND)
         self.add_css_class("aerobar-gota")
-        self.pegador = Pegador(self.esconder)
         self.largura = self.COL * self.PASSO + 36
         self.altura = self.TOPO_GRADE + self.LIN * self.PASSO + 20
         self.area = Gtk.DrawingArea(content_width=self.largura, content_height=self.altura)
@@ -1093,7 +1096,6 @@ class Calendario(Gtk.Window):
         self.ano, self.mes = hoje.tm_year, hoje.tm_mon
         Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA + 6)
         self.t0, self.saindo = time.monotonic(), False
-        self.pegador.present()                      # first the click-catcher, then the calendar above it
         self.set_visible(True)
         self.present()
         self.animar()
@@ -1103,7 +1105,6 @@ class Calendario(Gtk.Window):
     def esconder(self):
         if self.get_visible() and not self.saindo:
             self.saindo, self.t0 = True, time.monotonic()
-            self.pegador.set_visible(False)         # clicks go back to the desktop right away
             self.animar()
 
     def mudar_mes(self, d):

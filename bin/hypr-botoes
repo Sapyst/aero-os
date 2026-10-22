@@ -55,6 +55,18 @@ def ao_clicar():
         subprocess.Popen([f"{BIN}/som", "clique", "fora"])
     if "supermenu" in abertas:
         subprocess.Popen([f"{BIN}/supermenu", "--clique-fora"])
+    # AeroBar's calendar: a click outside it closes it (SIGUSR1 to AeroBar)
+    for l in camadas:
+        if l["namespace"] == "aerobar-calendario" and not (l["x"] <= x <= l["x"] + l["w"] and
+                                                          l["y"] <= y <= l["y"] + l["h"]):
+            try:
+                pid = int(open(os.path.join(RUN, "aerobar.pid")).read().strip())
+                filhos = subprocess.run(["pgrep", "-P", str(pid), "-f", "aerobar.py"], capture_output=True,
+                                        text=True).stdout.split()
+                for f in filhos:
+                    os.kill(int(f), 10)          # SIGUSR1: "close your popups"
+            except (OSError, ValueError):
+                pass
 
     # clique em cima de uma camada (barra, Dock, janelinha): não é botão de janela
     for l in camadas:

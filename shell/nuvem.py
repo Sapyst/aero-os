@@ -38,6 +38,31 @@ RAIOS = (54, 40, 30, 23)           # big (top 6), medium (next 14), small (next 
 ICONE_PX = 112                     # icon resolution kept in memory per app (enough for the zoomed bubble)
 
 
+def quadrado(sup):
+    """Is this icon a filled tile (square/rounded square), even with transparent padding around it?
+    Returns (x0, y0, x1, y1) of the tile in the image if so (it gets cropped into a circle), else None."""
+    sup.flush()
+    d, st, n = sup.get_data(), sup.get_stride(), sup.get_width()
+
+    def alfa(x, y):
+        return d[y * st + x * 4 + 3]
+    # bounding box of the visible pixels (skips the padding many themes add around the tile)
+    linhas = [y for y in range(n) if any(alfa(x, y) > 40 for x in range(0, n, 3))]
+    colunas = [x for x in range(n) if any(alfa(x, y) > 40 for y in range(0, n, 3))]
+    if not linhas or not colunas:
+        return None
+    x0, x1, y0, y1 = colunas[0], colunas[-1], linhas[0], linhas[-1]
+    lw, lh = x1 - x0, y1 - y0
+    if lw < n * 0.4 or lh < n * 0.4 or abs(lw - lh) > max(lw, lh) * 0.18:
+        return None                                   # small or not square-ish: keep it whole
+    mx, my = (x0 + x1) // 2, (y0 + y1) // 2
+    borda = 0
+    for desl in (2, 4, 7):
+        meios = [(mx, y0 + desl), (mx, y1 - desl), (x0 + desl, my), (x1 - desl, my)]
+        borda = max(borda, sum(1 for x, y in meios if alfa(x, y) > 200))
+    return (x0, y0, x1, y1) if borda >= 3 else None
+
+
 def suave(a, b, x):
     if x <= a:
         return 0.0
@@ -109,7 +134,7 @@ def empacotar(raios, folga=7.0):
 
 class Bolha:
     __slots__ = ("app", "id", "nome", "r", "x", "y", "atraso", "sup", "alvo_x", "alvo_y", "cx", "cy",
-                 "escala", "visivel")
+                 "escala", "visivel", "lente", "vx", "vy", "ox", "oy")
 
     def __init__(self, app):
         self.app = app
@@ -117,6 +142,8 @@ class Bolha:
         self.nome = app.get_display_name() or self.id
         self.sup = None
         self.escala, self.visivel = 1.0, 1.0
+        self.lente, self.vx, self.vy = 0.0, 0.0, 0.0
+        self.ox, self.oy = 0.0, 0.0              # displacement while a neighbour is magnified
 
 
 class Nuvem(Gtk.Window):
@@ -158,6 +185,75 @@ class Nuvem(Gtk.Window):
 
     # ---------- data ----------
 
+    def semear_enfeites(self, w, h):
+        """Decorative dots that live AROUND the cloud: each one has a home on a halo hugging the cloud
+        (denser near its edge, a few further out), is pulled back to it like gravity, slowly orbits,
+        is pushed away by the pointer and never sits inside a bubble. They are flung out of the centre
+        when the menu opens and fall back into it when it closes."""
+        rnd = random.Random(int(time.time()))
+        raio_nuvem = max((math.hypot(b.x, b.y) + b.r for b in self.bolhas), default=300)
+        self.raio_nuvem = raio_nuvem
+        self.enfeites = []
+        for _ in range(300):
+            ang = rnd.uniform(0, 2 * math.pi)
+            dist = raio_nuvem * (0.97 + abs(rnd.gauss(0, 0.16)))           # a tight halo hugging the cloud
+            hx, hy = math.cos(ang) * dist * 1.08, math.sin(ang) * dist * 0.9
+            tam = rnd.random()
+            r = 1.4 + tam ** 3 * 9                                   # mostly specks, a few soft discs
+            fora = rnd.uniform(3, 8)
+            self.enfeites.append({"hx": hx, "hy": hy, "x": rnd.gauss(0, 8), "y": rnd.gauss(0, 8),
+                                  "vx": math.cos(ang) * fora, "vy": math.sin(ang) * fora, "r": r,
+                                  "a": rnd.uniform(0.12, 0.34) * (0.7 if r > 6 else 1.0),
+                                  "giro": rnd.choice((-1, 1)) * rnd.uniform(0.002, 0.006)})
+        self._t_fisica = time.monotonic()
+
+    def desenhar_enfeites(self, cr, w, h, agora, geral):
+        if not getattr(self, "enfeites", None):
+            self.semear_enfeites(w, h)
+        dt = min(2.0, max(0.25, (agora - self._t_fisica) * 60))      # frames at 60 Hz
+        self._t_fisica = agora
+        cx, cy = self._centro()
+        fechando = self.t_fechar is not None
+        espalhar = 1.45 if self.busca else 1.0
+        rn = self.raio_nuvem
+        for e in self.enfeites:
+            # slow orbit: the home itself turns around the cloud
+            c, s_ = math.cos(e["giro"] * dt), math.sin(e["giro"] * dt)
+            e["hx"], e["hy"] = e["hx"] * c - e["hy"] * s_, e["hx"] * s_ + e["hy"] * c
+            if fechando:                                              # everything falls into the centre
+                ax, ay = -e["x"] * 0.06, -e["y"] * 0.06
+            else:
+                ax = (e["hx"] * espalhar - e["x"]) * 0.04             # gravity toward its home
+                ay = (e["hy"] * espalhar - e["y"]) * 0.04
+            px, py = cx + e["x"], cy + e["y"]
+            if self.mouse is not None and not fechando:               # the pointer pushes them away
+                dx, dy = px - self.mouse[0], py - self.mouse[1]
+                d = math.hypot(dx, dy)
+                if 1 < d < 190:
+                    f = (1 - d / 190) ** 2 * 3.2
+                    ax += dx / d * f
+                    ay += dy / d * f
+            if math.hypot(e["x"], e["y"]) < rn + 30 and not fechando:  # never inside a bubble
+                for b in self.bolhas:
+                    if b.escala < 0.5:
+                        continue
+                    dx, dy = e["x"] - (b.cx + b.ox), e["y"] - (b.cy + b.oy)
+                    d = math.hypot(dx, dy)
+                    lim = b.r * (1 + 0.5 * b.lente) + e["r"] + 4
+                    if 0.1 < d < lim:
+                        f = (lim - d) * 0.22
+                        ax += dx / d * f
+                        ay += dy / d * f
+            e["vx"] = (e["vx"] + ax * dt) * (0.84 ** dt)
+            e["vy"] = (e["vy"] + ay * dt) * (0.84 ** dt)
+            e["x"] += e["vx"] * dt
+            e["y"] += e["vy"] * dt
+            vel = math.hypot(e["vx"], e["vy"])
+            brilho = min(1.0, 0.75 + vel * 0.08)                      # moving dots light up a little
+            cr.set_source_rgba(*FG, e["a"] * geral * brilho)
+            cr.arc(cx + e["x"], cy + e["y"], e["r"], 0, 2 * math.pi)
+            cr.fill()
+
     def carregar(self):
         uso = ler_uso()
         fixados = apps.ler_lista("menu-fixados", FIXADOS_PADRAO)
@@ -187,9 +283,9 @@ class Nuvem(Gtk.Window):
             if gicon is not None:
                 tema = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
                 p = tema.lookup_by_gicon(gicon, ICONE_PX, 1, Gtk.TextDirection.NONE, 0)
-                if p is not None and (p.get_icon_name() or "").startswith("image-missing"):
-                    p = None                                  # no real icon: the bubble shows the initial
                 f = p.get_file() if p is not None else None
+                if f is not None and "missing" in (f.get_path() or ""):
+                    f = None                                  # no real icon: the bubble shows the initial
                 if f is not None and f.get_path():
                     pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(f.get_path(), ICONE_PX, ICONE_PX, True)
                     import cairo
@@ -198,6 +294,7 @@ class Nuvem(Gtk.Window):
                     Gdk.cairo_set_source_pixbuf(ctx, pb, (ICONE_PX - pb.get_width()) / 2,
                                                 (ICONE_PX - pb.get_height()) / 2)
                     ctx.paint()
+                    sup = (sup, quadrado(sup))
         except (GLib.Error, TypeError, ValueError):
             sup = None
         self.cache[b.id] = sup
@@ -234,6 +331,9 @@ class Nuvem(Gtk.Window):
     def abrir(self):
         self.busca = ""
         self.carregar()
+        self.enfeites = None
+        for b in self.bolhas:                      # born at the centre: the spring throws them out to their place
+            b.cx, b.cy = b.x * 0.35, b.y * 0.35
         self.t_abrir, self.t_fechar = time.monotonic(), None
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.EXCLUSIVE)
         self.present()
@@ -270,16 +370,29 @@ class Nuvem(Gtk.Window):
     def _quadro(self, *_):
         agora = time.monotonic()
         mexendo = False
+        cx, cy = self._centro()
         for b in self.bolhas:
-            dx, dy = b.alvo_x - b.cx, b.alvo_y - b.cy
-            if abs(dx) > 0.3 or abs(dy) > 0.3:
-                b.cx += dx * 0.18
-                b.cy += dy * 0.18
+            # spring toward the target place (a touch of overshoot = alive, not robotic)
+            b.vx = b.vx * 0.72 + (b.alvo_x - b.cx) * 0.11
+            b.vy = b.vy * 0.72 + (b.alvo_y - b.cy) * 0.11
+            if abs(b.vx) > 0.05 or abs(b.vy) > 0.05 or abs(b.alvo_x - b.cx) > 0.3 or abs(b.alvo_y - b.cy) > 0.3:
+                b.cx += b.vx
+                b.cy += b.vy
+                mexendo = True
+            # the lens grows and deflates smoothly instead of jumping
+            alvo_l = 0.0
+            if self.mouse is not None and b.escala > 0.5:
+                d = math.hypot(cx + b.cx + b.ox - self.mouse[0], cy + b.cy + b.oy - self.mouse[1])
+                alvo_l = math.exp(-(d / 140) ** 2)
+            if abs(alvo_l - b.lente) > 0.002:
+                b.lente += (alvo_l - b.lente) * 0.2
                 mexendo = True
             alvo_v = b.visivel
             if abs(b.escala - (0.16 if alvo_v == 0 else 1.0)) > 0.005:
                 b.escala += ((0.16 if alvo_v == 0 else 1.0) - b.escala) * 0.2
                 mexendo = True
+        if self.separar():
+            mexendo = True
         abrindo = agora - self.t_abrir < 0.9
         lente = self.mouse is not None and agora - self.ultimo_mov < 0.6
         self.area.queue_draw()
@@ -290,10 +403,52 @@ class Nuvem(Gtk.Window):
             if f:
                 GLib.idle_add(lambda: (f(), False)[1])
             return GLib.SOURCE_REMOVE
-        if not (mexendo or abrindo or lente or self.t_fechar is not None):
+        if not (mexendo or abrindo or lente or self.t_fechar is not None or self.get_visible()):
             self.tique = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
+
+    def separar(self):
+        """Magnified bubbles push their neighbours away so no two bubbles ever overlap: a few relaxation
+        passes on the grown radii (the magnified one stays put, the others give way, in a chain), then
+        each bubble eases toward its new place, and back home once the lens leaves."""
+        vivas = [b for b in self.bolhas if b.escala > 0.5]
+        if not any(b.lente > 0.01 for b in vivas) and not any(abs(b.ox) > 0.3 or abs(b.oy) > 0.3 for b in vivas):
+            for b in vivas:
+                b.ox = b.oy = 0.0
+            return False
+        px = {id(b): [b.cx, b.cy] for b in vivas}
+        raio = {id(b): b.r * (1 + 0.5 * b.lente) for b in vivas}
+        peso = {id(b): 1.0 - 0.95 * b.lente for b in vivas}          # the magnified one hardly moves
+        folga = 5.0
+        for _ in range(10):
+            for i, a in enumerate(vivas):
+                pa, ra = px[id(a)], raio[id(a)]
+                for b in vivas[i + 1:]:
+                    pb = px[id(b)]
+                    dx, dy = pb[0] - pa[0], pb[1] - pa[1]
+                    lim = ra + raio[id(b)] + folga
+                    if abs(dx) > lim or abs(dy) > lim:
+                        continue
+                    d = math.hypot(dx, dy)
+                    if d >= lim or d < 0.01:
+                        continue
+                    sobra = lim - d
+                    wa, wb = peso[id(a)], peso[id(b)]
+                    tot = wa + wb or 1.0
+                    ux, uy = dx / d, dy / d
+                    pa[0] -= ux * sobra * wa / tot
+                    pa[1] -= uy * sobra * wa / tot
+                    pb[0] += ux * sobra * wb / tot
+                    pb[1] += uy * sobra * wb / tot
+        mexeu = False
+        for b in vivas:
+            tx, ty = px[id(b)][0] - b.cx, px[id(b)][1] - b.cy
+            nx, ny = b.ox + (tx - b.ox) * 0.3, b.oy + (ty - b.oy) * 0.3
+            if abs(nx - b.ox) > 0.05 or abs(ny - b.oy) > 0.05:
+                mexeu = True
+            b.ox, b.oy = nx, ny
+        return mexeu
 
     # ---------- geometry ----------
 
@@ -314,16 +469,8 @@ class Nuvem(Gtk.Window):
             x, y = x + (cx - x) * p * 0.8, y + (cy - y) * p * 0.8
             r *= 1 - p * 0.85
             a = 1 - p
-        if self.mouse is not None and b.escala > 0.5:
-            mx, my = self.mouse
-            d = math.hypot(x - mx, y - my)
-            lente = math.exp(-(d / 150) ** 2)
-            r *= 1 + 0.55 * lente
-            if d > 1:                                         # neighbours step aside
-                empurra = 26 * lente * (1 - lente) * 2
-                x += (x - mx) / d * empurra
-                y += (y - my) / d * empurra
-        return x, y, r, a
+        r *= 1 + 0.5 * b.lente
+        return x + b.ox, y + b.oy, r, a
 
     def bolha_em(self, px, py):
         agora = time.monotonic()
@@ -345,6 +492,7 @@ class Nuvem(Gtk.Window):
             fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
         cr.set_source_rgba(0.02, 0.02, 0.025, 0.28 * fundo)
         cr.paint()
+        self.desenhar_enfeites(cr, w, h, agora, fundo)
         sobre = self.bolha_em(*self.mouse) if self.mouse else None
         foco = sobre if sobre is not None else (self.sel if (self.busca or getattr(self, "navegou", False)) else None)
         # tiny dots first, then the bubbles, and the focused one last (on top of its neighbours)
@@ -354,6 +502,7 @@ class Nuvem(Gtk.Window):
             x, y, r, a = self._onde(b, agora)
             if r < 0.6 or a <= 0.01:
                 continue
+            cr.new_path()                                     # never connect to the previous text's point
             if b.escala < 0.5:                                # filtered out: a tiny dot
                 cr.set_source_rgba(*FG, 0.25 * a)
                 cr.arc(x, y, max(2.0, r * 0.5), 0, 2 * math.pi)
@@ -375,12 +524,23 @@ class Nuvem(Gtk.Window):
             cr.set_source_rgba(*FG, 0.16 * a)
             cr.set_line_width(1)
             cr.stroke()
-            sup = self.icone(b)
-            if sup is not None:
-                lado = r * 1.25
+            ic = self.icone(b)
+            if ic is not None:
+                sup, placa = ic
                 cr.save()
-                cr.translate(x - lado / 2, y - lado / 2)
-                cr.scale(lado / ICONE_PX, lado / ICONE_PX)
+                if placa:                                     # tiles become round: cropped to the bubble
+                    px0, py0, px1, py1 = placa
+                    raio_in = r * 0.92
+                    cr.arc(x, y, raio_in, 0, 2 * math.pi)
+                    cr.clip()
+                    esc = raio_in * 2 * 1.1 / max(px1 - px0, py1 - py0)      # the tile fills the circle
+                    cr.translate(x, y)
+                    cr.scale(esc, esc)
+                    cr.translate(-(px0 + px1) / 2, -(py0 + py1) / 2)
+                else:
+                    lado = r * 1.3
+                    cr.translate(x - lado / 2, y - lado / 2)
+                    cr.scale(lado / ICONE_PX, lado / ICONE_PX)
                 cr.set_source_surface(sup, 0, 0)
                 cr.paint_with_alpha(a)
                 cr.restore()
@@ -410,8 +570,10 @@ class Nuvem(Gtk.Window):
         cr.move_to(x - tw / 2, y - th / 2)
         cr.set_source_rgba(*FG, alfa)
         PangoCairo.show_layout(cr, layout)
+        cr.new_path()
 
     def _texto(self, cr, s, x, y, fonte, alfa):
+        cr.new_path()
         layout = PangoCairo.create_layout(cr)
         layout.set_font_description(Pango.FontDescription.from_string(fonte))
         layout.set_text(s, -1)
@@ -422,6 +584,7 @@ class Nuvem(Gtk.Window):
         cr.move_to(x - tw / 2, y - th / 2)
         cr.set_source_rgba(*FG, alfa)
         PangoCairo.show_layout(cr, layout)
+        cr.new_path()
 
     # ---------- input ----------
 
