@@ -100,6 +100,7 @@ def ler_config():
 
 CFG = ler_config()
 ALTURA, TOPO, LADO = CFG["height"], CFG["margin_top"], CFG["margin_sides"]
+VAZAO = 22          # extra see-through room under the bar so glows fade out naturally instead of being cut
 LARGURA_ICONE_BANDEJA = 30
 
 FG = _hex(CFG["colors"]["text"], PADRAO["colors"]["text"])
@@ -470,10 +471,11 @@ class Barra(Gtk.Window):
         Camada.set_margin(self, Camada.Edge.TOP, TOPO)
         Camada.set_margin(self, Camada.Edge.LEFT, LADO)
         Camada.set_margin(self, Camada.Edge.RIGHT, LADO)
-        Camada.auto_exclusive_zone_enable(self)
+        Camada.set_exclusive_zone(self, ALTURA)             # windows start under the bar, not under the glow room
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
-        self.set_default_size(-1, ALTURA)
-        self.area = Gtk.DrawingArea(content_height=ALTURA, hexpand=True)
+        self.set_default_size(-1, ALTURA + VAZAO)
+        self.area = Gtk.DrawingArea(content_height=ALTURA + VAZAO, hexpand=True)
+        self.area.connect("resize", lambda _a, w, _h: self._entrada(w))
         self.area.set_draw_func(self.desenhar)
         self.area.set_has_tooltip(True)
         self.area.connect("query-tooltip", self.dica)
@@ -535,6 +537,13 @@ class Barra(Gtk.Window):
         self.iniciar_fontes()
         self.present()
 
+    def _entrada(self, largura):
+        """Only the bar itself takes clicks; the glow room below lets every click through."""
+        import cairo
+        sup = self.get_surface()
+        if sup is not None:
+            sup.set_input_region(cairo.Region(cairo.RectangleInt(0, 0, int(largura), ALTURA)))
+
     # ---------- layout / drawing ----------
 
     def visiveis(self, lista):
@@ -561,6 +570,7 @@ class Barra(Gtk.Window):
             x += m.w
 
     def desenhar(self, _area, cr, w, h):
+        h = ALTURA                                            # below it is only room for the glow
         r = min(CFG["radius"], h / 2)
         if CFG["background"] != "none" or CFG["outline"]:
             cr.new_sub_path()
@@ -658,7 +668,7 @@ class Barra(Gtk.Window):
 
     def dica(self, _area, x, _y, _kb, tooltip):
         m = self.modulo_em(x)
-        if m is None:
+        if m is None or _y > ALTURA:
             return False
         textos = {"vol": f"Volume {self.volume}%" + (" (muted)" if self.mudo else ""),
                   "wifi": self.wifi_nome or "Offline",
