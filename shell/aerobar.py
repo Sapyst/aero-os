@@ -107,6 +107,7 @@ BLUE = _hex(CFG["colors"]["plugged"], PADRAO["colors"]["plugged"])
 YELLOW = _hex(CFG["colors"]["saver"], PADRAO["colors"]["saver"])
 FUNDO = _hex(CFG["colors"]["background"], PADRAO["colors"]["background"])
 ICONE = CFG["icon_size"]
+GREEN = (0.30, 0.82, 0.52)
 F_RELOGIO = f"Doto Black {CFG['clock_size']}"
 F_NUMERO = f"Doto Black {CFG['number_size']}"
 
@@ -135,6 +136,26 @@ def wifi_icone(nivel):
     acesas.update(passos[3] if nivel > 0 else ())
     return ["".join((c if (i in acesas or c == ".") else ("+" if c == "#" else c)) for c in linha)
             for i, linha in enumerate(linhas)]
+
+
+def minutos_ultrasu(d):
+    """Minutes of admin access left, from UltraSu's bar text ("22h 18m", "35m"), or None if not open."""
+    if not isinstance(d, dict) or d.get("class") not in ("ativo", "acabando"):
+        return None
+    t = str(d.get("text", ""))
+    m = re.search(r"(\d+)\s*h\s*(\d+)\s*m", t) or re.search(r"(\d+)\s*h", t)
+    if m:
+        return int(m.group(1)) * 60 + (int(m.group(2)) if m.lastindex and m.lastindex >= 2 else 0)
+    m = re.search(r"(\d+)\s*m", t)
+    return int(m.group(1)) if m else 0
+
+
+def cor_ultrasu(minutos):
+    """Time left as a colour: green > 15 h, blue 7–15 h, yellow 3–7 h, red < 3 h."""
+    if minutos is None:
+        return None
+    h = minutos / 60
+    return GREEN if h > 15 else BLUE if h > 7 else YELLOW if h > 3 else RED
 
 
 def rodar(*cmd, timeout=4):
@@ -412,8 +433,8 @@ class Barra(Gtk.Window):
             Bateria(self, "bat", {1: f"{BIN}/aero-energia --alternar", 2: f"{som} central abrir",
                                   3: f"CONFIG_ABA=energia {cfg}"}),
             IconeSimples(self, "ultrasu", "shield", {1: f"{BIN}/ultrasu"},
-                         cor=lambda: RED if self.ultrasu.get("class") in ("ativo", "acabando") else FG,
-                         alfa=lambda: 1.0 if self.ultrasu.get("class") in ("ativo", "acabando") else 0.45),
+                         cor=lambda: cor_ultrasu(minutos_ultrasu(self.ultrasu)) or FG,
+                         alfa=lambda: 1.0 if minutos_ultrasu(self.ultrasu) is not None else 0.45),
             Sino(self, "bell", lambda: "bellx" if self.dnd else "bell", {1: f"{som} notificacoes abrir"},
                  alfa=lambda: 0.55 if self.dnd else 1.0, dica="Notifications"),
             IconeSimples(self, "gear", "gear", {1: cfg}, dica="Settings"),
@@ -432,6 +453,7 @@ class Barra(Gtk.Window):
         mov.connect("leave", lambda *_: self.mudar_sobre(None))
         self.area.add_controller(mov)
 
+        self.gota = Gota()
         self.iniciar_fontes()
         self.present()
 
@@ -503,6 +525,13 @@ class Barra(Gtk.Window):
         if m is not self.sobre:
             self.sobre = m
             self.area.queue_draw()
+            if m is not None and m.nome == "ultrasu":
+                mins = minutos_ultrasu(self.ultrasu)
+                texto_ = f"{mins // 60}H {mins % 60:02d}M" if mins is not None else "CLOSED"
+                cor = cor_ultrasu(mins) or DIM
+                self.gota.mostrar(texto_, cor, m.x + m.w / 2)
+            else:
+                self.gota.esconder()
 
     def ao_clicar(self, g, _n, x, _y):
         m = self.modulo_em(x)
@@ -522,7 +551,7 @@ class Barra(Gtk.Window):
                   "wifi": self.wifi_nome or "Offline",
                   "bt": (f"Bluetooth: {self.bt_conectados} connected" if self.bt_conectados else
                          "Bluetooth on" if self.bt_ligado else "Bluetooth off"),
-                  "bat": self.bat_dica, "ultrasu": self.ultrasu.get("tooltip", ""),
+                  "bat": self.bat_dica, "ultrasu": "",            # UltraSu shows its own dot drop
                   "clock": time.strftime("%A, %d %B %Y")}
         t = textos.get(m.nome) or m.dica
         if not t:
@@ -790,6 +819,110 @@ class Barra(Gtk.Window):
         if n != self.n_bandeja:
             self.n_bandeja = n
             self.redesenhar()
+
+
+class Gota(Gtk.Window):
+    """A small dot label that drops down under a bar icon on hover: its dots fall from the bar and
+    settle into the letters; on leave they rise back and fade. Click-through, own layer."""
+
+    PASSO = 2.4
+
+    def __init__(self):
+        super().__init__(decorated=False)
+        Camada.init_for_window(self)
+        Camada.set_layer(self, Camada.Layer.OVERLAY)
+        Camada.set_namespace(self, "aerobar-gota")
+        Camada.set_anchor(self, Camada.Edge.TOP, True)
+        Camada.set_anchor(self, Camada.Edge.LEFT, True)
+        Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
+        Camada.set_exclusive_zone(self, -1)
+        self.add_css_class("aerobar-gota")
+        prov = Gtk.CssProvider()
+        prov.load_from_string(".aerobar-gota { background: none; background-color: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.area = Gtk.DrawingArea()
+        self.area.set_draw_func(self.desenhar)
+        self.set_child(self.area)
+        self.connect("realize", self._sem_entrada)
+        self.texto, self.cor, self.t0, self.saindo, self.tique = "", FG, 0.0, False, None
+        self.pontos = []
+
+    def _sem_entrada(self, *_):
+        import cairo
+        if self.get_surface() is not None:
+            self.get_surface().set_input_region(cairo.Region())
+
+    def mostrar(self, texto_, cor, centro_x):
+        import random
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from hermes_dots import normalizar, FONTE
+        t = normalizar(texto_)
+        p = self.PASSO
+        largura = (len(t) * 6 - 1) * p + 24
+        altura = 7 * p + 18
+        self.pontos = []
+        rnd = random.Random(len(t))
+        for i, ch in enumerate(t):
+            for c in range(5):
+                for linha in range(7):
+                    if FONTE[ch][linha][c] == "1":
+                        x = 12 + (i * 6 + c) * p + p / 2
+                        y = 9 + linha * p + p / 2
+                        atraso = (i * 6 + c) * 0.012 + rnd.uniform(0, 0.05)
+                        self.pontos.append((x, y, atraso, rnd.uniform(14, 26)))
+        self.texto, self.cor = t, cor
+        self.set_size_request(int(largura), int(altura))
+        self.area.set_content_width(int(largura))
+        self.area.set_content_height(int(altura))
+        Camada.set_margin(self, Camada.Edge.LEFT, max(0, int(LADO + centro_x - largura / 2)))
+        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA + 2)
+        self.t0, self.saindo = time.monotonic(), False
+        self.set_visible(True)
+        if self.tique is None:
+            self.tique = self.area.add_tick_callback(self._quadro)
+
+    def esconder(self):
+        if self.get_visible() and not self.saindo:
+            self.saindo, self.t0 = True, time.monotonic()
+            if self.tique is None:
+                self.tique = self.area.add_tick_callback(self._quadro)
+
+    def _quadro(self, *_):
+        e = time.monotonic() - self.t0
+        self.area.queue_draw()
+        if self.saindo and e > 0.3:
+            self.tique = None
+            self.set_visible(False)
+            return GLib.SOURCE_REMOVE
+        if not self.saindo and e > 0.7:
+            self.tique = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def desenhar(self, _a, cr, w, h):
+        e = time.monotonic() - self.t0
+        fundo = min(1.0, e / 0.18) if not self.saindo else max(0.0, 1 - e / 0.3)
+        r = 9
+        cr.new_sub_path()
+        for (ax, ay, a0) in ((w - r, r, -math.pi / 2), (w - r, h - r, 0), (r, h - r, math.pi / 2), (r, r, math.pi)):
+            cr.arc(ax, ay, r, a0, a0 + math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(*FUNDO, 0.9 * fundo)
+        cr.fill()
+        for x, y, atraso, queda in self.pontos:
+            if not self.saindo:
+                k = min(1.0, max(0.0, (e - atraso) / 0.28))
+                k = 1 - (1 - k) ** 3                              # falls and lands softly
+                yy, a = y - queda * (1 - k), k
+            else:
+                k = min(1.0, e / 0.3)
+                yy, a = y - queda * 0.6 * k, 1 - k
+            if a <= 0.01:
+                continue
+            cr.set_source_rgba(*self.cor, a)
+            cr.arc(x, yy, self.PASSO * 0.38, 0, 2 * math.pi)
+            cr.fill()
 
 
 class App(Gtk.Application):
