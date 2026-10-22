@@ -1,0 +1,151 @@
+/* DotStyle for the shell's popups (quick center, sound, notifications, window menu).
+   Applied only while the window has the "dots" class (the DotStyle visual); som.py adds it.
+   Cards and tiles pop in (a small overshoot, staggered); "saindo" makes them shrink away before hiding. */
+
+@keyframes dot-pop {
+  from { opacity: 0; transform: scale(0.8); }
+  65%  { opacity: 1; transform: scale(1.03); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes dot-sai {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.86); }
+}
+
+/* the cards: dark glass, a dotted outline, born with a pop */
+window.dots .cartao-som, window.dots .central > .player, window.dots .central > .controles {
+  background-color: alpha(#0b0b0c, 0.93);
+  color: #ecebe8;
+  border-radius: 26px;
+  border: 2px dotted alpha(#ecebe8, 0.26);
+  box-shadow: 0 10px 40px alpha(black, 0.35);
+  animation: dot-pop 440ms cubic-bezier(0.34, 1.36, 0.64, 1) both;
+}
+window.dots .central > .controles { animation-delay: 80ms; }
+window.dots.saindo .cartao-som, window.dots.saindo .central > .player, window.dots.saindo .central > .controles {
+  animation: dot-sai 210ms cubic-bezier(0.4, 0, 0.6, 0.2) both;
+}
+
+/* titles in dots */
+window.dots .titulo, window.dots .redes-titulo, window.dots .aparelho, window.dots .bloco-titulo {
+  font-family: "Doto"; font-weight: 900; letter-spacing: 1px;
+}
+window.dots .bloco-titulo { font-size: 14px; }
+window.dots .bloco-estado, window.dots .por-cento, window.dots .tempo, window.dots .via {
+  font-family: "Geist Mono", monospace; font-size: 10.5px;
+}
+
+/* tiles: bubbles with a dotted rim; lit ones glow */
+window.dots .central button.bloco {
+  border-radius: 22px;
+  background: alpha(#ecebe8, 0.045);
+  border: 2px dotted alpha(#ecebe8, 0.16);
+  transition: background 220ms ease, border-color 220ms ease, box-shadow 260ms ease, transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation: dot-pop 420ms cubic-bezier(0.34, 1.36, 0.64, 1) both;
+}
+window.dots .central grid > button.bloco:nth-child(1) { animation-delay: 120ms; }
+window.dots .central grid > button.bloco:nth-child(2) { animation-delay: 150ms; }
+window.dots .central grid > button.bloco:nth-child(3) { animation-delay: 180ms; }
+window.dots .central grid > button.bloco:nth-child(4) { animation-delay: 210ms; }
+window.dots .central grid > button.bloco:nth-child(5) { animation-delay: 240ms; }
+window.dots .central grid > button.bloco:nth-child(6) { animation-delay: 270ms; }
+window.dots .central button.bloco:hover { background: alpha(#ecebe8, 0.09); transform: scale(1.035); }
+window.dots .central button.bloco.ligado {
+  background: alpha(#ecebe8, 0.15);
+  color: #ffffff;
+  border: 2px solid alpha(#ecebe8, 0.55);
+  box-shadow: 0 0 22px alpha(#ecebe8, 0.16);
+}
+window.dots .central button.bloco.ligado:hover { background: alpha(#ecebe8, 0.2); }
+window.dots .central button.seta, window.dots .central button.desligar, window.dots .central button.perfil,
+window.dots .central .chip {
+  border-radius: 99px;
+  transition: background 200ms ease, transform 240ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+window.dots .central button.seta:hover, window.dots .central button.desligar:hover { transform: scale(1.12); }
+window.dots .central button.desligar.ligado { background: #ecebe8; color: #0b0b0c; }
+
+/* sliders: a track of dots, the filled part bright dots, the knob a glowing dot */
+window.dots scale trough {
+  min-height: 10px;
+  border-radius: 99px;
+  background-color: transparent;
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.26) 1.5px, transparent 2px);
+  background-size: 8px 10px;
+  background-repeat: repeat-x;
+  background-position: left center;
+  border: none;
+}
+window.dots scale highlight {
+  min-height: 10px;
+  border-radius: 99px;
+  background-color: transparent;
+  background-image: radial-gradient(circle, #ecebe8 2.1px, transparent 2.7px);
+  background-size: 8px 10px;
+  background-repeat: repeat-x;
+  background-position: left center;
+  box-shadow: none;
+  border: none;
+}
+window.dots scale slider {
+  min-width: 18px; min-height: 18px; margin: -4px;
+  border-radius: 99px;
+  background: #ecebe8;
+  border: none;
+  box-shadow: 0 0 14px alpha(#ecebe8, 0.55);
+  transition: transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 200ms ease;
+}
+window.dots scale slider:hover { transform: scale(1.18); box-shadow: 0 0 20px alpha(#ecebe8, 0.75); }
+window.dots .central scale.progresso highlight { background-image: radial-gradient(circle, white 2px, transparent 2.6px); }
+
+/* lists (networks, devices, outputs) and the drawers */
+window.dots .central .redes {
+  border-radius: 20px;
+  background: alpha(#ecebe8, 0.04);
+  border: 2px dotted alpha(#ecebe8, 0.14);
+  animation: dot-pop 360ms cubic-bezier(0.34, 1.36, 0.64, 1) both;
+}
+window.dots .central button.rede, window.dots .cartao-som row {
+  border-radius: 14px;
+  transition: background 180ms ease, transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+window.dots .central button.rede:hover, window.dots .cartao-som row:hover {
+  background: alpha(#ecebe8, 0.08);
+  transform: translateX(3px);
+}
+
+/* scrollbars as a column of dots */
+window.dots scrollbar { background: transparent; border: none; }
+window.dots scrollbar slider {
+  min-width: 6px;
+  border-radius: 99px;
+  background-color: transparent;
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.7) 1.6px, transparent 2.2px);
+  background-size: 6px 7px;
+  background-repeat: repeat-y;
+}
+
+/* switches: a dot sliding on a dotted track */
+window.dots switch {
+  border-radius: 99px;
+  background-color: transparent;
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.28) 1.3px, transparent 1.8px);
+  background-size: 7px 100%;
+  border: none;
+  transition: background 220ms ease;
+}
+window.dots switch:checked { background-image: radial-gradient(circle, alpha(#ecebe8, 0.75) 1.4px, transparent 1.9px); }
+window.dots switch slider {
+  border-radius: 99px; background: alpha(#ecebe8, 0.55); box-shadow: none;
+  transition: all 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+window.dots switch:checked slider { background: #ecebe8; box-shadow: 0 0 12px alpha(#ecebe8, 0.55); }
+
+/* the separator lines become dotted */
+window.dots separator {
+  min-height: 2px;
+  background-color: transparent;
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.22) 0.9px, transparent 1.3px);
+  background-size: 6px 2px;
+  background-repeat: repeat-x;
+}

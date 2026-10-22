@@ -38,7 +38,7 @@ CSS = """
 .dotkit-botao:hover { background: alpha(#ecebe8, 0.08); }
 .dotkit-botao:disabled { color: alpha(#ecebe8, 0.3); }
 scrolledwindow.dotkit-rolagem, scrolledwindow.dotkit-rolagem > viewport { background: none; }
-window.dots .cartao-som { background: none; border: none; box-shadow: none; padding: 0; margin: 0; }
+window.dots.notif-dots .cartao-som { background: none; border: none; box-shadow: none; padding: 0; margin: 0; animation: none; }
 .dotkit-item { border-radius: 16px; padding: 8px 8px 8px 6px; transition: background 180ms ease; }
 .dotkit-item:hover { background: alpha(#ecebe8, 0.06); }
 """

@@ -359,10 +359,22 @@ class Janelinha(Gtk.Window):
         self.mostrar((x - 40, x + 40))
 
     def fechar(self):
-        self.set_visible(False)
         self.pegador.set_visible(False)
         Janelinha.abertas.discard(self)
         self._entrada = None              # (central) a região de entrada é refeita ao reabrir
+        if self.has_css_class("dots") and self.get_visible() and not getattr(self, "_saida", None):
+            # DotStyle: os cartões encolhem e somem (CSS "dot-sai", 210 ms) e só então a janela some
+            self.add_css_class("saindo")
+
+            def esconder():
+                self._saida = None
+                self.set_visible(False)
+                self.remove_css_class("saindo")
+                return False
+            self._saida = GLib.timeout_add(220, esconder)
+            return
+        if not getattr(self, "_saida", None):
+            self.set_visible(False)
 
     # ---------- "clicou fora = fecha" ----------
     # A camada invisível (pegador) não pegava cliques de verdade. Então, enquanto há uma janelinha
@@ -375,6 +387,15 @@ class Janelinha(Gtk.Window):
         """zona_icone = (x0, x1): faixa da barra de cima onde fica o ícone que abre esta janelinha
         (clicar nele de novo é "alternar", quem cuida é o próprio clique da barra)."""
         self.zona_icone = zona_icone
+        # DotStyle: o tema de pontos (dotstyle-janelinhas.css) vale enquanto a janela tem a classe "dots"
+        if visual_atual() == "DotStyle":
+            self.add_css_class("dots")
+        else:
+            self.remove_css_class("dots")
+        self.remove_css_class("saindo")
+        if getattr(self, "_saida", None):
+            GLib.source_remove(self._saida)
+            self._saida = None
         self.pegador.present()
         self.present()
         Janelinha.abertas.add(self)     # o vigia de cliques (hypr-botoes) avisa a cada clique (doc 33)
@@ -466,6 +487,7 @@ class CentralNotificacoes(Janelinha):
         if visual_atual() == "DotStyle":
             return self.montar_dots()
         self.remove_css_class("dots")
+        self.remove_css_class("notif-dots")
         historico = notif_historico()
         corte = self.limpas_ate() if HERMES is None else 0      # o Hermes limpa de verdade (sem corte por id)
         itens = [n for n in historico if n.get("id", 0) > corte]
@@ -531,6 +553,7 @@ class CentralNotificacoes(Janelinha):
         import hermes_dots as hd
         dk.aplicar_css()
         self.add_css_class("dots")
+        self.add_css_class("notif-dots")         # the panel draws its own card (no CSS card around it)
         historico = notif_historico()
         corte = self.limpas_ate() if HERMES is None else 0
         itens = [n for n in historico if n.get("id", 0) > corte]
@@ -1971,6 +1994,12 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         provedor.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+        pontos = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotstyle-janelinhas.css")
+        if os.path.exists(pontos):                       # DotStyle (só age em janelas com a classe "dots")
+            prov_dots = Gtk.CssProvider()
+            prov_dots.load_from_path(pontos)
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov_dots,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_USER + 2)
         self.janelinha = Janelinha()
         self.central = CentralNotificacoes()
         self.menu_janela = MenuJanela()
