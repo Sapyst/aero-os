@@ -72,6 +72,14 @@ def suave(a, b, x):
     return t * t * (3 - 2 * t)
 
 
+def ease(t):
+    if t <= 0:
+        return 0.0
+    if t >= 1:
+        return 1.0
+    return 1 - (1 - t) ** 3
+
+
 def pop(t):
     """0 -> overshoot -> 1 in about 0.32 s (t in seconds)."""
     if t <= 0:
@@ -185,6 +193,121 @@ class Nuvem(Gtk.Window):
 
     # ---------- data ----------
 
+    # ---------- halftone glass behind the cloud ----------
+    PASSO_VIDRO = 12
+    BORDA_VIDRO = 110          # how far (px) the dots keep fading out past the cloud's edge
+
+    def montar_vidro(self):
+        """Grid of dots for the glass: each point knows how far it is from the cloud's outline (an organic
+        outline: for each of 120 directions, the farthest bubble edge in that direction)."""
+        setores = 120
+        raio = [0.0] * setores
+        for b in self.bolhas:
+            d = math.hypot(b.x, b.y)
+            ang = math.atan2(b.y, b.x)
+            largura = math.asin(min(1.0, b.r / max(d, b.r))) if d > 0 else math.pi
+            n = max(1, int(largura / (2 * math.pi) * setores) + 1)
+            k = int((ang % (2 * math.pi)) / (2 * math.pi) * setores)
+            for j in range(k - n, k + n + 1):
+                raio[j % setores] = max(raio[j % setores], d + b.r + 30)
+        for _ in range(3):                                          # smooth the outline (no spikes)
+            raio = [(raio[i - 1] + 2 * raio[i] + raio[(i + 1) % setores]) / 4 for i in range(setores)]
+        rnd = random.Random(len(self.bolhas))
+        passo, borda = self.PASSO_VIDRO, self.BORDA_VIDRO
+        lim = max(raio) + borda
+        self.lim_vidro = lim
+        self.vidro = []
+        y = -lim
+        while y <= lim:
+            x = -lim
+            while x <= lim:
+                d = math.hypot(x, y)
+                k = int((math.atan2(y, x) % (2 * math.pi)) / (2 * math.pi) * setores)
+                fora = d - raio[k]                                    # < 0 inside the glass
+                if fora < borda:
+                    t = max(0.0, fora) / borda
+                    if t == 0 or rnd.random() > t * t * 0.85:         # sparser toward the edge
+                        tam = (1 - t) ** 1.4 * (0.75 + 0.25 * rnd.random())
+                        ang = rnd.uniform(0, 2 * math.pi)
+                        longe = rnd.uniform(120, 340)
+                        self.vidro.append((x, y, tam, t, math.cos(ang) * longe, math.sin(ang) * longe,
+                                           d / max(lim, 1) * 0.28 + rnd.uniform(0, 0.08)))
+                x += passo
+            y += passo
+        self.preparar_vidro()
+
+    def _pintar_vidro(self, pontos, lim):
+        """Draws the still glass once into an image (lim*2 square, centred on the cloud). Thread-safe:
+        only cairo, no GTK."""
+        import cairo
+        lado = int(2 * lim) + 2
+        img = cairo.ImageSurface(cairo.FORMAT_ARGB32, lado, lado)
+        cr = cairo.Context(img)
+        passo = self.PASSO_VIDRO
+        for x, y, tam, t, *_ in pontos:
+            r = passo * 0.5 * tam
+            if r < 0.4:
+                continue
+            tom = 0.06 + 0.07 * t
+            cr.set_source_rgba(tom, tom, tom + 0.01, 0.94 - 0.5 * t)
+            cr.arc(lim + x, lim + y, r, 0, 2 * math.pi)
+            cr.fill()
+        img.flush()
+        return img
+
+    def preparar_vidro(self):
+        """Paints the glass in a background thread (it takes ~0.1 s); the opening shows flying dots meanwhile."""
+        import threading
+        assinatura = (len(self.vidro), round(self.lim_vidro))
+        if getattr(self, "_vidro_assinatura", None) == assinatura and getattr(self, "vidro_img", None) is not None:
+            return
+        self.vidro_img = None
+        self._vidro_assinatura = assinatura
+        pontos, lim = list(self.vidro), self.lim_vidro
+
+        def trabalho():
+            img = self._pintar_vidro(pontos, lim)
+            GLib.idle_add(lambda: (setattr(self, "vidro_img", img), self.area.queue_draw(), False)[2])
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def desenhar_vidro(self, cr, w, h, agora):
+        """Opening: the glass is revealed from the centre outward (soft radial mask) while a few hundred
+        dots fly in and condense; closing: the reveal shrinks and the dots scatter away."""
+        if not getattr(self, "vidro", None):
+            return
+        import cairo
+        cx, cy = self._centro()
+        lim = self.lim_vidro
+        if self.t_fechar is None:
+            k = ease((agora - self.t_abrir) / 0.75)
+            voo = 1 - ease((agora - self.t_abrir) / 0.6)
+        else:
+            k = 1 - ease((agora - self.t_fechar) / 0.32)
+            voo = ease((agora - self.t_fechar) / 0.3)
+        img = getattr(self, "vidro_img", None)
+        if img is not None and k > 0.005:
+            cr.save()
+            cr.translate(cx - lim, cy - lim)
+            cr.set_source_surface(img, 0, 0)
+            if k >= 0.999:
+                cr.paint()
+            else:
+                alcance = lim * 1.25 * k
+                m = cairo.RadialGradient(lim, lim, max(0.0, alcance - 140), lim, lim, max(1.0, alcance))
+                m.add_color_stop_rgba(0, 0, 0, 0, 1)
+                m.add_color_stop_rgba(1, 0, 0, 0, 0)
+                cr.mask(m)
+            cr.restore()
+        if voo > 0.01:                                         # the flying dots (a sample of the glass)
+            for x, y, tam, t, lx, ly, _atraso in self.vidro[::12]:
+                f = 1 - voo
+                r = self.PASSO_VIDRO * 0.5 * tam * (0.5 + 0.5 * f)
+                if r < 0.5:
+                    continue
+                cr.set_source_rgba(0.85, 0.85, 0.83, 0.18 * voo * (1 - t * 0.6))
+                cr.arc(cx + x + lx * voo, cy + y + ly * voo, r, 0, 2 * math.pi)
+                cr.fill()
+
     def semear_enfeites(self, w, h):
         """Decorative dots that live AROUND the cloud: each one has a home on a halo hugging the cloud
         (denser near its edge, a few further out), is pulled back to it like gravity, slowly orbits,
@@ -194,7 +317,7 @@ class Nuvem(Gtk.Window):
         raio_nuvem = max((math.hypot(b.x, b.y) + b.r for b in self.bolhas), default=300)
         self.raio_nuvem = raio_nuvem
         self.enfeites = []
-        for _ in range(300):
+        for _ in range(160):
             ang = rnd.uniform(0, 2 * math.pi)
             dist = raio_nuvem * (0.97 + abs(rnd.gauss(0, 0.16)))           # a tight halo hugging the cloud
             hx, hy = math.cos(ang) * dist * 1.08, math.sin(ang) * dist * 0.9
@@ -270,7 +393,8 @@ class Nuvem(Gtk.Window):
         for b, (x, y) in zip(self.bolhas, empacotar([b.r for b in self.bolhas])):
             b.x, b.y = x, y
             b.cx, b.cy = x, y
-            b.atraso = min(0.42, math.hypot(x, y) / 1400) + random.uniform(0, 0.04)
+            b.atraso = min(0.42, math.hypot(x, y) / 1400) + 0.18 + random.uniform(0, 0.04)
+        self.montar_vidro()
         self.reorganizar()
 
     def icone(self, b):
@@ -490,8 +614,9 @@ class Nuvem(Gtk.Window):
             fundo = min(1.0, (agora - self.t_abrir) / 0.25)
         else:
             fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
-        cr.set_source_rgba(0.02, 0.02, 0.025, 0.28 * fundo)
+        cr.set_source_rgba(0.02, 0.02, 0.025, 0.12 * fundo)
         cr.paint()
+        self.desenhar_vidro(cr, w, h, agora)
         self.desenhar_enfeites(cr, w, h, agora, fundo)
         sobre = self.bolha_em(*self.mouse) if self.mouse else None
         foco = sobre if sobre is not None else (self.sel if (self.busca or getattr(self, "navegou", False)) else None)
