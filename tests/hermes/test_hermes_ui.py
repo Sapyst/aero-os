@@ -93,7 +93,7 @@ class TestCartaoEFluxo(unittest.TestCase):
                              ["default", "Open", "reply", "Reply"], {"value": 40, "urgency": 2}, -1, ":1")
         n = self.s.ativas[i]
         cartao = ui.montar_cartao(n, self.s.config, lambda i: None, lambda i, k: None, lambda i: None)
-        self.assertTrue(cartao.has_css_class("critica"))
+        self.assertTrue(cartao.critica)
 
     def test_tela_cheia_segura_cartao_e_onda_fraca(self):
         cheia = [True]
@@ -119,3 +119,65 @@ class TestCartaoEFluxo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDots(unittest.TestCase):
+    def test_fonte_e_texto(self):
+        import hermes_dots as hd
+        self.assertEqual(hd.normalizar("Notificação ç!"), "NOTIFICACAO C!")
+        self.assertEqual(hd.normalizar("emoji 😀"), "EMOJI  ")
+        self.assertAlmostEqual(hd.largura_texto("AB", 2), 22)
+        for ch, g in hd.FONTE.items():
+            self.assertEqual(len(g), 7, ch)
+            self.assertTrue(all(len(linha) == 5 for linha in g), ch)
+        sup = cairo.ImageSurface(cairo.FORMAT_ARGB32, 100, 20)
+        hd.desenhar_texto(cairo.Context(sup), "HERMES 02:51", 1, 1, 1.5, (1, 1, 1))
+        self.assertGreater(sum(sup.get_data()[3::4]), 0)
+
+    def test_perimetro(self):
+        import hermes_dots as hd
+        pts = hd.perimetro(0, 0, 340, 100, 22, 6)
+        self.assertGreater(len(pts), 60)
+        for x, y in pts:
+            self.assertTrue(-0.01 <= x <= 340.01 and -0.01 <= y <= 100.01)
+        self.assertEqual(len(hd.perimetro(0, 0, 10, 10, 50, 6)), 8)     # tiny box: never crashes
+
+    def test_cartao_entra_e_sai(self):
+        import time as t
+        import hermes_dots as hd
+        s = h.Hermes(h.validar_config({}), lambda ms, f: 1, lambda x: None)
+        i = s.notificar("Discord", 0, "", "Nova mensagem", "oi", [], {}, -1, ":1")
+        c = ui.montar_cartao(s.ativas[i], s.config, lambda i: None, lambda i, k: None, lambda i: None)
+        self.assertIsInstance(c, hd.CartaoDots)
+        contorno, conteudo = c.fases()
+        self.assertLess(conteudo, 0.2)                              # just born: outline first
+        c.t_entrada -= 1
+        self.assertEqual(c.fases(), (1.0, 1.0))
+        fim = []
+        c.sair(lambda: fim.append(1))
+        c.t_saida -= 1
+        self.assertEqual(c.fases(), (0.0, 0.0))
+        c._quadro()
+        ctx = __import__("gi.repository.GLib", fromlist=["GLib"]).MainContext.default()
+        for _ in range(20):
+            ctx.iteration(False)
+        self.assertEqual(fim, [1])
+        c.sobre(True)
+        self.assertEqual(c.alvo, 1.03)
+
+    def test_sino(self):
+        import json
+        import tempfile
+        d = tempfile.mkdtemp()
+        velho = ui.SINO
+        ui.SINO = os.path.join(d, "sino.json")
+        try:
+            c = h.validar_config({})
+            self.assertEqual(c["position"], "follow-bell")
+            self.assertEqual(ui.origem_da_onda(c, 1000, 600), (850, 18))       # estimate before a click
+            with open(ui.SINO, "w") as f:
+                json.dump({"x": 2300, "y": 20, "w": 2560, "h": 1440}, f)
+            self.assertEqual(ui.origem_da_onda(c, 2560, 1440), (2300, 20))
+            self.assertEqual(ui.posicao(c), "top-right")
+        finally:
+            ui.SINO = velho

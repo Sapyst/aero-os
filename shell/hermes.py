@@ -67,7 +67,8 @@ URGENCIAS = {0: "low", 1: "normal", 2: "critical"}
 # Every key can be changed by the user. Positions: "follow-central" uses the quick center's side.
 PADRAO = {
     "style": "dotstyle",                 # dotstyle | aeroterm | aerocloud
-    "position": "follow-central",        # follow-central | top-left | top-center | top-right |
+    "position": "follow-bell",           # follow-bell (under the bar's bell) | follow-central | top-left |
+                                         # top-center | top-right |
                                          # bottom-left | bottom-center | bottom-right
     "margin": 12, "width": 340, "gap": 8, "max_visible": 4,
     "timeout": {"low": 3000, "normal": 5000, "critical": 0},       # ms; 0 = stays until closed
@@ -98,7 +99,7 @@ PADRAO = {
     "rules": [],                         # [{"match": {...}, "set": {...}}], see aplicar_regras()
     "steam": "wave",                     # wave (wave where Steam's own popup appears) | move | off
 }
-POSICOES = {"follow-central", "top-left", "top-center", "top-right", "bottom-left", "bottom-center",
+POSICOES = {"follow-bell", "follow-central", "top-left", "top-center", "top-right", "bottom-left", "bottom-center",
             "bottom-right"}
 COR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 

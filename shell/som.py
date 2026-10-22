@@ -1880,7 +1880,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         self.hold()
         # Ações no D-Bus: o lançador chama com gdbus, sem iniciar outro Python
         for nome, funcao in (("popup", lambda p: self.janelinha.abrir(p == "completo")),
-                             ("notificacoes", lambda _p: self.central.abrir(False)),
+                             ("notificacoes", lambda _p: (self.lembrar_sino(), self.central.abrir(False))),
                              ("menu", lambda _p: self.menu_janela.abrir_no_mouse()),
                              ("central", lambda _p: self.central_rapida.abrir_central()),
                              ("sub", lambda p: self.central_rapida.alternar_sub(p)),   # abre uma subjanelinha
@@ -1890,6 +1890,30 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
             acao.connect("activate", lambda _a, valor, f=funcao: f(valor.get_string()))
             self.add_action(acao)
         threading.Thread(target=self.vigiar, daemon=True).start()
+
+    def lembrar_sino(self):
+        """O sino da barra acabou de ser clicado: o mouse está em cima dele. Anota onde (em coordenadas
+        do monitor), pra o Hermes soltar a onda e os cartões dali (~/.cache/aero-shell/sino.json)."""
+        def trabalho():
+            import json
+            try:
+                cursor = json.loads(rodar("hyprctl", "cursorpos", "-j") or "{}")
+                for m in json.loads(rodar("hyprctl", "monitors", "-j") or "[]"):
+                    escala = m.get("scale", 1) or 1
+                    w, h = m["width"] / escala, m["height"] / escala
+                    x, y = cursor["x"] - m["x"], cursor["y"] - m["y"]
+                    if 0 <= x <= w and 0 <= y <= h:
+                        caminho = os.path.expanduser("~/.cache/aero-shell/sino.json")
+                        with open(caminho + ".tmp", "w") as f:
+                            json.dump({"x": round(x), "y": round(y), "w": round(w), "h": round(h),
+                                       "monitor": m.get("name", "")}, f)
+                        os.replace(caminho + ".tmp", caminho)
+                        if getattr(self, "hermes_ui", None) is not None:
+                            GLib.idle_add(lambda: (self.hermes_ui.cartoes.ancorar(), False)[1])
+                        return
+            except (ValueError, KeyError, TypeError, OSError):
+                pass
+        threading.Thread(target=trabalho, daemon=True).start()
 
     def iniciar_hermes(self):
         """Hermes (doc: shell/hermes.py) recebe as notificações se o nome estiver livre. Com o mako
@@ -1938,6 +1962,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         elif len(args) == 2 and args[0] == "central":
             self.central_rapida.abrir_central()
         elif len(args) == 2 and args[0] == "notificacoes":
+            self.lembrar_sino()
             self.central.abrir(False)
         elif len(args) == 2 and args[0] == "osd":
             self.osd.mostrar(args[1])

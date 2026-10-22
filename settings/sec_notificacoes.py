@@ -21,7 +21,7 @@ except ImportError:                       # Hermes not installed: the page expla
     H = None
 
 CTL = os.path.expanduser("~/.local/bin/hermesctl")
-POSICOES = [("Next to the quick center", "follow-central"), ("Top left", "top-left"), ("Top center", "top-center"),
+POSICOES = [("Under the notification bell", "follow-bell"), ("Next to the quick center", "follow-central"), ("Top left", "top-left"), ("Top center", "top-center"),
             ("Top right", "top-right"), ("Bottom left", "bottom-left"), ("Bottom center", "bottom-center"),
             ("Bottom right", "bottom-right")]
 ESTILOS = [("DotStyle", "dotstyle"), ("AeroTerm", "aeroterm"), ("AeroCloud", "aerocloud")]

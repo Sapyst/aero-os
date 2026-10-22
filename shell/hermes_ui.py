@@ -25,6 +25,8 @@ gi.require_version("Gtk4LayerShell", "1.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
+import hermes_dots as hd  # noqa: E402
+
 PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
 
 
@@ -47,9 +49,31 @@ def lado_da_central():
     return "top-right"
 
 
+SINO = os.path.expanduser("~/.cache/aero-shell/sino.json")
+
+
+def lugar_do_sino():
+    """Where the bar's bell is, learned the last time it was clicked (som.py writes it):
+    {"x", "y"} in the monitor's own coordinates plus the monitor size; None if never clicked."""
+    try:
+        import json
+        with open(SINO, encoding="utf-8") as f:
+            d = json.load(f)
+        if all(isinstance(d.get(k), (int, float)) for k in ("x", "y", "w", "h")) and d["w"] > 0:
+            return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def posicao(config):
     p = config["position"]
-    return lado_da_central() if p == "follow-central" else p
+    if p == "follow-central":
+        return lado_da_central()
+    if p == "follow-bell":
+        sino = lugar_do_sino()
+        return "bottom-right" if sino and sino["y"] > sino["h"] / 2 else "top-right"   # bar at the bottom?
+    return p
 
 
 def tela_cheia():
@@ -127,6 +151,11 @@ def origem_da_onda(config, w, h, cartao=None):
     modo = config["wave"]["origin"]
     if modo == "screen-center":
         return w / 2, h / 2
+    if config["position"] == "follow-bell":
+        sino = lugar_do_sino()
+        if sino:                                              # the wave leaves the bell itself
+            return sino["x"] * w / sino["w"], sino["y"] * h / sino["h"]
+        return w - 150, 18                                    # until the first click: near the bar's right end
     pos = posicao(config)
     m = config["margin"]
     x = {"left": m + 24, "center": w / 2, "right": w - m - 24}[pos.split("-")[1]]
@@ -210,11 +239,7 @@ class Onda(Gtk.Window):
 CSS = """
 window.hermes-onda, .hermes-onda { background: none; background-color: transparent; box-shadow: none; }
 window.hermes-cartoes, .hermes-cartoes { background: none; background-color: transparent; box-shadow: none; }
-.hermes-cartao {
-  background: alpha(@hermes_bg, 0.94); color: @hermes_fg; border-radius: @hermes_radius;
-  border: 1px solid alpha(@hermes_fg, 0.10); padding: 12px 14px;
-}
-.hermes-cartao.critica { border-color: @hermes_accent; }
+.hermes-titulo, .hermes-corpo { color: @hermes_fg; }
 .hermes-app { font-family: "@hermes_mono"; font-size: 10.5px; letter-spacing: 0.08em; color: @hermes_dim; }
 .hermes-titulo { font-family: "@hermes_body"; font-weight: 600; font-size: 13.5px; }
 .hermes-corpo { font-family: "@hermes_body"; font-size: 12.5px; color: alpha(@hermes_fg, 0.82); }
@@ -274,24 +299,24 @@ def imagem_da_notificacao(n, tamanho=36):
     return None
 
 
-def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar):
-    """One card. Text widgets never use markup except the body, which hermes.limpar_markup made safe."""
-    caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-    caixa.add_css_class("hermes-cartao")
-    if n.urgencia == 2:
-        caixa.add_css_class("critica")
+def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar, claro=False):
+    """One DotStyle card (hermes_dots.CartaoDots): dot outline that assembles, app name and time in dot
+    letters, a red dot to dismiss, hover bounce. Text widgets never use markup except the body, which
+    hermes.limpar_markup made safe."""
+    cores_hex = config["colors_light" if claro else "colors"]
+    cores = {k: rgb(v) for k, v in cores_hex.items()}
+    caixa = hd.CartaoDots(cores, config["radius"], critica=n.urgencia == 2)
     caixa.set_size_request(config["width"], -1)
+    dentro = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7, margin_top=12, margin_bottom=12,
+                     margin_start=14, margin_end=12)
+    caixa.append(dentro)
     topo = Gtk.Box(spacing=8)
-    app = Gtk.Label(label=n.app.upper(), xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END, use_markup=False)
-    app.add_css_class("hermes-app")
-    hora = Gtk.Label(label=time.strftime("%H:%M", time.localtime(n.criada)), use_markup=False)
-    hora.add_css_class("hermes-app")
-    fechar = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Dismiss")
-    fechar.add_css_class("hermes-fechar")
-    fechar.connect("clicked", lambda *_: ao_fechar(n.id))
-    for w in (app, hora, fechar):
-        topo.append(w)
-    caixa.append(topo)
+    nome = n.app if len(n.app) <= 28 else n.app[:27] + "."
+    topo.append(hd.TextoDots(nome, cores["dim"], passo=1.55, alfa=0.95))
+    topo.append(Gtk.Box(hexpand=True))
+    topo.append(hd.TextoDots(time.strftime("%H:%M", time.localtime(n.criada)), cores["dim"], passo=1.55, alfa=0.7))
+    topo.append(hd.PontoFechar(cores["accent"], lambda: ao_fechar(n.id)))
+    dentro.append(topo)
     meio = Gtk.Box(spacing=10)
     if config["icons"]:
         img = imagem_da_notificacao(n)
@@ -315,9 +340,9 @@ def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar):
         c.add_css_class("hermes-corpo")
         textos.append(c)
     meio.append(textos)
-    caixa.append(meio)
+    dentro.append(meio)
     if n.valor is not None:
-        caixa.append(pontos_progresso(n.valor, rgb(config["colors"]["text"])))
+        dentro.append(pontos_progresso(n.valor, cores["text"]))
     botoes = [(k, t) for k, t in n.acoes if k != "default" and t]
     if botoes:
         linha = Gtk.Box(spacing=6)
@@ -326,7 +351,7 @@ def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar):
             b.add_css_class("hermes-acao")
             b.connect("clicked", lambda *_, k=k: ao_acao(n.id, k))
             linha.append(b)
-        caixa.append(linha)
+        dentro.append(linha)
     clique = Gtk.GestureClick(button=0)
 
     def soltou(g, _n, _x, _y):
@@ -366,12 +391,18 @@ class Cartoes(Gtk.Window):
             Camada.set_anchor(self, Camada.Edge.LEFT if h_ == "left" else Camada.Edge.RIGHT, True)
         for borda in (Camada.Edge.TOP, Camada.Edge.BOTTOM, Camada.Edge.LEFT, Camada.Edge.RIGHT):
             Camada.set_margin(self, borda, self.config["margin"])
+        if self.config["position"] == "follow-bell":
+            sino = lugar_do_sino()
+            if sino:                       # the card's right edge sits just right of the bell
+                Camada.set_margin(self, Camada.Edge.RIGHT,
+                                  int(max(self.config["margin"], sino["w"] - sino["x"] - 30)))
         self.de_baixo = v == "bottom"
 
     def mostrar(self, n):
         velho = self.widgets.pop(n.id, None)
         novo = montar_cartao(n, self.config, lambda i: self.servico.acionar(i),
-                             lambda i, k: self.servico.acionar(i, k), lambda i: self.servico.fechar(i))
+                             lambda i, k: self.servico.acionar(i, k), lambda i: self.servico.fechar(i),
+                             claro="claro" in self.servico.modos)
         if velho is not None:
             self.pilha.insert_child_after(novo, velho)
             self.pilha.remove(velho)
@@ -382,16 +413,25 @@ class Cartoes(Gtk.Window):
         self.widgets[n.id] = novo
         # too many: the oldest leaves the screen (it stays in the history)
         while len(self.widgets) > self.config["max_visible"]:
-            mais_velho = min(self.widgets)
-            self.pilha.remove(self.widgets.pop(mais_velho))
+            self._sumir(self.widgets.pop(min(self.widgets)))
         self.set_visible(True)
 
     def tirar(self, id_):
         w = self.widgets.pop(id_, None)
         if w is not None:
-            self.pilha.remove(w)
-        if not self.widgets:
-            self.set_visible(False)
+            self._sumir(w)
+
+    def _sumir(self, w):
+        """The card dissolves (dots go out), then leaves the stack; the window hides when empty."""
+        def fim():
+            if w.get_parent() is self.pilha:
+                self.pilha.remove(w)
+            if not self.widgets and self.pilha.get_first_child() is None:
+                self.set_visible(False)
+        if hasattr(w, "sair"):
+            w.sair(fim)
+        else:
+            fim()
 
     def centro_do_mais_novo(self):
         """Approximate screen point of the newest card (for the wave's origin), or None."""

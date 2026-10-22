@@ -32,7 +32,7 @@ def novo(config=None):
     r = Relogio()
     s = h.Hermes(h.validar_config(config or {}), r.agendar, r.cancelar)
     eventos = []
-    s.ouvir(lambda ev, n: eventos.append((ev, n.id)))
+    s.ouvir(lambda ev, n: n is not None and eventos.append((ev, n.id)))
     return s, r, eventos
 
 
@@ -43,7 +43,7 @@ class TestConfig(unittest.TestCase):
         c = h.validar_config({"position": "middle-earth", "width": "big", "margin": -5, "max_visible": 99,
                               "wave": {"color": "red", "intensity": 7, "origin": "moon"},
                               "colors": {"text": "#12345"}, "font": {"title": "Evil;font"}, "rules": "no"})
-        self.assertEqual(c["position"], "follow-central")
+        self.assertEqual(c["position"], "follow-bell")
         self.assertEqual(c["width"], 340)
         self.assertEqual(c["margin"], 0)
         self.assertEqual(c["max_visible"], 12)
