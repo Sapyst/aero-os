@@ -9,10 +9,32 @@ Usa o nmcli (linha de comando do NetworkManager, o serviço que cuida da rede):
   nmcli connection up|down|delete id NOME   conectar/desconectar/esquecer uma rede salva
 SSID = o nome da rede Wi-Fi.
 """
+import json
+import os
+
 from gi.repository import Adw, Gtk
 
 from comum import (Secao, botao, confirmar, em_segundo_plano, limpar_grupo, linha_app, linha_seta,
-                   pagina, rodar)
+                   pagina, rodar, rodar_como_root)
+
+PAIS = "/usr/local/lib/aero-geo/aero-wifi-country"     # root helper (pkexec): Wi-Fi country
+ESTADO_PAIS = "/var/lib/aero-geo/state.json"
+FONTES = {"routers": "from nearby networks", "timezone": "from the time zone", "ip": "from internet location",
+          "manual": "set by you"}
+
+
+def ler_paises():
+    """[(name, code)] from the system's own table, sorted by name."""
+    nomes = []
+    try:
+        with open("/usr/share/zoneinfo/iso3166.tab", encoding="utf-8") as f:
+            for linha in f:
+                partes = linha.rstrip("\n").split("\t")
+                if len(partes) == 2 and len(partes[0]) == 2 and partes[0].isalpha():
+                    nomes.append((partes[1], partes[0]))
+    except OSError:
+        pass
+    return sorted(nomes)
 
 
 def separar(linha):
@@ -72,11 +94,28 @@ class SecaoRede(Secao):
         self.redes.set_header_suffix(sufixo)
 
         self.salvas = Adw.PreferencesGroup(title="Saved networks")
+        self.grupo_pais = Adw.PreferencesGroup(
+            title="Wi-Fi country", description="Decides which channels and bands are allowed (6 GHz needs it). "
+                                               "Checked only when you join a new network.")
+        self.pais_atual = Adw.ActionRow(title="Now")
+        self.pais_atual.set_use_markup(False)
+        self.paises = ler_paises()
+        self.pais_combo = Adw.ComboRow(title="Country", model=Gtk.StringList.new(
+            ["Automatic"] + [f"{n} ({c})" for n, c in self.paises]))
+        self.pais_combo.set_enable_search(True)
+        self.pais_combo.connect("notify::selected", self.ao_mudar_pais)
+        self.pais_ip = Adw.SwitchRow(title="Use internet location",
+                                     subtitle="Only when nearby networks and the time zone can't tell. "
+                                              "Sends your IP address to ipinfo.io")
+        self.pais_ip.connect("notify::active", self.ao_mudar_ip)
+        for linha in (self.pais_atual, self.pais_combo, self.pais_ip):
+            self.grupo_pais.add(linha)
+
         avancado = Adw.PreferencesGroup()
         avancado.add(linha_app("Advanced network settings", "IP, DNS, VPN, wired connections",
                                ["nm-connection-editor"], "preferences-system-symbolic"))
 
-        for g in (self.status, wifi, self.redes, self.salvas, avancado):
+        for g in (self.status, wifi, self.redes, self.salvas, self.grupo_pais, avancado):
             conteudo.add(g)
         self.linhas = {"status": [], "redes": [], "salvas": []}
         self.atualizando = False
@@ -89,6 +128,52 @@ class SecaoRede(Secao):
         self.montar_status()
         self.montar_redes()
         self.montar_salvas()
+        self.montar_pais()
+
+    # ---------- Wi-Fi country (aero-wifi-country) ----------
+
+    def montar_pais(self):
+        instalado = os.access(PAIS, os.X_OK)
+        self.grupo_pais.set_visible(instalado)
+        if not instalado:
+            return
+        try:
+            with open(ESTADO_PAIS, encoding="utf-8") as f:
+                estado = json.load(f)
+        except (OSError, ValueError):
+            estado = {}
+        try:
+            conf = dict(linha.strip().partition("=")[::2] for linha in open("/etc/aero/wifi-country.conf")
+                        if "=" in linha and not linha.startswith("#"))
+        except OSError:
+            conf = {}
+        codigo = estado.get("country", "")
+        nome = next((n for n, c in self.paises if c == codigo), codigo)
+        self.pais_atual.set_subtitle(f"{nome} ({codigo}) · {FONTES.get(estado.get('source'), '')}"
+                                     if codigo else "Not decided yet")
+        self.atualizando = True
+        manual = conf.get("mode") == "manual"
+        indice_pais = next((i for i, (_, c) in enumerate(self.paises) if c == conf.get("country")), None)
+        self.pais_combo.set_selected(indice_pais + 1 if manual and indice_pais is not None else 0)
+        self.pais_ip.set_active(conf.get("ip_lookup") == "1")
+        self.atualizando = False
+
+    def mudar_pais(self, args):
+        def depois(r):
+            ok = getattr(r, "returncode", 1) == 0
+            self.janela.avisar("Wi-Fi country updated" if ok else "Not changed (password cancelled or error)")
+            self.montar_pais()
+        em_segundo_plano(lambda: rodar_como_root([PAIS, "set"] + args), depois)
+
+    def ao_mudar_pais(self, *_):
+        if self.atualizando:
+            return
+        i = self.pais_combo.get_selected()
+        self.mudar_pais(["mode", "auto"] if i == 0 else ["country", self.paises[i - 1][1]])
+
+    def ao_mudar_ip(self, *_):
+        if not self.atualizando:
+            self.mudar_pais(["ip_lookup", "1" if self.pais_ip.get_active() else "0"])
 
     def ao_ligar(self, *_):
         if not self.atualizando:

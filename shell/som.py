@@ -136,8 +136,35 @@ window.menu-janela .cartao-som button label { font-weight: normal; }   /* menu c
 """
 
 
-def rodar(*cmd):
-    return subprocess.run(cmd, capture_output=True, text=True).stdout
+def rodar(*cmd, timeout=4):
+    # sempre com prazo: um player/D-Bus travado (Firefox, Steam...) não pode prender a central
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+_FOTO = {"chave": None, "textura": None}
+
+
+def foto_perfil():
+    """~/.face em MINIATURA (96 px), feita uma vez e guardada até a foto mudar.
+    Antes a central decodificava a foto inteira a cada redesenho: com uma foto de 5000×6000 eram ~100 ms e
+    uma textura de 120 MB por clique/mudança de volume — a central travava e ficava "uma imagem"."""
+    caminho = os.path.expanduser("~/.face")
+    try:
+        chave = (os.path.getmtime(caminho), os.path.getsize(caminho))
+    except OSError:
+        return None
+    if _FOTO["chave"] != chave:
+        try:
+            from gi.repository import GdkPixbuf
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(caminho, 96, 96, True)
+            _FOTO["textura"] = Gdk.Texture.new_for_pixbuf(pb)
+        except GLib.Error:
+            _FOTO["textura"] = None
+        _FOTO["chave"] = chave
+    return _FOTO["textura"]
 
 
 def hyprctl_json(*args):
@@ -191,13 +218,14 @@ class Janelinha(Gtk.Window):
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.ON_DEMAND)   # pra receber o Esc
         self.pegador = Pegador(self.fechar)
         self.zona_icone = (0, 0)
-        self.mexendo = False       # True enquanto VOCÊ arrasta o controle (não atualizar por baixo)
         self.completo = False
 
         teclas = Gtk.EventControllerKey()
         teclas.connect("key-pressed", lambda _c, tecla, *_: self.fechar() if tecla == Gdk.KEY_Escape else None)
         self.add_controller(teclas)
 
+        from esfera import EsferaLiquida
+        self.esfera = EsferaLiquida(92)          # o volume como líquido (esfera.py); mantida entre os montar()
         self.cartao = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.cartao.add_css_class("cartao-som")
         self.cartao.set_size_request(LARGURA, -1)
@@ -218,27 +246,25 @@ class Janelinha(Gtk.Window):
         alvo = "@DEFAULT_SINK@" if eh_saida else "@DEFAULT_SOURCE@"
         tipo = "sink" if eh_saida else "source"
         mudo_bt.connect("clicked", lambda *_: rodar("pactl", f"set-{tipo}-mute", alvo, "toggle"))
-        escala = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        escala.set_hexpand(True)
-        escala.set_draw_value(False)
-        escala.set_value(min(v, 100))
-        escala.set_sensitive(not mudo)
         por_cento = Gtk.Label(label=f"{v}%", xalign=1)
         por_cento.add_css_class("por-cento")
+        por_cento.set_width_chars(4)
 
-        def mudou(e):
-            n = round(e.get_value())
+        def mudou(valor):                 # a cada quadro: interface (número, ícone, esfera)
+            n = round(valor)
             por_cento.set_label(f"{n}%")
+            if eh_saida:
+                self.esfera.set_nivel(valor / 100)
             mudo_bt.set_icon_name(icone_volume(n, False) if eh_saida else "audio-input-microphone-symbolic")
-            rodar("pactl", f"set-{tipo}-volume", alvo, f"{n}%")
 
-        escala.connect("value-changed", mudou)
-        # enquanto o dedo/mouse estiver segurando o controle, não deixa a atualização automática mexer nele
-        segurar = Gtk.GestureClick()
-        segurar.connect("pressed", lambda *_: setattr(self, "mexendo", True))
-        segurar.connect("released", lambda *_: setattr(self, "mexendo", False))
-        segurar.connect("cancel", lambda *_: setattr(self, "mexendo", False))
-        escala.add_controller(segurar)
+        def aplicar(valor):               # numa thread, no máximo ~30x/s, sempre o último valor
+            rodar("pactl", f"set-{tipo}-volume", alvo, f"{valor:.1f}%")
+
+        # slider.py: arraste 1:1, clique desliza, rolar ±2 — e não trava a tela esperando o pactl
+        from slider import SliderFluido
+        escala = SliderFluido(0, 100, valor=min(v, 100), ao_mudar=mudou, aplicar=aplicar)
+        escala.set_ativo(not mudo)
+        self.sliders = [s for s in getattr(self, "sliders", []) if s.get_root() is not None] + [escala]
         for w in (mudo_bt, escala, por_cento):
             caixa.append(w)
         return caixa
@@ -262,7 +288,8 @@ class Janelinha(Gtk.Window):
         return lista
 
     def montar(self):
-        if self.mexendo:
+        # segurando um slider: o painel não se remonta por baixo (era isso que fazia a barra pular)
+        if any(s.segurando for s in getattr(self, "sliders", [])):
             return
         while (filho := self.cartao.get_first_child()) is not None:
             self.cartao.remove(filho)
@@ -274,8 +301,19 @@ class Janelinha(Gtk.Window):
             nome = Gtk.Label(label=nome_bonito(saida.get("description", saida["name"]), saida["name"], False),
                              xalign=0, ellipsize=3, use_markup=False, margin_start=4)
             nome.add_css_class("aparelho")
-            self.cartao.append(nome)
-            self.cartao.append(self.linha_volume(True, saida))
+            topo = Gtk.Box(spacing=12, margin_bottom=4)
+            if self.esfera.get_parent() is not None:
+                self.esfera.get_parent().remove(self.esfera)
+            primeira = not getattr(self, "_esfera_pronta", False)
+            self.esfera.set_mudo(saida.get("mute", False))
+            self.esfera.set_nivel(min(volume_de(saida), 100) / 100, imediato=primeira)
+            self._esfera_pronta = True
+            topo.append(self.esfera)
+            lado = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, valign=Gtk.Align.CENTER, hexpand=True)
+            lado.append(nome)
+            lado.append(self.linha_volume(True, saida))
+            topo.append(lado)
+            self.cartao.append(topo)
         else:
             self.cartao.append(Gtk.Label(label="No output device"))
 
@@ -324,6 +362,7 @@ class Janelinha(Gtk.Window):
         self.set_visible(False)
         self.pegador.set_visible(False)
         Janelinha.abertas.discard(self)
+        self._entrada = None              # (central) a região de entrada é refeita ao reabrir
 
     # ---------- "clicou fora = fecha" ----------
     # A camada invisível (pegador) não pegava cliques de verdade. Então, enquanto há uma janelinha
@@ -598,6 +637,10 @@ class CentralRapida(Janelinha):
         # (região de entrada = só os cartões, atualizada a cada quadro em que a altura muda).
         self.altura_conteudo = 0
         self.add_tick_callback(self.ajustar_entrada)
+        # Toda vez que a central reabre, o Wayland cria a superfície de novo e ZERA a região de entrada.
+        # Sem esquecer o tamanho anterior, ela não era reaplicada (mesmo tamanho = "nada mudou") e a central
+        # aparecia sem receber cliques: "parece só uma imagem". Ao mapear, força reaplicar.
+        self.connect("map", lambda *_: setattr(self, "_entrada", None))
         vazio = Gtk.GestureClick(button=0)
         vazio.connect("pressed", self.clique_no_vazio)
         self.add_controller(vazio)
@@ -692,6 +735,11 @@ class CentralRapida(Janelinha):
         f = self.fonte()
         return rodar("playerctl", *(["-p", f] if f else []), *args)
 
+    def pc_fundo(self, *args):
+        """playerctl a partir de um clique: numa thread (a tela nunca espera o player responder)."""
+        import threading
+        threading.Thread(target=lambda: self.pc(*args), daemon=True).start()
+
     @staticmethod
     def nome_fonte(player, url=""):
         base = player.split(".")[0]
@@ -758,8 +806,11 @@ class CentralRapida(Janelinha):
         import time
         fmt = "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}\t{{mpris:artUrl}}\t{{mpris:length}}\t{{xesam:url}}"
         f = self.fonte()
-        r = subprocess.run(["playerctl", *(["-p", f] if f else []), "metadata", "--format", fmt],
-                           capture_output=True, text=True)
+        try:
+            r = subprocess.run(["playerctl", *(["-p", f] if f else []), "metadata", "--format", fmt],
+                               capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return None
         partes = r.stdout.rstrip("\n").split("\t")
         if r.returncode != 0 or len(partes) < 7 or not (partes[3] or partes[2]):
             return None
@@ -914,20 +965,22 @@ class CentralRapida(Janelinha):
         caixa.set_margin_bottom(44)         # o texto/botões não ocupam a faixa da base
         return fundo
 
-    def deslizante(self, icone, valor, ao_mudar):
+    def deslizante(self, icone, valor, aplicar, minimo=1, maximo=100):
+        """Slider da central. O comando (pactl, DDC...) roda NUMA THREAD, só o valor mais recente (slider.py).
+        Antes: Gtk.Scale rodando o comando a cada pixel na tela + uma trava "mexendo" que às vezes nunca
+        soltava (o Gtk.Scale engole o "soltou") — e a central parava de responder de vez."""
+        from slider import SliderFluido
         linha = Gtk.Box(spacing=10)
         linha.append(Gtk.Image(icon_name=icone))
-        escala = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 100, 1)
-        escala.set_hexpand(True)
-        escala.set_draw_value(False)
-        escala.set_value(valor)
-        escala.connect("value-changed", lambda e: ao_mudar(round(e.get_value())))
-        segurar = Gtk.GestureClick()
-        segurar.connect("pressed", lambda *_: setattr(self, "mexendo", True))
-        segurar.connect("released", lambda *_: setattr(self, "mexendo", False))
-        escala.add_controller(segurar)
+        escala = SliderFluido(minimo, maximo, valor=valor, aplicar=lambda v: aplicar(round(v)))
+        self.sliders = [s for s in getattr(self, "sliders", []) if s.get_root() is not None] + [escala]
         linha.append(escala)
         return linha
+
+    @property
+    def mexendo(self):
+        """Você está segurando algum slider? (então nada se redesenha por baixo)"""
+        return any(s.segurando for s in getattr(self, "sliders", []) if s.get_root() is not None)
 
     def botao_grande(self, icone, titulo, estado, ligado, ao_clicar, aba=None):
         """Botão "pílula" Material: ligado = cor de destaque; a setinha abre a página do Settings."""
@@ -1144,7 +1197,7 @@ class CentralRapida(Janelinha):
                 uso, ssid, sinal, seg = campos[0] == "*", campos[1], int(campos[2] or 0), campos[3]
                 if ssid not in redes or uso or sinal > redes[ssid]["sinal"]:
                     redes[ssid] = {"ssid": ssid, "uso": uso or redes.get(ssid, {}).get("uso", False),
-                                   "sinal": sinal, "seguranca": seg not in ("", "--")}
+                                   "sinal": sinal, "seguranca": seg not in ("", "--"), "tipo": seg}
             self.redes = sorted(redes.values(), key=lambda r: (not r["uso"], -r["sinal"]))
             GLib.idle_add(self.atualizar_sub)
         threading.Thread(target=trabalho, daemon=True).start()
@@ -1158,6 +1211,10 @@ class CentralRapida(Janelinha):
         if not wifi_on:
             caixa.append(Gtk.Label(label="Wi-Fi is off", xalign=0, margin_start=6, opacity=0.7))
             return caixa
+        aviso = getattr(self, "aviso_wifi", "")
+        if aviso:
+            rotulo = Gtk.Label(label=aviso, xalign=0, margin_start=6, opacity=0.8, wrap=True, use_markup=False)
+            caixa.append(rotulo)
         redes = getattr(self, "redes", None)
         if not redes:
             caixa.append(Gtk.Label(label="Searching…" if redes is None else "No networks found",
@@ -1182,8 +1239,10 @@ class CentralRapida(Janelinha):
             b = Gtk.Button(child=linha)
             b.add_css_class("rede")
             if not r["uso"]:
-                b.connect("clicked", lambda *_, ssid=r["ssid"]: self.conectar_rede(ssid))
+                b.connect("clicked", lambda *_, rede=r: self.conectar_rede(rede))
             lista.append(b)
+            if getattr(self, "senha_para", None) == r["ssid"]:
+                lista.append(self.campo_senha(r))
         rolar.set_child(lista)
         caixa.append(rolar)
         return caixa
@@ -1197,22 +1256,96 @@ class CentralRapida(Janelinha):
                          daemon=True).start()
         GLib.timeout_add(800, self.montar_seguro)
 
-    def conectar_rede(self, ssid):
-        """Rede já salva: conecta direto. Rede nova com senha: abre a página de rede do Settings."""
+    def campo_senha(self, rede):
+        """Senha de uma rede nova, ali mesmo na central. Vai pro NetworkManager pela entrada padrão
+        (passwd-file /dev/stdin), nunca na linha de comando (que qualquer programa consegue ler)."""
+        caixa = Gtk.Box(spacing=6, margin_start=28, margin_end=4, margin_top=2, margin_bottom=4)
+        campo = Gtk.PasswordEntry(show_peek_icon=True, hexpand=True, placeholder_text="Password")
+        ok = Gtk.Button(label="Connect")
+        ok.add_css_class("suggested-action")
+
+        def enviar(*_):
+            senha = campo.get_text()
+            if len(senha) >= 8 or (rede["tipo"].startswith("WEP") and senha):
+                self.conectar_com_senha(rede, senha)
+            else:
+                self.aviso_wifi = "Wi-Fi passwords have at least 8 characters"
+                self.atualizar_sub()
+        campo.connect("activate", enviar)
+        ok.connect("clicked", enviar)
+        caixa.append(campo)
+        caixa.append(ok)
+        GLib.idle_add(lambda: (campo.grab_focus(), GLib.SOURCE_REMOVE)[1])
+        return caixa
+
+    def conectar_rede(self, rede):
+        """Rede salva: conecta direto. Aberta: conecta. Nova com senha: abre o campo de senha aqui.
+        Empresarial (802.1X, login e certificado): isso precisa da tela completa do Settings."""
         import threading
+        ssid = rede["ssid"]
+        salvas = rodar("nmcli", "-t", "-f", "NAME", "con", "show").splitlines()
+        if ssid not in salvas and "802.1X" in rede.get("tipo", ""):
+            self.abrir_settings("rede")
+            return
+        if ssid not in salvas and rede["seguranca"]:
+            self.senha_para = None if getattr(self, "senha_para", None) == ssid else ssid
+            self.aviso_wifi = ""
+            self.atualizar_sub()
+            return
+        self.senha_para = None
+        self.aviso_wifi = f"Connecting to {ssid}…"
+        self.atualizar_sub()
 
         def trabalho():
-            salvas = rodar("nmcli", "-t", "-f", "NAME", "con", "show").splitlines()
             if ssid in salvas:
-                rodar("nmcli", "con", "up", ssid)
+                r = subprocess.run(["nmcli", "--wait", "45", "con", "up", "id", ssid], capture_output=True, text=True)
             else:
-                r = subprocess.run(["nmcli", "dev", "wifi", "connect", ssid], capture_output=True, text=True)
-                if r.returncode != 0:
-                    GLib.idle_add(lambda: (self.abrir_settings("rede"), GLib.SOURCE_REMOVE)[1])
-                    return
-            self.procurar_redes()
-            GLib.idle_add(self.montar_seguro)
+                r = subprocess.run(["nmcli", "--wait", "45", "dev", "wifi", "connect", ssid],
+                                   capture_output=True, text=True)
+            self.depois_conectar(ssid, r.returncode == 0)
         threading.Thread(target=trabalho, daemon=True).start()
+
+    def conectar_com_senha(self, rede, senha):
+        import threading
+        ssid = rede["ssid"]
+        self.senha_para = None
+        self.aviso_wifi = f"Connecting to {ssid}…"
+        self.atualizar_sub()
+        # WPA3 puro usa "sae"; WPA2 e o modo misto WPA2/WPA3 usam "wpa-psk"; WEP é "none" + chave WEP
+        tipo = rede.get("tipo", "")
+        if tipo.startswith("WEP"):
+            seguranca, campo = ["wifi-sec.key-mgmt", "none"], "802-11-wireless-security.wep-key0"
+        elif "WPA3" in tipo and "WPA2" not in tipo and "WPA1" not in tipo:
+            seguranca, campo = ["wifi-sec.key-mgmt", "sae"], "802-11-wireless-security.psk"
+        else:
+            seguranca, campo = ["wifi-sec.key-mgmt", "wpa-psk"], "802-11-wireless-security.psk"
+
+        def trabalho():
+            criou = subprocess.run(["nmcli", "con", "add", "type", "wifi", "con-name", ssid, "ssid", ssid]
+                                   + seguranca, capture_output=True, text=True)
+            ok = False
+            if criou.returncode == 0:
+                r = subprocess.run(["nmcli", "--wait", "45", "con", "up", "id", ssid, "passwd-file", "/dev/stdin"],
+                                   input=f"{campo}:{senha}\n", capture_output=True, text=True)
+                ok = r.returncode == 0
+                if not ok:
+                    subprocess.run(["nmcli", "con", "delete", "id", ssid], capture_output=True)
+            self.depois_conectar(ssid, ok, senha_errada=criou.returncode == 0)
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def depois_conectar(self, ssid, ok, senha_errada=False):
+        def na_tela():
+            if ok:
+                self.aviso_wifi = ""
+            else:
+                self.aviso_wifi = (f"Couldn't connect to {ssid}. Wrong password?" if senha_errada
+                                   else f"Couldn't connect to {ssid}")
+                if senha_errada:
+                    self.senha_para = ssid               # campo aberto de novo pra tentar outra vez
+            self.procurar_redes()
+            self.montar_seguro()
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(na_tela)
 
     def ao_bloco(self, botao, rotulo, acao):
         """Clique num botão grande: muda NA HORA (cor e texto) e roda o comando em segundo plano.
@@ -1234,10 +1367,18 @@ class CentralRapida(Janelinha):
         tarefas = {"player": self.player, "wifi": self.wifi, "bluetooth": self.bluetooth,
                    "modos": lambda: rodar("makoctl", "mode").split(), "filtro": self.filtro_ligado,
                    "tema": lambda: rodar("cat", os.path.expanduser("~/.cache/hypr-tema/tema")).strip(),
-                   "sinks": lambda: listar("sinks"), "sources": lambda: listar("sources")}
+                   "sinks": lambda: listar("sinks"), "sources": lambda: listar("sources"),
+                   "brilho": self.ler_brilho}
         with ThreadPoolExecutor(len(tarefas)) as ex:
             futuros = {k: ex.submit(f) for k, f in tarefas.items()}
             return {k: f.result() for k, f in futuros.items()}
+
+    @staticmethod
+    def ler_brilho():
+        """(telas que o controle muda, valor) — DDC pode levar segundos: só roda fora da tela."""
+        from servicos import brilho
+        telas = brilho.alvos()
+        return telas, (brilho.ler(telas[0]) if telas else None)
 
     def atualizar_tudo(self):
         """Coleta em segundo plano e, quando chegar, redesenha (na thread do GTK)."""
@@ -1285,10 +1426,9 @@ class CentralRapida(Janelinha):
         eu = pwd.getpwuid(os.getuid())
         nome_eu = eu.pw_gecos.split(",")[0] or eu.pw_name
         avatar = Adw.Avatar(size=26, text=nome_eu, show_initials=True)
-        try:
-            avatar.set_custom_image(Gdk.Texture.new_from_filename(os.path.expanduser("~/.face")))
-        except GLib.Error:
-            pass
+        foto = foto_perfil()
+        if foto is not None:
+            avatar.set_custom_image(foto)
         perfil = Gtk.Button(tooltip_text="Change profile picture")
         perfil.add_css_class("perfil")
         caixa_eu = Gtk.Box(spacing=8)
@@ -1318,16 +1458,12 @@ class CentralRapida(Janelinha):
         topo.append(ajustes)
         controles.append(topo)
 
-        # brilho (tela do notebook) e volume
-        try:
-            b = int(open(f"{BACKLIGHT}/brightness").read()); bmax = int(open(f"{BACKLIGHT}/max_brightness").read())
-            controles.append(self.deslizante("display-brightness-symbolic", round(b * 100 / bmax),
-                                             lambda v, m=bmax: rodar("busctl", "call", "org.freedesktop.login1",
-                                                                     "/org/freedesktop/login1/session/auto",
-                                                                     "org.freedesktop.login1.Session", "SetBrightness",
-                                                                     "ssu", "backlight", "amdgpu_bl1", str(max(1, m * v // 100)))))
-        except (OSError, ValueError):
-            pass
+        # brilho (a tela focada: notebook ou monitor externo via DDC; servicos/brilho.py) e volume
+        from servicos import brilho
+        telas_brilho, valor_brilho = e["brilho"]
+        if valor_brilho is not None:
+            controles.append(self.deslizante("display-brightness-symbolic", valor_brilho,
+                                             lambda v: [brilho.definir(t, v) for t in telas_brilho]))
         saida = next((d for d in e["sinks"] if d["padrao"]), None)
         if saida:
             controles.append(self.deslizante("audio-volume-high-symbolic", min(volume_de(saida), 100),
@@ -1349,7 +1485,7 @@ class CentralRapida(Janelinha):
         blocos = [
             self.botao_grande("network-wireless-symbolic" if wifi_on else "network-wireless-offline-symbolic",
                               "Wi-Fi", rede or ("On" if wifi_on else "Off"), wifi_on,
-                              "wifi", "rede"),
+                              "wifi", "sub:wifi"),
             self.botao_grande("bluetooth-active-symbolic" if bt_on else "bluetooth-disabled-symbolic",
                               "Bluetooth", (bt_dev[0] if bt_dev else "On") if bt_on else "Off", bt_on,
                               # clique liga/desliga; a setinha ">" abre a lista (e já procura aparelhos)
@@ -1361,7 +1497,7 @@ class CentralRapida(Janelinha):
                               lambda: self.alternar_filtro(not filtro), "sub:noite"),
             self.botao_grande("audio-volume-muted-symbolic" if saida and saida.get("mute") else "audio-speakers-symbolic",
                               "Sound", nome_bonito(saida.get("description", saida["name"]), saida["name"], False)
-                              if saida else "No output", bool(saida and not saida.get("mute")), "som", "som"),
+                              if saida else "No output", bool(saida and not saida.get("mute")), "som", "sub:som"),
             self.botao_grande("weather-clear-night-symbolic" if escuro else "weather-clear-symbolic",
                               "Dark mode", "On" if escuro else "Off", escuro,
                               lambda: self.alternar_tema(not escuro)),     # um clique troca, outro desfaz
@@ -1431,14 +1567,14 @@ class CentralRapida(Janelinha):
 
     def pular_relativo(self, segundos):
         import time
-        self.pc("position", f"{abs(segundos)}{'+' if segundos > 0 else '-'}")
+        self.pc_fundo("position", f"{abs(segundos)}{'+' if segundos > 0 else '-'}")
         if self.ref_pos:
             url, p, t, toc = self.ref_pos
             self.ref_pos = (url, max(0.0, p + (time.monotonic() - t if toc else 0) + segundos), time.monotonic(), toc)
 
     def ao_pular(self, _escala, _tipo, valor):
         import time
-        self.pc("position", f"{max(0.0, valor):.1f}")      # pula pra esse ponto (segundos)
+        self.pc_fundo("position", f"{max(0.0, valor):.1f}")      # pula pra esse ponto (segundos)
         if self.capa_atual:
             self.ref_pos = (self.capa_atual["url"], max(0.0, valor), time.monotonic(), self.capa_atual["tocando"])
         if self.tempo and self.capa_atual:
@@ -1446,7 +1582,7 @@ class CentralRapida(Janelinha):
         return False
 
     def ao_botao_player(self, botao, cmd):
-        self.pc(cmd)
+        self.pc_fundo(cmd)
         if cmd == "play-pause":                       # troca o ícone NA HORA (sem esperar o player)
             tocando = botao.get_icon_name() == "media-playback-start-symbolic"
             botao.set_icon_name("media-playback-pause-symbolic" if tocando else "media-playback-start-symbolic")
@@ -1461,7 +1597,22 @@ class CentralRapida(Janelinha):
             if not sozinho:
                 self.relogio = None
             return GLib.SOURCE_REMOVE
-        pl = self.player()
+        if not getattr(self, "perguntando_player", False):     # a pergunta anterior ainda não voltou: pula
+            import threading
+            self.perguntando_player = True
+
+            def trabalho():
+                try:
+                    pl = self.player()
+                finally:
+                    self.perguntando_player = False
+                GLib.idle_add(self.aplicar_player, pl)
+            threading.Thread(target=trabalho, daemon=True).start()
+        return GLib.SOURCE_REMOVE if sozinho else GLib.SOURCE_CONTINUE
+
+    def aplicar_player(self, pl):
+        if not self.get_visible():
+            return GLib.SOURCE_REMOVE
         chave = lambda p: p and {k: v for k, v in p.items() if k != "posicao"}   # noqa: E731
         if chave(pl) != chave(self.capa_atual):
             self.trocar_player(pl)
@@ -1469,7 +1620,7 @@ class CentralRapida(Janelinha):
             self.barra_pos.set_value(min(pl["posicao"], pl["duracao"]))
             self.tempo.set_label(self.texto_tempo(pl["posicao"], pl["duracao"]))
             self.capa_atual = pl
-        return GLib.SOURCE_REMOVE if sozinho else GLib.SOURCE_CONTINUE
+        return GLib.SOURCE_REMOVE
 
     def trocar_player(self, pl):
         """Troca SÓ o cartão do player (o de baixo, com os controles, fica como está)."""
@@ -1489,9 +1640,11 @@ class CentralRapida(Janelinha):
         comum.atualizar_painel(FILTRO_MODO="ligado" if ligar else "desligado")
         # aplica o filtro DIRETO (rápido), em vez de regerar o tema inteiro; e anota pro hypr-tema saber
         temp = comum.ler_painel().get("FILTRO_TEMP", "4500") if ligar else "0"
-        if temp == "0":
-            rodar("hyprctl", "hyprsunset", "identity")
+        if temp == "0":         # hyprsunset 0.4: desligar = "identity true" (sem valor só pergunta) + 6500 K neutro
+            rodar("hyprctl", "hyprsunset", "identity", "true")
+            rodar("hyprctl", "hyprsunset", "temperature", "6500")
         else:
+            rodar("hyprctl", "hyprsunset", "identity", "false")
             rodar("hyprctl", "hyprsunset", "temperature", temp)
         os.makedirs(os.path.expanduser("~/.cache/hypr-tema"), exist_ok=True)
         with open(os.path.expanduser("~/.cache/hypr-tema/filtro"), "w") as f:
@@ -1512,7 +1665,7 @@ class CentralRapida(Janelinha):
     def alternar_tema(self, escuro):
         """Dark mode na mão (desliga o automático). Trocar o tema precisa regerar as cores: roda em thread."""
         self.gravar_painel(TEMA_MODO="escuro" if escuro else "claro")
-        rodar(f"{self.BIN}/hypr-tema")
+        rodar(f"{self.BIN}/hypr-tema", timeout=90)
 
     def agenda(self, titulo, chave_modo, modo_manual, horarios, painel, temperatura=False):
         """Subjanelinha de agenda: liga/desliga sozinho nos horários escolhidos (mesmo que o Settings)."""
@@ -1528,7 +1681,7 @@ class CentralRapida(Janelinha):
 
         def ao_auto(sw, _p):
             self.gravar_painel(**{chave_modo: "auto" if sw.get_active() else modo_manual})
-            threading.Thread(target=lambda: rodar(f"{self.BIN}/hypr-tema"), daemon=True).start()
+            threading.Thread(target=lambda: rodar(f"{self.BIN}/hypr-tema", timeout=90), daemon=True).start()
             GLib.timeout_add(600, self.montar_seguro)
         chave.connect("notify::active", ao_auto)
         topo.append(Gtk.Label(label="Automatic", opacity=0.75))
@@ -1557,31 +1710,25 @@ class CentralRapida(Janelinha):
                     painel[ch] = novo
                     v.set_label(novo)
                     self.gravar_painel(**{ch: novo})
-                    threading.Thread(target=lambda: rodar(f"{self.BIN}/hypr-tema"), daemon=True).start()
+                    threading.Thread(target=lambda: rodar(f"{self.BIN}/hypr-tema", timeout=90), daemon=True).start()
                 b.connect("clicked", ao_passo)
                 linha.append(b)
             caixa.append(linha)
         if temperatura:
             linha = Gtk.Box(spacing=6, margin_start=6)
             linha.append(Gtk.Label(label="Warmth", xalign=0))
-            escala = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 2500, 6000, 100)
-            escala.set_hexpand(True)
-            escala.set_draw_value(False)
-            escala.set_inverted(True)            # pra direita = mais quente (temperatura menor)
-            escala.set_value(int(painel.get("FILTRO_TEMP", "4500")))
+            # pra direita = mais quente (temperatura menor): o slider vai de 2500 a 6000 e a cor é 8500 - valor
 
-            def ao_mudar(e):
-                v = str(int(e.get_value()) // 100 * 100)
+            def aplicar(valor):                  # numa thread (slider.py), só o valor mais recente
+                v = str(int(8500 - valor) // 100 * 100)
                 self.gravar_painel(FILTRO_TEMP=v)
                 if self.filtro_ligado():           # já ligado: mostra a cor nova na hora
                     rodar("hyprctl", "hyprsunset", "temperature", v)
                     with open(os.path.expanduser("~/.cache/hypr-tema/filtro"), "w") as f:
                         f.write(v + "\n")
-            escala.connect("value-changed", ao_mudar)
-            segurar = Gtk.GestureClick()
-            segurar.connect("pressed", lambda *_: setattr(self, "mexendo", True))
-            segurar.connect("released", lambda *_: setattr(self, "mexendo", False))
-            escala.add_controller(segurar)
+            from slider import SliderFluido
+            escala = SliderFluido(2500, 6000, valor=8500 - int(painel.get("FILTRO_TEMP", "4500")), aplicar=aplicar)
+            self.sliders = [s for s in getattr(self, "sliders", []) if s.get_root() is not None] + [escala]
             linha.append(escala)
             caixa.append(linha)
         return caixa
@@ -1637,22 +1784,24 @@ class Osd(Gtk.Window):
         caixa.add_css_class("pilula")
         caixa.set_size_request(300, -1)
         self.icone = Gtk.Image(pixel_size=20)
+        from esfera import EsferaLiquida
+        self.esfera = EsferaLiquida(46, texto=False)   # o volume enchendo/esvaziando (esfera.py)
         self.barra = Gtk.LevelBar(min_value=0, max_value=100, hexpand=True, valign=Gtk.Align.CENTER)
         self.por_cento = Gtk.Label(xalign=1)
         self.por_cento.add_css_class("por-cento")
-        for w in (self.icone, self.barra, self.por_cento):
+        for w in (self.esfera, self.icone, self.barra, self.por_cento):
             caixa.append(w)
         self.set_child(caixa)
         self.relogio = None
 
     def mostrar(self, tipo):
-        if tipo == "brilho":
-            try:
-                atual = int(open(f"{BACKLIGHT}/brightness").read())
-                maximo = int(open(f"{BACKLIGHT}/max_brightness").read())
-                v, icone = round(atual * 100 / maximo), "display-brightness-symbolic"
-            except (OSError, ValueError):
+        if tipo == "brilho":                 # a tela focada (notebook ou monitor externo): servicos/brilho.py
+            from servicos import brilho
+            tela = next(iter(brilho.alvos()), None)
+            v = brilho.ler(tela) if tela else None
+            if v is None:
                 return
+            icone = "display-brightness-symbolic"
         else:
             eh_saida = tipo != "mic"
             d = next((d for d in listar("sinks" if eh_saida else "sources") if d["padrao"]), None)
@@ -1666,6 +1815,8 @@ class Osd(Gtk.Window):
             if mudo:
                 v = 0
         self.icone.set_from_icon_name(icone)
+        self.esfera.set_mudo(tipo != "brilho" and v == 0)
+        self.esfera.set_nivel(min(v, 100) / 100)
         self.barra.set_value(min(v, 100))
         self.por_cento.set_label(f"{v}%")
         self.present()
@@ -1739,5 +1890,32 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         return 0
 
 
+def registrar_erros():
+    """Diário de erros (~/.cache/aero-shell/som.log): erro em qualquer clique fica anotado com hora, e
+    `kill -USR1 <pid>` grava onde cada thread está (o vigia do lançador `som` faz isso antes de reiniciar
+    uma central travada). Antes, o daemon jogava tudo em /dev/null e um travamento não deixava pista."""
+    import faulthandler
+    import signal
+    import time
+    import traceback
+    caminho = os.path.expanduser("~/.cache/aero-shell/som.log")
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    if os.path.exists(caminho) and os.path.getsize(caminho) > 512 * 1024:
+        os.replace(caminho, caminho + ".1")
+    diario = open(caminho, "a", buffering=1)
+    diario.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} som.py iniciou (pid {os.getpid()})\n")
+    faulthandler.enable(file=diario)
+    faulthandler.register(signal.SIGUSR1, file=diario, all_threads=True)
+
+    def anotar(tipo, valor, tb):
+        diario.write(f"--- {time.strftime('%H:%M:%S')} erro:\n" + "".join(traceback.format_exception(tipo, valor, tb)))
+    sys.excepthook = anotar
+    threading_excepthook = lambda a: anotar(a.exc_type, a.exc_value, a.exc_traceback)  # noqa: E731
+    import threading
+    threading.excepthook = threading_excepthook
+
+
 if __name__ == "__main__":
+    if "--daemon" in sys.argv:
+        registrar_erros()
     sys.exit(App().run(sys.argv))

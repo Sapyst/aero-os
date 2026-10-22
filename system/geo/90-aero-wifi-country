@@ -1,0 +1,6 @@
+#!/bin/sh
+# NetworkManager dispatcher hook: runs when a connection goes up, then exits (nothing stays running).
+# Only Wi-Fi interfaces; aero-wifi-country decides the radio country and is gone.
+[ "$2" = "up" ] || exit 0
+[ -d "/sys/class/net/$1/wireless" ] || exit 0
+exec /usr/local/lib/aero-geo/aero-wifi-country run --iface "$1" --connection "${CONNECTION_UUID:-}"

@@ -1,0 +1,365 @@
+#!/usr/bin/env -S python3 -I
+"""
+aero-wifi-country — picks the country for the Wi-Fi radio rules (wireless-regdb) and then exits.
+
+It is not a service. NetworkManager's dispatcher starts it when a Wi-Fi connection comes UP; it decides,
+applies, writes a small state file and is gone (no loop, no memory used afterwards). A network it has
+seen before costs one file read.
+
+Where the country comes from, most trusted first:
+  1. the routers around: most of them announce their country in the beacon (802.11d). Read from the
+     scan the card already has (iw scan dump: no new scan, nothing sent). Majority vote; the network
+     you are connected to counts triple. Network names and addresses are never stored.
+  2. the time zone (/etc/localtime -> zone.tab).
+  3. the public IP, ONLY if turned on (ip_lookup=1): asks one web service for the country code.
+     Off by default because it sends your IP to that service.
+Manual mode (country=XX) skips all of that.
+
+If the routers say a country that the time zone does not belong to (you travelled), it only SUGGESTS
+a new time zone with a notification; it never changes the clock by itself.
+
+  aero-wifi-country run [--iface IF] [--connection UUID]   what the dispatcher calls
+  aero-wifi-country check [--iface IF]                     shows what it would decide (changes nothing)
+  aero-wifi-country set mode auto|manual
+  aero-wifi-country set country XX
+  aero-wifi-country set ip_lookup 0|1
+  aero-wifi-country status
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONF = "/etc/aero/wifi-country.conf"
+ESTADO = "/var/lib/aero-geo/state.json"
+MODPROBE = "/etc/modprobe.d/aero-wifi-country.conf"
+ZONE_TAB = "/usr/share/zoneinfo/zone.tab"
+ISO_TAB = "/usr/share/zoneinfo/iso3166.tab"
+IW = "/usr/bin/iw"
+CURL = "/usr/bin/curl"
+SERVICO_IP = "https://ipinfo.io/country"       # answers "US\n"; used only with ip_lookup=1
+PADRAO = {"mode": "auto", "country": "", "ip_lookup": "0"}
+PAIS_RE = re.compile(r"^[A-Z]{2}$")
+INVALIDOS = {"00", "99", "XX", "ZZ"}
+MAX_CONHECIDAS = 300
+
+
+# ---------- small files ----------
+
+def ler_conf(caminho=CONF):
+    conf = dict(PADRAO)
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                chave, igual, valor = linha.strip().partition("=")
+                if igual and chave in PADRAO:
+                    conf[chave] = valor.strip()
+    except OSError:
+        pass
+    if conf["mode"] not in ("auto", "manual"):
+        conf["mode"] = "auto"
+    if not PAIS_RE.match(conf["country"]) or conf["country"] in INVALIDOS:
+        conf["country"] = ""
+    if conf["ip_lookup"] not in ("0", "1"):
+        conf["ip_lookup"] = "0"
+    return conf
+
+
+def gravar_texto(caminho, texto, modo=0o644):
+    os.makedirs(os.path.dirname(caminho), mode=0o755, exist_ok=True)
+    tmp = caminho + ".tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, modo)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(texto)
+    os.replace(tmp, caminho)
+
+
+def gravar_conf(conf, caminho=CONF):
+    gravar_texto(caminho, "# Wi-Fi country (aero-wifi-country). Changed from Settings -> Network.\n" +
+                 "".join(f"{k}={conf[k]}\n" for k in PADRAO))
+
+
+def ler_estado(caminho=ESTADO):
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            e = json.load(f)
+        return e if isinstance(e, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def gravar_estado(estado, caminho=ESTADO):
+    gravar_texto(caminho, json.dumps(estado, indent=1, sort_keys=True) + "\n")
+
+
+# ---------- sources ----------
+
+def votos_da_varredura(texto):
+    """iw scan dump -> {country: votes}. The connected router counts 3. Only the country is kept."""
+    votos = {}
+    for bloco in re.split(r"(?m)^BSS ", texto)[1:]:
+        m = re.search(r"(?m)^\s*Country:\s*([A-Z]{2})\b", bloco)
+        if not m or m.group(1) in INVALIDOS:
+            continue
+        peso = 3 if "-- associated" in bloco.split("\n", 1)[0] else 1
+        votos[m.group(1)] = votos.get(m.group(1), 0) + peso
+    return votos
+
+
+def interfaces_wifi():
+    try:
+        return sorted(n for n in os.listdir("/sys/class/net") if os.path.isdir(f"/sys/class/net/{n}/wireless"))
+    except OSError:
+        return []
+
+
+def ler_varredura(iface):
+    if not os.access(IW, os.X_OK) or not re.match(r"^[A-Za-z0-9_.-]{1,15}$", iface or ""):
+        return ""
+    try:
+        r = subprocess.run([IW, "dev", iface, "scan", "dump"], capture_output=True, text=True, timeout=10)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def fuso_atual():
+    try:
+        alvo = os.readlink("/etc/localtime")
+    except OSError:
+        return ""
+    return alvo.split("zoneinfo/", 1)[1] if "zoneinfo/" in alvo else ""
+
+
+def tabela_fusos(caminho=ZONE_TAB):
+    """zone.tab -> ({zone: country}, {country: [zones]})"""
+    de_fuso, de_pais = {}, {}
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                if linha.startswith("#"):
+                    continue
+                partes = linha.rstrip("\n").split("\t")
+                if len(partes) >= 3 and PAIS_RE.match(partes[0]):
+                    de_fuso[partes[2]] = partes[0]
+                    de_pais.setdefault(partes[0], []).append(partes[2])
+    except OSError:
+        pass
+    return de_fuso, de_pais
+
+
+def nomes_paises(caminho=ISO_TAB):
+    nomes = {}
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                partes = linha.rstrip("\n").split("\t")
+                if len(partes) == 2 and PAIS_RE.match(partes[0]):
+                    nomes[partes[0]] = partes[1]
+    except OSError:
+        pass
+    return nomes
+
+
+def pais_pelo_ip():
+    try:
+        r = subprocess.run([CURL, "-fsS", "--max-time", "5", "--proto", "=https", SERVICO_IP],
+                           capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    pais = r.stdout.strip().upper()
+    return pais if r.returncode == 0 and PAIS_RE.match(pais) and pais not in INVALIDOS else ""
+
+
+def decidir(conf, votos, fuso, de_fuso, ip=None):
+    """-> (country, source, detail) or ("", "none", why). ip=None means: don't ask."""
+    if conf["mode"] == "manual" and conf["country"]:
+        return conf["country"], "manual", "set by you"
+    total = sum(votos.values())
+    if total >= 2:
+        pais, n = max(votos.items(), key=lambda kv: (kv[1], kv[0]))
+        if n * 2 > total:                                    # a real majority
+            return pais, "routers", f"{n} of {total} votes from nearby networks"
+    if fuso in de_fuso:
+        return de_fuso[fuso], "timezone", fuso
+    if ip:
+        return ip, "ip", "internet location"
+    return "", "none", "no nearby network announced a country and the time zone has none"
+
+
+# ---------- applying ----------
+
+def regdom_atual():
+    try:
+        r = subprocess.run([IW, "reg", "get"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    m = re.search(r"(?ms)^global\s*\ncountry ([A-Z0-9]{2}):", r.stdout)
+    return m.group(1) if m else ""
+
+
+def aplicar(pais):
+    """Sets the country now (iw reg set) and for the next boot (cfg80211 option). Returns True if changed.
+    The channel in use stays allowed (it is the routers' own country), so the connection does not drop."""
+    mudou = False
+    if regdom_atual() != pais:
+        subprocess.run([IW, "reg", "set", pais], capture_output=True, timeout=5)
+        mudou = True
+    linha = f"# Written by aero-wifi-country: the last Wi-Fi country, so 6 GHz works right after boot.\n" \
+            f"options cfg80211 ieee80211_regdom={pais}\n"
+    try:
+        with open(MODPROBE, encoding="utf-8") as f:
+            atual = f.read()
+    except OSError:
+        atual = ""
+    if atual != linha:
+        gravar_texto(MODPROBE, linha)
+        mudou = True
+    return mudou
+
+
+def registrar_x9(proposito, detalhe):
+    """One line in X9 (if installed): this runs as root without sudo, so X9 would not see it otherwise."""
+    if not os.path.isfile("/usr/local/lib/x9/x9core.py"):
+        return
+    try:
+        sys.path.insert(0, "/usr/local/lib/x9")
+        import grp
+        import x9core as x
+        agora = time.time()
+        ev = {"id": hashlib.sha256(f"aero-wifi-country {agora} {os.getpid()}".encode()).hexdigest()[:16],
+              "ts": round(agora, 3), "tool": "aero", "user": "root", "as": "root", "result": "allowed",
+              "reason": "", "command": detalhe[:500], "cwd": "", "tty": "none", "terminal": False,
+              "app": "Network (automatic)", "category": "Network", "purpose": proposito, "risk": "low"}
+        try:
+            gid = grp.getgrnam("wheel").gr_gid
+        except KeyError:
+            gid = None
+        with x.Trava():
+            x.acrescentar([ev], gid=gid)
+    except Exception:  # noqa: BLE001 — the log is a bonus, never a reason to fail
+        pass
+
+
+def avisar_fuso(pais, fuso, de_pais, nomes):
+    """Routers say another country than the clock's time zone: suggest (never change) the time zone."""
+    zonas = de_pais.get(pais, [])
+    if not zonas or fuso in zonas:
+        return False
+    try:
+        r = subprocess.run(["loginctl", "list-sessions", "--no-legend", "-o", "json"], capture_output=True,
+                           text=True, timeout=5)
+        sessoes = json.loads(r.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    for s in sessoes:
+        uid, usuario = s.get("uid"), s.get("user")
+        if not isinstance(uid, int) or uid < 1000 or not usuario or not s.get("seat"):
+            continue
+        barramento = f"/run/user/{uid}/bus"
+        if not os.path.exists(barramento):
+            continue
+        sugestao = zonas[0] if len(zonas) == 1 else f"one of {len(zonas)} zones"
+        texto = (f"Nearby Wi-Fi networks say {nomes.get(pais, pais)}, but the clock uses {fuso or 'no time zone'}. "
+                 f"Change it in Settings if you travelled ({sugestao}).")
+        subprocess.run(["runuser", "-u", usuario, "--", "env", f"DBUS_SESSION_BUS_ADDRESS=unix:path={barramento}",
+                        "notify-send", "-a", "Aero", "-i", "preferences-system-time", "Time zone?", texto],
+                       capture_output=True, timeout=10)
+        return True
+    return False
+
+
+# ---------- commands ----------
+
+def executar(iface=None, conexao="", so_ver=False):
+    conf = ler_conf()
+    estado = ler_estado()
+    conhecidas = estado.get("known") if isinstance(estado.get("known"), dict) else {}
+    chave = hashlib.sha256(conexao.encode()).hexdigest()[:16] if conexao else ""
+    # fast path: a network already decided, same mode, and the radio still on that country
+    if not so_ver and chave and conf["mode"] == "auto" and chave in conhecidas \
+            and conhecidas[chave] == estado.get("country") and regdom_atual() == estado.get("country"):
+        return 0
+    texto = "".join(ler_varredura(i) for i in ([iface] if iface else interfaces_wifi()))
+    votos = votos_da_varredura(texto)
+    de_fuso, de_pais = tabela_fusos()
+    fuso = fuso_atual()
+    ip = pais_pelo_ip() if conf["ip_lookup"] == "1" and conf["mode"] == "auto" and \
+        not (sum(votos.values()) >= 2) and fuso not in de_fuso else None
+    pais, fonte, detalhe = decidir(conf, votos, fuso, de_fuso, ip)
+    if so_ver:
+        print(json.dumps({"country": pais, "source": fonte, "detail": detalhe, "votes": votos, "timezone": fuso,
+                          "radio_now": regdom_atual(), "mode": conf["mode"]}, indent=1))
+        return 0
+    if not pais:
+        return 0
+    mudou = aplicar(pais)
+    if chave:
+        conhecidas[chave] = pais
+        while len(conhecidas) > MAX_CONHECIDAS:
+            conhecidas.pop(next(iter(conhecidas)))
+    sugerido = estado.get("tz_suggested")
+    if fonte in ("routers", "ip") and sugerido != f"{pais}|{fuso}":
+        if avisar_fuso(pais, fuso, de_pais, nomes_paises()):
+            sugerido = f"{pais}|{fuso}"
+    gravar_estado({"country": pais, "source": fonte, "detail": detalhe, "when": int(time.time()),
+                   "known": conhecidas, "tz_suggested": sugerido})
+    if mudou:
+        registrar_x9(f"Set Wi-Fi country to {pais}", f"aero-wifi-country: {fonte} ({detalhe})")
+    return 0
+
+
+def principal(args):
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if os.geteuid() != 0 and args[0] not in ("status",):
+        sys.exit("aero-wifi-country: must run as root")
+    acao, resto = args[0], args[1:]
+    opcoes = {}
+    while resto and resto[0].startswith("--") and len(resto) >= 2:
+        opcoes[resto[0][2:]] = resto[1]
+        resto = resto[2:]
+    iface = opcoes.get("iface") or None
+    if iface and not re.match(r"^[A-Za-z0-9_.-]{1,15}$", iface):
+        sys.exit("aero-wifi-country: bad interface name")
+    if acao == "run":
+        conexao = opcoes.get("connection", "")
+        if not re.match(r"^[0-9a-fA-F-]{0,64}$", conexao):
+            sys.exit("aero-wifi-country: bad connection id")
+        return executar(iface, conexao)
+    if acao == "check":
+        return executar(iface, so_ver=True)
+    if acao == "status":
+        print(json.dumps({k: v for k, v in ler_estado().items() if k != "known"} | {"config": ler_conf()}, indent=1))
+        return 0
+    if acao == "set" and len(resto) == 2:
+        chave, valor = resto
+        conf = ler_conf()
+        if chave == "mode" and valor in ("auto", "manual"):
+            conf["mode"] = valor
+        elif chave == "country" and PAIS_RE.match(valor) and valor not in INVALIDOS:
+            conf["country"], conf["mode"] = valor, "manual"
+        elif chave == "ip_lookup" and valor in ("0", "1"):
+            conf["ip_lookup"] = valor
+        else:
+            sys.exit(2)
+        if conf["mode"] == "manual" and not conf["country"]:
+            sys.exit("aero-wifi-country: pick a country first")
+        gravar_conf(conf)
+        estado = ler_estado()
+        estado["known"] = {}                                  # rules changed: decide again everywhere
+        gravar_estado(estado)
+        return executar()
+    sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    sys.exit(principal(sys.argv[1:]))
