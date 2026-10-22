@@ -111,7 +111,8 @@ def suave(a, b, x):
 def faixa_da_barra(w):
     """The top bar's rectangle on screen (AeroBar's settings, else the Waybar defaults it shares)."""
     import json
-    g = {"height": 34, "margin_top": 8, "margin_sides": 12}
+    aerobar = os.path.exists(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aerobar.pid"))
+    g = {"height": 34, "margin_top": 0, "margin_sides": 0} if aerobar else {"height": 34, "margin_top": 8, "margin_sides": 12}
     try:
         with open(os.path.expanduser("~/.config/aero/aerobar.json"), encoding="utf-8") as f:
             d = json.load(f)

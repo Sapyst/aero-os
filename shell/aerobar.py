@@ -16,7 +16,7 @@ Data comes from the system directly (no polling loop for what can be followed):
   minimized, UltraSu           their own scripts (every 2 s / 15 s), like before
   notifications                Hermes (com.aero.Hermes) every 2 s
 
-The layer is called "waybar" on purpose: the tray, the quick center and Hermes already line up with it.
+Its layer is "aerobar"; the tray (bandeja.py) and Hermes read ~/.config/aero/aerobar.json to line up with it.
 """
 import json
 import math
@@ -45,17 +45,18 @@ VISTO = os.path.join(H, ".cache/aero-shell/sino-visto")      # last notification
 CONFIG = os.path.join(H, ".config/aero/aerobar.json")
 # Everything the person can change (Settings -> AeroBar, or the JSON by hand). Bad values fall back.
 PADRAO = {
-    "background": "solid",      # solid | glass (more see-through) | none (only the icons float)
+    "background": "none",       # none (invisible: only the icons float) | glass (see-through) | solid
     "opacity": 0.9,             # of the background, when there is one
-    "outline": True,            # the thin line around the bar
-    "radius": 14,
-    "height": 34, "margin_top": 8, "margin_sides": 12,
+    "outline": False,           # the thin line around the bar
+    "radius": 14,               # curve of the corners (also the shape of the hover highlight area)
+    "height": 34, "margin_top": 0, "margin_sides": 0,       # 0 = glued to the top of the screen
     "date": True,               # the date next to the clock
     "icon_size": 15, "clock_size": 17, "number_size": 15,
     "hover": True,              # the soft highlight under the pointer
     "hide": [],                 # modules to hide: workspaces min clock lang vol wifi bt bat ultrasu bell gear central
-    "colors": {"text": "#ecebe8", "dim": "#8c8b88", "alert": "#e8312a", "plugged": "#5aa9ff",
-               "saver": "#f2c84b", "background": "#0b0b0c"},
+    "colors": {"text": "#ecebe8", "dim": "#8c8b88", "alert": "#ff3b30", "plugged": "#4cc2ff",
+               "saver": "#ffd23f", "good": "#3dff9a", "background": "#0b0b0c"},
+    "glow": True,               # coloured dots light up with a soft halo
 }
 OCULTAVEIS = {"workspaces", "min", "clock", "lang", "vol", "wifi", "bt", "bat", "ultrasu", "bell", "gear", "central"}
 
@@ -83,7 +84,7 @@ def ler_config():
                       ("icon_size", 10, 28), ("clock_size", 10, 32), ("number_size", 10, 28)):
         if isinstance(bruto.get(k), int) and not isinstance(bruto.get(k), bool):
             c[k] = min(hi, max(lo, bruto[k]))
-    for k in ("outline", "date", "hover"):
+    for k in ("outline", "date", "hover", "glow"):
         if isinstance(bruto.get(k), bool):
             c[k] = bruto[k]
     if isinstance(bruto.get("hide"), list):
@@ -107,7 +108,7 @@ BLUE = _hex(CFG["colors"]["plugged"], PADRAO["colors"]["plugged"])
 YELLOW = _hex(CFG["colors"]["saver"], PADRAO["colors"]["saver"])
 FUNDO = _hex(CFG["colors"]["background"], PADRAO["colors"]["background"])
 ICONE = CFG["icon_size"]
-GREEN = (0.30, 0.82, 0.52)
+GREEN = _hex(CFG["colors"]["good"], PADRAO["colors"]["good"])
 F_RELOGIO = f"Doto Black {CFG['clock_size']}"
 F_NUMERO = f"Doto Black {CFG['number_size']}"
 
@@ -173,9 +174,27 @@ def lancar(cmd):
 
 # ---------- drawing helpers ----------
 
+def halo(cr, x, y, raio, cor, forca=0.55):
+    """A soft glow behind a coloured dot (so colours shine on the black bar)."""
+    import cairo
+    g = cairo.RadialGradient(x, y, 0, x, y, raio)
+    g.add_color_stop_rgba(0, *cor, forca)
+    g.add_color_stop_rgba(0.45, *cor, forca * 0.35)
+    g.add_color_stop_rgba(1, *cor, 0)
+    cr.set_source(g)
+    cr.arc(x, y, raio, 0, 2 * math.pi)
+    cr.fill()
+
+
+def colorida(cor):
+    return CFG["glow"] and cor not in (FG, DIM)
+
+
 def icone(cr, nome_ou_linhas, x, y, tamanho, cor, alfa=1.0):
     linhas = ICONES[nome_ou_linhas] if isinstance(nome_ou_linhas, str) else nome_ou_linhas
     p = tamanho / 7
+    if colorida(cor) and alfa > 0.5:                      # one halo behind the whole icon, then the dots
+        halo(cr, x + tamanho / 2, y + tamanho / 2, tamanho * 0.95, cor, 0.32 * alfa)
     for j, linha in enumerate(linhas):
         for i, ch in enumerate(linha[:7]):
             a = 1.0 if ch == "#" else 0.45 if ch == "+" else 0.1
@@ -330,6 +349,8 @@ class Sino(IconeSimples):
     def desenhar(self, cr, x):
         super().desenhar(cr, x)
         if self.barra.nao_lidas and not self.barra.dnd:
+            if CFG["glow"]:
+                halo(cr, x + 8 + ICONE, ALTURA / 2 - ICONE / 2 + 0.5, 8, RED, 0.6)
             cr.set_source_rgba(*RED, 1)
             cr.arc(x + 8 + ICONE, ALTURA / 2 - ICONE / 2 + 0.5, 3, 0, 2 * math.pi)
             cr.fill()
@@ -353,6 +374,8 @@ class Bateria(Modulo):
         b = self.barra
         cor = self.cor()
         W, Hh = 26, 15
+        if colorida(cor):
+            halo(cr, x + 8 + W / 2, ALTURA / 2, W * 0.75, cor, 0.3)
         p = W / (self.COLS + 1.2)
         oy = ALTURA / 2 - Hh / 2 + (Hh - (self.ROWS - 1) * p) / 2
         ox = x + 8
@@ -372,8 +395,11 @@ class Bateria(Modulo):
             cr.set_source_rgba(*cor, 0.95)
             cr.arc(ox + p * (self.COLS + 0.6), oy + j * p, p * 0.34, 0, 2 * math.pi)
             cr.fill()
-        texto(cr, None, str(b.bat_nivel), x + 8 + W + 6, ALTURA / 2, F_NUMERO,
-              BLUE if b.na_tomada else cor)
+        cor_num = BLUE if b.na_tomada else cor
+        if colorida(cor_num):
+            tw = texto(cr, None, str(b.bat_nivel), 0, 0, F_NUMERO, cor_num, medir=True)
+            halo(cr, x + 8 + W + 6 + tw / 2, ALTURA / 2, max(tw, 14) * 0.9, cor_num, 0.3)
+        texto(cr, None, str(b.bat_nivel), x + 8 + W + 6, ALTURA / 2, F_NUMERO, cor_num)
 
 
 class EspacoBandeja(Modulo):
@@ -385,9 +411,14 @@ class Barra(Gtk.Window):
     def __init__(self, app):
         super().__init__(application=app, decorated=False)
         self.add_css_class("aerobar")
+        prov = Gtk.CssProvider()            # the window itself paints nothing: the bar draws its own background
+        prov.load_from_string("window.aerobar, .aerobar { background: none; background-color: transparent; "
+                              "box-shadow: none; border: none; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.TOP)
-        Camada.set_namespace(self, "waybar")
+        Camada.set_namespace(self, "aerobar")
         for borda in (Camada.Edge.TOP, Camada.Edge.LEFT, Camada.Edge.RIGHT):
             Camada.set_anchor(self, borda, True)
         Camada.set_margin(self, Camada.Edge.TOP, TOPO)
@@ -920,6 +951,8 @@ class Gota(Gtk.Window):
                 yy, a = y - queda * 0.6 * k, 1 - k
             if a <= 0.01:
                 continue
+            if colorida(self.cor):
+                halo(cr, x, yy, self.PASSO * 1.6, self.cor, 0.22 * a)
             cr.set_source_rgba(*self.cor, a)
             cr.arc(x, yy, self.PASSO * 0.38, 0, 2 * math.pi)
             cr.fill()

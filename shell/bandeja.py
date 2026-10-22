@@ -36,8 +36,44 @@ import apps  # noqa: E402
 
 LARGURA_ICONE = 30                     # tem que bater com o CSS da waybar (#custom-espaco-bandeja.nX)
 TAMANHO_ICONE = 18
-# Distância da borda direita: 12 (margem da waybar) + 40 (botão da central, #custom-central no style.css)
-MARGEM_DIREITA = 12 + 40
+# Posição lida da PRÓPRIA config da waybar (vale para qualquer visual: AeroTerm, AerOS...):
+# distância da borda direita = margin-right da barra + 40 (botão da central, #custom-central no style.css);
+# do topo = margin-top + metade da sobra entre a altura da barra e os 34 px dos ícones.
+def aerobar_ativa():
+    try:
+        pid = int(open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aerobar.pid")).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def geometria_da_barra():
+    """(top margin, right margin) for the tray, from the bar in use: AeroBar (DotStyle) or Waybar."""
+    import re
+    if aerobar_ativa():
+        g = {"height": 34, "margin_top": 0, "margin_sides": 0, "icon_size": 15}
+        try:
+            import json
+            d = json.load(open(os.path.expanduser("~/.config/aero/aerobar.json")))
+            for k in g:
+                if isinstance(d.get(k), int) and not isinstance(d.get(k), bool):
+                    g[k] = d[k]
+        except (OSError, ValueError, AttributeError):
+            pass
+        # AeroBar: 6 px inner edge + the quick-center icon (8 + icon + 8) are right of the tray
+        return g["margin_top"] + (g["height"] - 34) // 2, g["margin_sides"] + 6 + 8 + g["icon_size"] + 8
+    try:
+        txt = open(os.path.expanduser("~/.config/waybar/config.jsonc")).read()
+    except OSError:
+        txt = ""
+    def num(chave, padrao):
+        m = re.search(rf'"{chave}"\s*:\s*(\d+)', txt)
+        return int(m.group(1)) if m else padrao
+    return num("margin-top", 8) + (num("height", 34) - 34) // 2, num("margin-right", 12) + 40
+
+
+MARGEM_TOPO, MARGEM_DIREITA = geometria_da_barra()
 ESTADO = os.path.expanduser("~/.cache/aero-shell/bandeja.json")   # lido pela waybar
 SINAL_WAYBAR = 9                       # pkill -RTMIN+9 waybar = "releia o módulo do espaço"
 
@@ -145,7 +181,7 @@ class Bandeja(Gtk.ApplicationWindow):
         Camada.set_namespace(self, "bandeja")
         Camada.set_anchor(self, Camada.Edge.TOP, True)
         Camada.set_anchor(self, Camada.Edge.RIGHT, True)
-        Camada.set_margin(self, Camada.Edge.TOP, 8)       # mesma margem da waybar (config.jsonc)
+        Camada.set_margin(self, Camada.Edge.TOP, MARGEM_TOPO)   # alinhada à waybar (config.jsonc)
         Camada.set_margin(self, Camada.Edge.RIGHT, MARGEM_DIREITA)
         Camada.set_exclusive_zone(self, -1)               # fica POR CIMA da barra, sem empurrar nada
         # Acompanha o tema claro/escuro (o hypr-tema muda esta configuração pelo horário)
@@ -179,12 +215,18 @@ class Bandeja(Gtk.ApplicationWindow):
             except OSError:
                 return
             for linha in s.makefile("r", encoding="utf-8", errors="replace"):
-                if linha.strip() == "openlayer>>waybar":
+                if linha.strip() in ("openlayer>>waybar", "openlayer>>aerobar"):
                     GLib.timeout_add(300, self.reerguer)    # espera a barra terminar de aparecer
 
         threading.Thread(target=ouvir, daemon=True).start()
 
     def reerguer(self):
+        """A barra reabriu: volta pra frente E relê onde ela está. Trocar o visual (AerOS = barra colada
+        no topo, AeroTerm = barra flutuante com margens) muda a posição; antes a bandeja só lia isso ao
+        iniciar e ficava pra trás, desalinhada (ícones "bugados" depois de trocar de tema)."""
+        topo, direita = geometria_da_barra()
+        Camada.set_margin(self, Camada.Edge.TOP, topo)
+        Camada.set_margin(self, Camada.Edge.RIGHT, direita)
         self.set_visible(False)
         GLib.timeout_add(60, lambda: (self.present(), False)[1])
         return False

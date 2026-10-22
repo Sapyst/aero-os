@@ -43,7 +43,8 @@ class Intro(Gtk.Application):
         GLib.timeout_add(150, self.esperar)
 
     def esperar(self):
-        pronto = subprocess.run(["pgrep", "-x", "waybar"], capture_output=True).returncode == 0
+        pronto = subprocess.run(["pgrep", "-x", "waybar"], capture_output=True).returncode == 0 or \
+            subprocess.run(["pgrep", "-f", "aero-shell/aerobar.py"], capture_output=True).returncode == 0
         passou = GLib.get_monotonic_time() / 1e6 - self.inicio
         if (pronto and passou > 0.6) or passou > ESPERA_MAX:
             self.venus.leave(1.0, self.quit)

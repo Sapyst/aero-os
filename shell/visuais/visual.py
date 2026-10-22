@@ -233,7 +233,7 @@ def recarregar_shell():
     rodar("hyprctl", "dispatch", "exec", os.path.join(BIN, "aero-barra"))
     for _ in range(30):                                   # espera a barra existir (a bandeja se mede por ela)
         camadas = subprocess.run(["hyprctl", "layers"], capture_output=True, text=True).stdout
-        if "namespace: waybar" in camadas:
+        if "namespace: waybar" in camadas or "namespace: aerobar" in camadas:
             break
         time.sleep(0.1)
     reabrir = {"bandeja": "~/.local/bin/bandeja", "supermenu": "~/.local/bin/supermenu --daemon",
