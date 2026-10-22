@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# aero-snap — takes a snapshot before and after a root command, so it can be undone.
+#   sudo aero-snap "X9 install" bash system/x9/install.sh --apply
+#   sudo aero-snap list                  -> the snapshots
+#   sudo aero-snap undo PRE POST         -> puts back the files a pair changed (snapper undochange)
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "aero-snap: run with sudo" >&2; exit 1; }
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+  list) exec snapper -c root list ;;
+  undo) [ $# -eq 3 ] && [[ $2 =~ ^[0-9]+$ && $3 =~ ^[0-9]+$ ]] || { echo "usage: aero-snap undo PRE POST" >&2; exit 2; }
+        snapper -c root status "$2..$3" | head -40
+        read -r -p "Undo these changes? [y/N] " r; [[ $r == [yY]* ]] || exit 1
+        exec snapper -c root undochange "$2..$3" ;;
+esac
+desc="$1"; shift
+[ $# -gt 0 ] || { echo "aero-snap: missing command" >&2; exit 2; }
+pre=$(snapper -c root create -t pre -p -c number -d "Aero: $desc")
+echo "aero-snap: snapshot $pre taken before: $desc"
+set +e; "$@"; codigo=$?; set -e
+post=$(snapper -c root create -t post --pre-number "$pre" -p -c number -d "Aero: $desc (exit $codigo)")
+echo "aero-snap: snapshot $post taken after. To undo: sudo aero-snap undo $pre $post"
+exit $codigo
