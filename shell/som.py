@@ -513,6 +513,15 @@ def notif_dispensar():
         notif_dispensar()
 
 
+
+def carregar_dicas_dotstyle():
+    """DotStyle tooltips (dotstyle-dicas.css), only when the visual is DotStyle."""
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotstyle-dicas.css")
+    if visual_atual() == "DotStyle" and os.path.exists(caminho):
+        prov = Gtk.CssProvider()
+        prov.load_from_path(caminho)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
+
 class CentralNotificacoes(Janelinha):
     """O sininho da barra (doc 25): últimas notificações (histórico do mako), "Não perturbe" e
     "Clear all". O mako não tem comando pra apagar o histórico, então "Clear all" anota o número da
@@ -2049,6 +2058,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         provedor.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+        carregar_dicas_dotstyle()
         pontos = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotstyle-janelinhas.css")
         if os.path.exists(pontos):                       # DotStyle (só age em janelas com a classe "dots")
             prov_dots = Gtk.CssProvider()

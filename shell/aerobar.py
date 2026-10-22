@@ -496,8 +496,7 @@ class Barra(Gtk.Window):
         self.area = Gtk.DrawingArea(content_height=ALTURA + VAZAO, hexpand=True)
         self.area.connect("resize", lambda _a, w, _h: self._entrada(w))
         self.area.set_draw_func(self.desenhar)
-        self.area.set_has_tooltip(True)
-        self.area.connect("query-tooltip", self.dica)
+        # no GTK tooltips: every icon explains itself with the dot drop (Gota) after a short hover
         self.set_child(self.area)
 
         # state
@@ -733,13 +732,40 @@ class Barra(Gtk.Window):
         if m is not self.sobre:
             self.sobre = m
             self.area.queue_draw()
+            if getattr(self, "_dica_id", None):
+                GLib.source_remove(self._dica_id)
+                self._dica_id = None
             if m is not None and m.nome == "ultrasu":
                 mins = minutos_ultrasu(self.ultrasu)
                 texto_ = f"{mins // 60}H {mins % 60:02d}M" if mins is not None else "CLOSED"
                 cor = cor_ultrasu(mins) or DIM
                 self.gota.mostrar(texto_, cor, m.x + m.w / 2)
+            elif m is not None and m.nome not in ("workspaces", "tray", "clock"):
+                self.gota.esconder()
+                self._dica_id = GLib.timeout_add(420, lambda mm=m: self._mostrar_dica(mm))   # a short, still hover
             else:
                 self.gota.esconder()
+
+    def _mostrar_dica(self, m):
+        self._dica_id = None
+        if m is not self.sobre:
+            return False
+        texto_ = self.texto_dica(m)
+        if texto_:
+            self.gota.mostrar(texto_[:30], ESCURA["FG"], m.x + m.w / 2)
+        return False
+
+    def texto_dica(self, m):
+        textos = {"vol": f"VOLUME {self.volume}%" + (" MUTED" if self.mudo else ""),
+                  "wifi": self.wifi_nome or "OFFLINE",
+                  "bt": (f"BLUETOOTH {self.bt_conectados} ON" if self.bt_conectados else
+                         "BLUETOOTH ON" if self.bt_ligado else "BLUETOOTH OFF"),
+                  "bat": f"{self.bat_nivel}%" + (" CHARGING" if self.carregando else " PLUGGED" if self.na_tomada else "")
+                         + (" SAVER" if self.perfil == "power-saver" else ""),
+                  "lang": f"KEYBOARD {self.idioma}", "min": f"{self.minimizados} MINIMIZED",
+                  "bell": "NOTIFICATIONS" + (" (DND)" if self.dnd else ""), "gear": "SETTINGS",
+                  "central": "QUICK CENTER"}
+        return textos.get(m.nome, m.dica.upper() if m.dica else "")
 
     def ao_clicar(self, g, _n, x, _y):
         m = self.modulo_em(x)

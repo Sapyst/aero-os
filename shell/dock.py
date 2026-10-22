@@ -440,6 +440,15 @@ class Faixa(Gtk.Widget):
                 cr.fill()
 
 
+
+def carregar_dicas_dotstyle():
+    """DotStyle tooltips (dotstyle-dicas.css), only when the visual is DotStyle."""
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotstyle-dicas.css")
+    if visual_atual() == "DotStyle" and os.path.exists(caminho):
+        prov = Gtk.CssProvider()
+        prov.load_from_path(caminho)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
+
 # ---------- a janela-camada ----------
 
 class Dock(Gtk.ApplicationWindow):
@@ -1276,6 +1285,7 @@ class App(Adw.Application):    # Adw = menus acompanham o claro/escuro (doc 35)
 
     def iniciar(self):
         self.hold()
+        carregar_dicas_dotstyle()
         self.provedor = Gtk.CssProvider()
         # USER+1: vence o gtk.css do usuário, que liga o vidro em toda janela (doc 16)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.provedor,
