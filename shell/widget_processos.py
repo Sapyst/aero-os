@@ -2,7 +2,8 @@
 número de tarefas no topo; depois os processos que mais consomem CPU (ou memória), agrupados pelo nome do
 programa — e, pra interpretadores (python3, bash, node...), pelo nome do SCRIPT: assim dá pra ver quanto cada
 peça do próprio shell (dock.py, widgets.py...) gasta. Lê /proc/*/stat e statm a cada 3 s (uns 10 ms de CPU).
-CPU% é como no top: % de UM núcleo (um programa com 3 threads cheias passa de 100)."""
+CPU% é como no top: % de UM núcleo (um programa com 3 threads cheias passa de 100).
+Clicar na coluna "cpu%" ou "mem" ordena por ela (e fica gravado, igual à opção do Settings)."""
 import os
 import time
 
@@ -103,8 +104,23 @@ class Processos(Widget):
         self.redimensionar(LARGURA_ESTREITA, h)
         self.tela = self.area(LARGURA_ESTREITA, h, self.desenhar)
         self.cartao.append(self.tela)
+        self.colunas = {}                        # "cpu"/"mem" -> (x0, x1) na tela, medido no desenho
+        clique = __import__("gi").repository.Gtk.GestureClick(button=1)
+        clique.connect("released", self.ao_clicar)
+        self.tela.add_controller(clique)
         self.temporizadores.append(__import__("gi").repository.GLib.timeout_add(900, self._primeira))
         self.a_cada(3, self.tique)
+
+    def ao_clicar(self, _g, _n, x, _y):
+        """Clique numa coluna (cabeçalho ou números) = ordenar por ela."""
+        for por, (a, b) in self.colunas.items():
+            if a <= x <= b and por != self.opcoes["ordenar"]:
+                self.opcoes["ordenar"] = por
+                # grava no registro do widget (o mesmo do Settings), pra continuar assim depois de reiniciar
+                self.registro.setdefault("opcoes", {})["ordenar"] = por
+                self.app.config.gravar()
+                self.tique()
+                return
 
     def _primeira(self):
         self.tique()
@@ -128,9 +144,14 @@ class Processos(Widget):
         # cabeçalho da tabela
         y = 36 * e
         xc, xm = xr - 54 * e, xr
+        # cada coluna clicável vai da borda da anterior até o seu número (alinhado à direita)
+        self.colunas = {"cpu": (xc - 44 * e, xc + 4 * e), "mem": (xc + 4 * e, w)}
         texto(cr, area, "name", x0, y, 9.5 * e, "bold", 0.4, familia=MONO_FAM)
-        texto(cr, area, "cpu%", xc, y, 9.5 * e, "bold", 0.4, "direita", MONO_FAM)
-        texto(cr, area, "mem", xm, y, 9.5 * e, "bold", 0.4, "direita", MONO_FAM)
+        # a coluna escolhida fica acesa e com ▾; a outra, apagada (dá pra ver que é clicável)
+        texto(cr, area, "▾ cpu%" if por == "cpu" else "cpu%", xc, y, 9.5 * e, "bold",
+              0.85 if por == "cpu" else 0.4, "direita", MONO_FAM)
+        texto(cr, area, "▾ mem" if por == "mem" else "mem", xm, y, 9.5 * e, "bold",
+              0.85 if por == "mem" else 0.4, "direita", MONO_FAM)
         y += 16 * e
         maximo = max([i[1] if por == "cpu" else i[2] for i in self.linhas] or [1]) or 1
         cores = [PASTEL["rosa"], PASTEL["pessego"], PASTEL["amarelo"], PASTEL["verde"], PASTEL["azul"], PASTEL["lilas"]]
