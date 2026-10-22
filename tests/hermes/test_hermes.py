@@ -106,6 +106,8 @@ class TestLista(unittest.TestCase):
         self.assertEqual(ev[-1], ("close", i))
         self.assertNotIn(i, s.ativas)
         self.assertEqual(s.historico[-1]["summary"], "Oi")
+        j = s.notificar("App", 0, "", "x", "<b>Aero's</b> &amp; co", [], {}, -1, ":1.5")
+        self.assertEqual(s.historico_mako()[0]["body"], "Aero's & co")
 
     def test_critica_fica(self):
         s, r, _ = novo()

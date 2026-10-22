@@ -1,0 +1,5 @@
+# Aero: Hermes (inside the quick center daemon) owns org.freedesktop.Notifications.
+# This shadows mako's activation file so D-Bus never starts mako by itself. Delete it to go back to mako.
+[D-BUS Service]
+Name=org.freedesktop.Notifications
+Exec=/usr/bin/false

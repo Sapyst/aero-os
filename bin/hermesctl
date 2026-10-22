@@ -14,7 +14,7 @@ if ! busctl --user status "$DEST" >/dev/null 2>&1; then
     echo "hermesctl: no notification daemon is running" >&2; exit 1
 fi
 chamar() { busctl --user call "$DEST" "$OBJ" "$IF" "$@"; }
-modos() { chamar Modes | python3 -c 'import sys,shlex; p=shlex.split(sys.stdin.read()); print("\n".join(p[2:]))'; }
+modos() { busctl --user --json=short call "$DEST" "$OBJ" "$IF" Modes | python3 -c 'import sys,json; print("\n".join(json.load(sys.stdin)["data"][0]))'; }
 case "${1:-}" in
   mode)
     shift
@@ -33,7 +33,8 @@ case "${1:-}" in
     chamar SetModes as "${#lista[@]}" "${lista[@]}" >/dev/null
     modos ;;
   history)
-    chamar History | python3 -c 'import sys,shlex,json; s=shlex.split(sys.stdin.read())[1]; print(json.dumps(json.loads(s), indent=2, ensure_ascii=False))' ;;
+    busctl --user --json=short call "$DEST" "$OBJ" "$IF" History |
+      python3 -c 'import sys,json; print(json.dumps(json.loads(json.load(sys.stdin)["data"][0]), indent=2, ensure_ascii=False))' ;;
   dismiss) chamar DismissAll >/dev/null ;;
   reload) chamar Reload >/dev/null ;;
   *) sed -n 2,9p "$0"; exit 2 ;;

@@ -195,7 +195,8 @@ class Onda(Gtk.Window):
 # ---------- cards ----------
 
 CSS = """
-.hermes-cartoes { background: transparent; }
+window.hermes-onda, .hermes-onda { background: none; background-color: transparent; box-shadow: none; }
+window.hermes-cartoes, .hermes-cartoes { background: none; background-color: transparent; box-shadow: none; }
 .hermes-cartao {
   background: alpha(@hermes_bg, 0.94); color: @hermes_fg; border-radius: @hermes_radius;
   border: 1px solid alpha(@hermes_fg, 0.10); padding: 12px 14px;

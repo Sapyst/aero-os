@@ -269,6 +269,16 @@ def limpar_markup(texto, limite=2000):
     return "".join(saida)
 
 
+def markup_para_texto(markup):
+    """Safe markup -> plain text (the history keeps what you read, without tags or &amp;)."""
+    try:
+        from gi.repository import Pango
+        ok, _attrs, texto, _accel = Pango.parse_markup(markup, -1, "\0")
+        return texto if ok else markup
+    except Exception:  # noqa: BLE001
+        return markup
+
+
 def texto_puro(texto, limite=500):
     """Summary / app name: plain text, no control characters."""
     if not isinstance(texto, str):
@@ -311,7 +321,7 @@ class Notificacao:
 
     def resumo(self):
         """What the history and the quick center see (no image bytes)."""
-        return {"id": self.id, "app": self.app, "summary": self.titulo, "body": self.corpo,
+        return {"id": self.id, "app": self.app, "summary": self.titulo, "body": markup_para_texto(self.corpo),
                 "urgency": URGENCIAS[self.urgencia], "category": self.categoria, "icon": self.icone,
                 "desktop_entry": self.entrada, "time": round(self.criada, 3),
                 "actions": [[k, t] for k, t in self.acoes]}
