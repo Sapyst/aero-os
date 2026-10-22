@@ -43,7 +43,8 @@ faz install -m644 -o root -g root "$raiz/system/polkit/com.aero.settings.policy"
   /usr/share/polkit-1/actions/com.aero.settings.policy
 faz install -m644 -o root -g root "$aqui/x9d.service" /etc/systemd/system/x9d.service
 faz systemctl daemon-reload
-faz systemctl enable --now x9d.service
+faz systemctl enable x9d.service
+faz systemctl restart x9d.service   # picks up a new version when reinstalling
 
 # A local polkit rule that says YES to admins would skip every password prompt: warn about it
 if grep -lsE 'Result\.YES' /etc/polkit-1/rules.d/*.rules 2>/dev/null; then

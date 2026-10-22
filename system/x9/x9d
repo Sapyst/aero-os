@@ -20,6 +20,7 @@ sys.path.insert(0, "/usr/local/lib/x9")
 import x9core as x  # noqa: E402
 
 CURSOR = os.path.join(x.ESTADO, "cursor")
+IMPORTADO = os.path.join(x.ESTADO, "history-imported")   # the old journal was read once
 GRUPO = "wheel"                    # who may read the archive (the admins); the app runs as one of them
 FILTROS = ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec", "SYSLOG_IDENTIFIER=su"]
 RETENCAO_A_CADA = 3600
@@ -72,8 +73,34 @@ def ids_recentes():
 
 def abrir_journal(cursor):
     cmd = ["journalctl", "-o", "json", "-f", "-q", "--no-pager"]
-    cmd += ["--after-cursor", cursor] if cursor else ["-n", "all"]
+    cmd += ["--after-cursor", cursor] if cursor else ["-n", "0"]
     return subprocess.Popen(cmd + FILTROS, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, bufsize=0)
+
+
+def importar_historico(guardar):
+    """Reads everything the journal still has, once (journalctl -f only gives the last lines).
+    Returns the cursor of the last line read, so following starts right after it."""
+    proc = subprocess.Popen(["journalctl", "-o", "json", "-q", "--no-pager"] + FILTROS,
+                            stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    juntador = x.Juntador()
+    cursor = ""
+    n = 0
+    for linha in proc.stdout:
+        try:
+            e = json.loads(linha)
+        except ValueError:
+            continue
+        peca = x.ler_linha(e)
+        if peca:
+            prontos = juntador.receber(peca, agora=0.0)
+            n += len(prontos)
+            guardar(prontos)
+        if isinstance(e.get("__CURSOR"), str):
+            cursor = e["__CURSOR"]
+    resto = juntador.todos()
+    guardar(resto)
+    proc.wait()
+    return cursor, n + len(resto)
 
 
 def principal():
@@ -102,7 +129,15 @@ def principal():
             vistos.clear()
             vistos.update(ids_recentes())
 
-    log(f"x9d: following sudo, pkexec and su ({'from saved position' if ultimo_cursor else 'importing history'})")
+    if not os.path.exists(IMPORTADO):
+        cursor, n = importar_historico(guardar)
+        log(f"x9d: imported {n} past calls from the journal")
+        if cursor and not ultimo_cursor:
+            ultimo_cursor = salvo = cursor
+            gravar_cursor(cursor)
+        with open(IMPORTADO, "w") as f:
+            f.write("1\n")
+    log("x9d: following sudo, pkexec and su")
     while not parar:
         proc = abrir_journal(ultimo_cursor)
         resto = b""
