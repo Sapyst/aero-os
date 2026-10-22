@@ -358,6 +358,51 @@ class Janelinha(Gtk.Window):
         self.montar()
         self.mostrar((x - 40, x + 40))
 
+    HALO = 110          # room around the cards for the halftone field (px)
+
+    def _com_campo(self, ligar):
+        """Puts the content inside an Overlay with the live dot field behind it (or takes it out)."""
+        import campo
+        tem = getattr(self, "raiz", None) is not None and self.get_child() is self.raiz
+        if ligar and not tem:
+            if getattr(self, "raiz", None) is None:
+                self.campo = campo.CampoDots(self._formas_dos_cartoes)
+                self.raiz = Gtk.Overlay()
+                self.raiz.set_child(self.campo)
+                self.suporte = Gtk.Box()
+                self.raiz.add_overlay(self.suporte)
+                self.raiz.set_measure_overlay(self.suporte, True)
+                mov = Gtk.EventControllerMotion()
+                mov.connect("motion", lambda _c, x, y: self.campo.ponteiro(x, y))
+                mov.connect("leave", lambda *_: self.campo.ponteiro(None, None))
+                self.add_controller(mov)
+            self.set_child(None)
+            self.suporte.append(self.cartao)
+            direita = Camada.get_anchor(self, Camada.Edge.RIGHT)
+            self.suporte.set_margin_start(self.HALO if direita else 0)
+            self.suporte.set_margin_end(0 if direita else self.HALO)
+            self.suporte.set_margin_bottom(self.HALO)
+            self.set_child(self.raiz)
+        elif not ligar and tem:
+            self.suporte.remove(self.cartao)
+            self.set_child(self.cartao)
+
+    def _formas_dos_cartoes(self):
+        """The cards (rounded rectangles) in the field's coordinates: the central has two, the others one."""
+        cartoes = [self.cartao]
+        if self.cartao.has_css_class("central"):
+            cartoes, filho = [], self.cartao.get_first_child()
+            while filho is not None:
+                if filho.get_visible():
+                    cartoes.append(filho)
+                filho = filho.get_next_sibling()
+        formas = []
+        for c in cartoes:
+            ok, r = c.compute_bounds(self.campo)
+            if ok and r.get_width() > 4 and r.get_height() > 4:
+                formas.append((r.get_x(), r.get_y(), r.get_width(), r.get_height(), 26))
+        return formas
+
     def fechar(self):
         self.pegador.set_visible(False)
         Janelinha.abertas.discard(self)
@@ -371,7 +416,9 @@ class Janelinha(Gtk.Window):
                 self.set_visible(False)
                 self.remove_css_class("saindo")
                 return False
-            self._saida = GLib.timeout_add(220, esconder)
+            if getattr(self, "campo", None) is not None and self.get_child() is getattr(self, "raiz", None):
+                self.campo.fechar()
+            self._saida = GLib.timeout_add(340, esconder)
             return
         if not getattr(self, "_saida", None):
             self.set_visible(False)
@@ -387,11 +434,15 @@ class Janelinha(Gtk.Window):
         """zona_icone = (x0, x1): faixa da barra de cima onde fica o ícone que abre esta janelinha
         (clicar nele de novo é "alternar", quem cuida é o próprio clique da barra)."""
         self.zona_icone = zona_icone
-        # DotStyle: o tema de pontos (dotstyle-janelinhas.css) vale enquanto a janela tem a classe "dots"
+        # DotStyle: o tema de pontos (dotstyle-janelinhas.css) vale enquanto a janela tem a classe "dots",
+        # e o conteúdo ganha o campo vivo de meio-tom em volta (campo.py)
         if visual_atual() == "DotStyle":
             self.add_css_class("dots")
+            self._com_campo(True)
+            self.campo.abrir()
         else:
             self.remove_css_class("dots")
+            self._com_campo(False)
         self.remove_css_class("saindo")
         if getattr(self, "_saida", None):
             GLib.source_remove(self._saida)
@@ -557,7 +608,7 @@ class CentralNotificacoes(Janelinha):
         historico = notif_historico()
         corte = self.limpas_ate() if HERMES is None else 0
         itens = [n for n in historico if n.get("id", 0) > corte]
-        painel = dk.Painel(origem="right", semente=len(itens))
+        painel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)      # the field (campo.py) draws its glass
         painel.set_size_request(LARGURA + 30, -1)
         dentro = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=16, margin_bottom=14,
                          margin_start=16, margin_end=12)
@@ -822,9 +873,13 @@ class CentralRapida(Janelinha):
             superficie.set_input_region(cairo.Region(cairo.RectangleInt(0, 0, w, h)))
         return GLib.SOURCE_CONTINUE
 
-    def clique_no_vazio(self, _gesto, _n, _x, y):
-        """Clique na parte transparente abaixo dos cartões = clicou fora: fecha (sem passar o clique)."""
-        if self.altura_conteudo and y > self.altura_conteudo:
+    def clique_no_vazio(self, _gesto, _n, x, y):
+        """Clique na parte transparente (abaixo dos cartões, ou no halo de pontos à esquerda no DotStyle)
+        = clicou fora: fecha (sem passar o clique)."""
+        ok, caixa = self.cartao.compute_bounds(self)
+        if ok and x < caixa.get_x():
+            self.fechar()
+        elif self.altura_conteudo and y > self.altura_conteudo:
             self.fechar()
 
     # ---------- estado do sistema (tudo por comandos simples) ----------
