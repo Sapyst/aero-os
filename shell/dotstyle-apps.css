@@ -1,0 +1,62 @@
+/* DotStyle for the small shell apps (Alt+Tab, clipboard history, emoji picker, power confirmation).
+   Each app loads this file only when the visual is DotStyle (and adds the "dots" class to its window). */
+
+@keyframes app-pop { from { opacity: 0; transform: scale(0.88); } 65% { opacity: 1; transform: scale(1.03); }
+                     to { opacity: 1; transform: none; } }
+
+/* ---- Alt+Tab: the field draws a glass behind every card; the chosen one glows ---- */
+window.alttab.dots .cartao {
+  background: none; border: none; box-shadow: none; border-radius: 22px;
+  transition: background 180ms ease, box-shadow 220ms ease, transform 240ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation: app-pop 360ms cubic-bezier(0.34, 1.36, 0.64, 1) both;
+}
+window.alttab.dots .cartao.selecionado {
+  background: alpha(#ecebe8, 0.08);
+  box-shadow: 0 0 0 2px alpha(#ecebe8, 0.85), 0 0 26px alpha(#ecebe8, 0.22);
+  transform: scale(1.04);
+}
+window.alttab.dots .titulo { font-family: "Doto"; font-weight: 900; letter-spacing: 1px; color: #ecebe8; }
+window.alttab.dots .miniatura { border-radius: 16px; }
+
+/* ---- clipboard history and dialogs: OLED glass, Doto titles, rows that pop in ---- */
+window.clipboard.dots, window.dots.energia {
+  background-color: alpha(#0b0b0c, 0.95);
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.05) 1px, transparent 1.5px);
+  background-size: 9px 9px;
+  border-radius: 26px;
+  color: #ecebe8;
+}
+window.clipboard.dots .cabecalho entry, window.clipboard.dots searchentry {
+  border-radius: 99px; background: alpha(#ecebe8, 0.06); border: none; box-shadow: none;
+  font-family: "Geist Mono", monospace;
+}
+window.clipboard.dots row {
+  border-radius: 18px; margin: 3px 8px;
+  transition: background 160ms ease, transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation: app-pop 340ms cubic-bezier(0.34, 1.36, 0.64, 1) both;
+}
+window.clipboard.dots row:hover { background: alpha(#ecebe8, 0.07); transform: translateX(3px); }
+window.clipboard.dots row:selected { background: alpha(#ecebe8, 0.12); box-shadow: inset 0 0 0 2px alpha(#ecebe8, 0.6); }
+window.clipboard.dots list { background: none; }
+window.clipboard.dots .vazio, window.dots .title-2 { font-family: "Doto"; font-weight: 900; letter-spacing: 1px; }
+window.dots button { border-radius: 99px; transition: transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+window.dots button:hover { transform: scale(1.06); }
+window.dots button.destructive-action { background: #ff3b30; color: white; box-shadow: 0 0 20px alpha(#ff3b30, 0.35); }
+
+/* dot scrollbars everywhere in these apps */
+window.dots scrollbar { background: transparent; border: none; }
+window.dots scrollbar slider {
+  min-width: 6px; border-radius: 99px; background-color: transparent;
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.7) 1.6px, transparent 2.2px);
+  background-size: 6px 7px; background-repeat: repeat-y;
+}
+
+/* ---- emoji picker (GTK's own chooser in a popover) ---- */
+window.emojis.dots popover > contents, window.emojis.dots popover contents {
+  background-color: alpha(#0b0b0c, 0.96);
+  background-image: radial-gradient(circle, alpha(#ecebe8, 0.05) 1px, transparent 1.5px);
+  background-size: 9px 9px;
+  border-radius: 26px; border: none;
+}
+window.emojis.dots emoji { border-radius: 99px; transition: transform 200ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+window.emojis.dots emoji:hover { background: alpha(#ecebe8, 0.1); transform: scale(1.25); }

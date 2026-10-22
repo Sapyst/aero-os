@@ -44,6 +44,8 @@ class App(Adw.Application):    # Adw = acompanha o claro/escuro do sistema (doc 
         janela = Gtk.ApplicationWindow(application=self, title="Emoji", decorated=False,
                                        default_width=8, default_height=8)
         janela.add_css_class("emojis")
+        import dotkit
+        dotkit.tema_apps(janela)                # DotStyle (dotstyle-apps.css), only in that visual
         apoio = Gtk.Box()
         janela.set_child(apoio)
         escolhedor = Gtk.EmojiChooser()

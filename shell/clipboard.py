@@ -108,6 +108,8 @@ class Historico(Gtk.ApplicationWindow):
         rolagem.set_margin_bottom(10)
         caixa.append(rolagem)
         self.set_child(caixa)
+        import dotkit
+        dotkit.tema_apps(self)                  # DotStyle (dotstyle-apps.css), only in that visual
 
         # Perdeu o foco = fecha (como o Super Menu). Menos nos primeiros 0,4 s: às vezes outro app
         # pede atenção bem na hora em que a janelinha abre e "rouba" o foco por um instante.

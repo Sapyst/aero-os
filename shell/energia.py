@@ -37,6 +37,9 @@ class App(Adw.Application):
         # A própria janela é o "diálogo": título, texto e dois botões (Cancel é o padrão)
         janela = Adw.ApplicationWindow(application=self, title=titulo, resizable=False,
                                        default_width=400)
+        janela.add_css_class("energia")
+        import dotkit
+        dotkit.tema_apps(janela)                # DotStyle (dotstyle-apps.css), only in that visual
         caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
                         margin_top=24, margin_bottom=20, margin_start=24, margin_end=24)
         cabeca = Gtk.Label(label=titulo, xalign=0)

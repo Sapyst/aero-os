@@ -194,3 +194,48 @@ class CampoDots(Gtk.DrawingArea):
                 cr.arc(x, y, r, 0, dois_pi)
             cr.set_source_rgba(*FG, (k + 0.5) / 22)
             cr.fill()
+
+
+# ---------- wrapping any window ----------
+
+CSS_ENVOLVER = """
+@keyframes campo-pop { from { opacity: 0; transform: scale(0.86); } 65% { opacity: 1; transform: scale(1.03); }
+                       to { opacity: 1; transform: none; } }
+.campo-conteudo { background: none; border: none; box-shadow: none;
+                  animation: campo-pop 420ms cubic-bezier(0.34, 1.36, 0.64, 1) both; }
+"""
+_css_ok = [False]
+
+
+def envolver(janela, conteudo, formas=None, halo=90, lados=("start", "end", "top", "bottom")):
+    """Puts `conteudo` (already the window's child) inside an Overlay with a live field behind it.
+    formas: function returning the cards [(x, y, w, h, r)] in the field's coordinates; default = the
+    whole content as one card. Returns the CampoDots (call .abrir() when the window shows)."""
+    from gi.repository import Gdk
+    if not _css_ok[0]:
+        p = Gtk.CssProvider()
+        p.load_from_string(CSS_ENVOLVER)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
+        _css_ok[0] = True
+    janela.set_child(None)
+    campo = None
+
+    def padrao():
+        ok, r = conteudo.compute_bounds(campo)
+        return [(r.get_x(), r.get_y(), r.get_width(), r.get_height(), 26)] if ok else []
+    campo = CampoDots(formas or padrao)
+    raiz = Gtk.Overlay()
+    raiz.set_child(campo)
+    suporte = Gtk.Box()
+    for lado in lados:
+        getattr(suporte, f"set_margin_{lado}")(halo)
+    suporte.append(conteudo)
+    raiz.add_overlay(suporte)
+    raiz.set_measure_overlay(suporte, True)
+    conteudo.add_css_class("campo-conteudo")
+    mov = Gtk.EventControllerMotion()
+    mov.connect("motion", lambda _c, x, y: campo.ponteiro(x, y))
+    mov.connect("leave", lambda *_: campo.ponteiro(None, None))
+    janela.add_controller(mov)
+    janela.set_child(raiz)
+    return campo

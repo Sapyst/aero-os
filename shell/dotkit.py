@@ -318,3 +318,29 @@ def tempo_atras(ts, agora=None):
     if d < 172800:
         return "yesterday"
     return time.strftime("%b %d", time.localtime(ts))
+
+
+def visual_atual():
+    try:
+        for linha in open(os.path.expanduser("~/.config/hypr/painel.conf")):
+            if linha.startswith("VISUAL="):
+                return linha.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "AeroTerm"
+
+
+def tema_apps(janela):
+    """DotStyle for the small apps: loads dotstyle-apps.css (+ the tooltip style) and marks the window.
+    Returns True if DotStyle is on."""
+    if visual_atual() != "DotStyle":
+        return False
+    pasta = os.path.dirname(os.path.abspath(__file__))
+    for nome in ("dotstyle-apps.css", "dotstyle-dicas.css"):
+        caminho = os.path.join(pasta, nome)
+        if os.path.exists(caminho):
+            p = Gtk.CssProvider()
+            p.load_from_path(caminho)
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
+    janela.add_css_class("dots")
+    return True

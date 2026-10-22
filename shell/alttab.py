@@ -131,6 +131,12 @@ class AltTab(Gtk.ApplicationWindow):
                                column_homogeneous=True)
         self.painel.add_css_class("painel")
         self.set_child(self.painel)
+        # DotStyle: the live halftone field wraps every card (campo.py)
+        import dotkit
+        self.campo = None
+        if dotkit.tema_apps(self):
+            import campo
+            self.campo = campo.envolver(self, self.painel, formas=self.formas_cartoes, halo=70)
 
         self.janelas = []        # lista de janelas (dicionários do hyprctl clients -j)
         self.cartoes = []
@@ -264,12 +270,22 @@ class AltTab(Gtk.ApplicationWindow):
         print("atraso: teclado chegou?", self.teclado_chegou, flush=True)
         return self.mostrar_agora()
 
+    def formas_cartoes(self):
+        formas = []
+        for c in self.cartoes:
+            ok, r = c.compute_bounds(self.campo)
+            if ok and r.get_width() > 4:
+                formas.append((r.get_x(), r.get_y(), r.get_width(), r.get_height(), 22))
+        return formas
+
     def mostrar_agora(self):
         if self.temporizador:
             GLib.source_remove(self.temporizador)
             self.temporizador = None
         if self.aberta:
             self.set_opacity(1)
+            if self.campo is not None:
+                self.campo.abrir()
         return GLib.SOURCE_REMOVE
 
     # ---------- teclado (enquanto aberta) ----------
