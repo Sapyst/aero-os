@@ -1,0 +1,63 @@
+/* AerOS — barra fina de vidro claro, de ponta a ponta (como no trailer do Nava OS).
+   Cores do tema em cores.css (hypr-tema); aqui só a forma. Escrito pelo aero-visual. */
+@import "cores.css";
+
+* {
+    font-family: Inter, "Font Awesome 7 Free Solid", "Font Awesome 7 Brands", sans-serif;
+    font-size: 12.5px;
+    font-weight: 500;
+    min-height: 0;
+    border: none;
+}
+window#waybar {
+    background: alpha(@fundo, 0.55);
+    color: @texto;
+    border-radius: 0;
+    border-bottom: 1px solid alpha(#ffffff, 0.45);
+}
+tooltip { background: alpha(@fundo, 0.92); border-radius: 12px; border: 1px solid alpha(#ffffff, 0.5); }
+
+/* área de trabalho: pontinhos pequenos; a ativa vira pílula lilás */
+#workspaces button {
+    padding: 0; margin: 10px 2px; min-width: 6px; min-height: 6px; border-radius: 99px;
+    background: alpha(@texto, 0.35); transition: all 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+#workspaces button.empty { background: alpha(@texto, 0.16); }
+#workspaces button label { font-size: 0; }
+#workspaces button.active { min-width: 18px; background: @destaque; }
+#workspaces button:hover { background: alpha(@texto, 0.55); box-shadow: none; text-shadow: none; }
+#window { margin-left: 10px; color: alpha(@texto, 0.75); }
+
+#clock, #tray, #language, #pulseaudio, #network, #bluetooth, #battery,
+#custom-settings, #custom-minimizados, #custom-notificacoes, #custom-central {
+    padding: 0 7px;
+    color: @texto;
+    border-radius: 99px;
+    transition: background 200ms ease;
+}
+#network, #bluetooth, #pulseaudio, #language { color: alpha(@texto, 0.8); font-size: 12px; }
+#clock { font-weight: 600; letter-spacing: 0.2px; }
+#battery.warning { color: #c88800; }
+#battery.critical { color: #e62d42; }
+#clock:hover, #pulseaudio:hover, #network:hover, #bluetooth:hover, #battery:hover,
+#custom-settings:hover, #custom-notificacoes:hover, #custom-central:hover, #custom-minimizados:hover {
+    background: alpha(@texto, 0.08);
+}
+
+/* espaço que a bandeja (ícones dos apps) ocupa por cima da barra: 30 px por ícone, como no AeroTerm */
+#custom-espaco-bandeja { padding: 0; margin: 0; }
+#custom-espaco-bandeja.n1 { min-width: 30px; }
+#custom-espaco-bandeja.n2 { min-width: 60px; }
+#custom-espaco-bandeja.n3 { min-width: 90px; }
+#custom-espaco-bandeja.n4 { min-width: 120px; }
+#custom-espaco-bandeja.n5 { min-width: 150px; }
+#custom-espaco-bandeja.n6 { min-width: 180px; }
+#custom-espaco-bandeja.n7 { min-width: 210px; }
+#custom-espaco-bandeja.n8 { min-width: 240px; }
+#custom-espaco-bandeja.n9 { min-width: 270px; }
+#custom-espaco-bandeja.n10 { min-width: 300px; }
+#custom-espaco-bandeja.n11 { min-width: 330px; }
+#custom-espaco-bandeja.n12 { min-width: 360px; }
+#custom-central { min-width: 24px; padding: 0 8px; margin: 4px 0; border-radius: 10px; }
+#custom-notificacoes.dnd { opacity: 0.55; }
+#bluetooth.off, #bluetooth.disabled { opacity: 0.45; }

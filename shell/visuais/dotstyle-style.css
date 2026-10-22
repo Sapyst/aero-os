@@ -1,0 +1,73 @@
+/* DotStyle — a thin OLED-black bar; numbers in a dot-matrix face when installed (Doto), dots for
+   workspaces, white everywhere and red only for alerts. Colours of the theme in cores.css (hypr-tema).
+   Written by aero-visual. */
+@import "cores.css";
+
+* {
+    font-family: "Geist Mono", "Adwaita Mono", "Font Awesome 7 Free Solid", "Font Awesome 7 Brands", monospace;
+    font-size: 12.5px;
+    font-weight: 500;
+    min-height: 0;
+    border: none;
+}
+window#waybar {
+    background: alpha(#0b0b0c, 0.9);
+    color: #ecebe8;
+    border-radius: 14px;
+    border: 1px solid alpha(#ecebe8, 0.08);
+}
+tooltip { background: #111112; color: #ecebe8; border-radius: 12px; border: 1px solid alpha(#ecebe8, 0.12); }
+tooltip label { color: #ecebe8; }
+
+/* workspaces as dots: the one you are on is a bright dot with a halo, used ones are grey, empty ones faint */
+#workspaces { margin-left: 6px; }
+#workspaces button {
+    padding: 0; margin: 0 4px; min-width: 6px; min-height: 6px; border-radius: 99px;
+    background: alpha(#ecebe8, 0.45); transition: all 260ms cubic-bezier(0.34, 1.36, 0.64, 1);
+}
+#workspaces button.empty { background: alpha(#ecebe8, 0.14); }
+#workspaces button label { font-size: 0; }
+#workspaces button.active {
+    min-width: 9px; min-height: 9px; background: #ecebe8;
+    box-shadow: 0 0 0 3px alpha(#ecebe8, 0.12);
+}
+#workspaces button:hover { background: alpha(#ecebe8, 0.75); box-shadow: none; text-shadow: none; }
+
+#clock, #tray, #language, #pulseaudio, #network, #bluetooth, #battery,
+#custom-settings, #custom-minimizados, #custom-ultrasu, #custom-notificacoes, #custom-central {
+    padding: 0 8px;
+    color: #ecebe8;
+    border-radius: 10px;
+    transition: background 180ms ease;
+}
+/* numbers in dots (Doto) when the font is there; otherwise the mono face */
+#clock { font-family: "Doto", "Geist Mono", "Adwaita Mono", monospace; font-size: 17px; font-weight: 900;
+         letter-spacing: 1px; }
+#battery { font-family: "Doto", "Geist Mono", "Adwaita Mono", "Font Awesome 7 Free Solid", monospace;
+           font-weight: 900; font-size: 14px; }
+#network, #bluetooth, #pulseaudio, #language { color: alpha(#ecebe8, 0.85); }
+#battery.warning { color: #f2c84b; }
+#battery.critical { color: #e8312a; }
+#custom-ultrasu.ativo, #custom-ultrasu.acabando { color: #e8312a; }   /* root open: the one red icon */
+#custom-ultrasu.vencido { opacity: 0.5; }
+#custom-notificacoes.dnd { opacity: 0.5; }
+#bluetooth.off, #bluetooth.disabled { opacity: 0.4; }
+#clock:hover, #pulseaudio:hover, #network:hover, #bluetooth:hover, #battery:hover, #language:hover,
+#custom-settings:hover, #custom-notificacoes:hover, #custom-central:hover, #custom-minimizados:hover,
+#custom-ultrasu:hover { background: alpha(#ecebe8, 0.08); }
+#custom-minimizados { background: alpha(#ecebe8, 0.06); }
+
+#custom-espaco-bandeja { padding: 0; margin: 0; }
+#custom-espaco-bandeja.n1 { min-width: 30px; }
+#custom-espaco-bandeja.n2 { min-width: 60px; }
+#custom-espaco-bandeja.n3 { min-width: 90px; }
+#custom-espaco-bandeja.n4 { min-width: 120px; }
+#custom-espaco-bandeja.n5 { min-width: 150px; }
+#custom-espaco-bandeja.n6 { min-width: 180px; }
+#custom-espaco-bandeja.n7 { min-width: 210px; }
+#custom-espaco-bandeja.n8 { min-width: 240px; }
+#custom-espaco-bandeja.n9 { min-width: 270px; }
+#custom-espaco-bandeja.n10 { min-width: 300px; }
+#custom-espaco-bandeja.n11 { min-width: 330px; }
+#custom-espaco-bandeja.n12 { min-width: 360px; }
+#custom-central { min-width: 24px; margin: 4px 0; }

@@ -1,0 +1,2 @@
+{"name": "Dots", "icon": "content-loading-symbolic", "description": "The screen turns into a grid of dots that sweeps into the new workspace",
+ "curve": [1.0, 0.86, 0.7, 0.54, 0.38, 0.24, 0.12, 0.04], "frame_ms": 45, "order": 5}
