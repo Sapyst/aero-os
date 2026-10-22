@@ -71,6 +71,74 @@ MARGEM = 8           # distância da barra até a borda de baixo da tela
 FOLGA = 8            # espaço entre os ícones e a borda da barra
 ESPACO = 8           # espaço entre um ícone e outro
 RAIO = 22            # cantos: 22 px, o mesmo de TUDO no sistema (regra do Aero, doc 30)
+
+
+def visual_atual():
+    try:
+        for linha in open(os.path.expanduser("~/.config/hypr/painel.conf")):
+            if linha.startswith("VISUAL="):
+                return linha.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "AeroTerm"
+
+
+class BolhaIcone(Gtk.DrawingArea):
+    """DotStyle: the app's real icon inside a round bubble (tile icons cropped round, like the start menu)."""
+
+    def __init__(self, gicon, tamanho, nome=""):
+        super().__init__(content_width=tamanho, content_height=tamanho, hexpand=True, vexpand=True)
+        self.ic = None
+        self.nome = nome
+        try:
+            import nuvem
+            tema = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            p = tema.lookup_by_gicon(gicon, 128, 1, Gtk.TextDirection.NONE, 0)
+            f = p.get_file() if p is not None else None
+            if f is not None and f.get_path() and "missing" not in f.get_path():
+                from gi.repository import GdkPixbuf
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(f.get_path(), 128, 128, True)
+                sup = cairo.ImageSurface(cairo.FORMAT_ARGB32, 128, 128)
+                c = cairo.Context(sup)
+                Gdk.cairo_set_source_pixbuf(c, pb, (128 - pb.get_width()) / 2, (128 - pb.get_height()) / 2)
+                c.paint()
+                self.ic = (sup, nuvem.quadrado(sup))
+        except (GLib.Error, TypeError, ValueError, ImportError):
+            self.ic = None
+        self.set_draw_func(self._desenhar)
+
+    def _desenhar(self, _a, cr, w, h):
+        x, y, r = w / 2, h / 2, min(w, h) / 2 - 1
+        cr.arc(x, y, r, 0, 2 * math.pi)
+        cr.set_source_rgba(0.07, 0.07, 0.08, 0.92)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.925, 0.92, 0.91, 0.14)
+        cr.set_line_width(1)
+        cr.stroke()
+        if self.ic is None:                                  # no icon in the theme: the initial in dots
+            import hermes_dots as hd
+            letra = (self.nome[:1] or "?").upper()
+            p = r * 0.11
+            hd.desenhar_texto(cr, letra, x - 2.5 * p, y - 3.5 * p, p, (0.925, 0.92, 0.91), 0.9)
+            return
+        sup, placa = self.ic
+        cr.save()
+        if placa:
+            px0, py0, px1, py1 = placa
+            ri = r * 0.92
+            cr.arc(x, y, ri, 0, 2 * math.pi)
+            cr.clip()
+            esc = ri * 2 * 1.1 / max(px1 - px0, py1 - py0)
+            cr.translate(x, y)
+            cr.scale(esc, esc)
+            cr.translate(-(px0 + px1) / 2, -(py0 + py1) / 2)
+        else:
+            lado = r * 1.3
+            cr.translate(x - lado / 2, y - lado / 2)
+            cr.scale(lado / 128, lado / 128)
+        cr.set_source_surface(sup, 0, 0)
+        cr.paint()
+        cr.restore()
 LARG_SEPARADOR = 10
 LINHA_ALT = 5        # espessura da linha dormente
 LINHA_ALT_VAZIO = 7  # ...e da linha do Dock vazio ("meio grossa", pedido do Aero)
@@ -251,6 +319,8 @@ class Faixa(Gtk.Widget):
 
     def do_snapshot(self, snap):
         d = self.dock
+        if getattr(d, "dots", False):
+            return self.snapshot_pontos(snap)
         if DEPURAR:
             print("desenho: fase", round(d.fase, 2), "alvo", d.alvo, "barra", d.ret_barra, "alfa", round(d.alfa_barra, 2),
                   "encostado", d.encostado, "tela cheia", d.tela_cheia, flush=True)
@@ -291,6 +361,85 @@ class Faixa(Gtk.Widget):
                     snap.pop()
 
 
+    def snapshot_pontos(self, snap):
+        """DotStyle dock: no bar. A halftone of dots around the bubbles (big against them, fading out), which
+        follows the magnifying wave on its own because it is measured from the bubbles' real size every frame.
+        Sleeping (thin line state): just a row of dots. Open apps: glowing dots; separators: a dot column."""
+        d = self.dock
+        w, h = self.get_width(), self.get_height()
+        cr = snap.append_cairo(Graphene.Rect().init(0, 0, w, h))
+        tx = d.cores["texto"]
+        fg = (tx[0], tx[1], tx[2])
+        if d.ret_barra and d.alfa_barra > 0.005:
+            x, y, bw, bh = d.ret_barra
+            bolhas = [(it.x + d.tam_max * it.escala / 2, it.y + d.tam_max * it.escala / 2, d.tam_max * it.escala / 2 * 0.96)
+                      for it in d.itens if it.widget is not None and it.visivel > 0.01]
+            if d.forma < 0.35 or not bolhas:                       # sleeping line: a row of dots
+                cy = y + bh / 2
+                n = max(2, int(bw / 9))
+                cr.new_path()
+                for i in range(n + 1):
+                    cr.new_sub_path()
+                    cr.arc(x + bw * i / n, cy, 1.6, 0, 2 * math.pi)
+                cr.set_source_rgba(*fg, 0.55 * d.alfa_barra)
+                cr.fill()
+            else:
+                passo, alc = 11.0, 62.0
+                grupos = [[] for _ in range(10)]
+                gy = y - alc
+                linha = 0
+                while gy < min(h, y + bh + alc):
+                    gx = x - alc + (passo / 2 if linha % 2 else 0)
+                    while gx < x + bw + alc:
+                        dmin = 999.0
+                        for bx, by, br in bolhas:
+                            dd = math.hypot(gx - bx, gy - by) - br
+                            if dd < dmin:
+                                dmin = dd
+                        if 3 < dmin < alc:
+                            t = dmin / alc
+                            a = (0.05 + 0.4 * (1 - t) ** 1.3) * d.alfa_barra
+                            grupos[min(9, int(a * 20))].append((gx, gy, 0.8 + 3.0 * (1 - t) ** 1.6))
+                        gx += passo
+                    gy += passo * 0.87
+                    linha += 1
+                for k, grupo in enumerate(grupos):
+                    if not grupo:
+                        continue
+                    cr.new_path()
+                    for gx, gy, r in grupo:
+                        cr.new_sub_path()
+                        cr.arc(gx, gy, r, 0, 2 * math.pi)
+                    cr.set_source_rgba(*fg, (k + 0.5) / 20)
+                    cr.fill()
+        for item in d.itens:
+            if item.tipo == "separador" and item.visivel > 0.01:
+                for k in (-1, 0, 1):
+                    cr.arc(item.x, item.y + k * 7, 1.5, 0, 2 * math.pi)
+                    cr.set_source_rgba(*fg, 0.45 * item.visivel)
+                    cr.fill()
+        cr = None
+        for item in d.itens:
+            if item.tipo != "separador" and item.widget is not None:
+                self.snapshot_child(item.widget, snap)
+        cr = snap.append_cairo(Graphene.Rect().init(0, 0, w, h))
+        for item in d.itens:
+            if item.widget is not None and item.janelas and item.visivel > 0.01:
+                cx = item.x + d.tam_max * item.escala / 2
+                cy = d.base_barra - 2.5
+                r = 3.0 if item.ativo else 2.0
+                g = cairo.RadialGradient(cx, cy, 0, cx, cy, r * 3.5)
+                for k in range(7):
+                    t = k / 6
+                    g.add_color_stop_rgba(t, *fg, (0.5 if item.ativo else 0.25) * math.exp(-4 * t * t) * item.visivel)
+                cr.set_source(g)
+                cr.arc(cx, cy, r * 3.5, 0, 2 * math.pi)
+                cr.fill()
+                cr.arc(cx, cy, r, 0, 2 * math.pi)
+                cr.set_source_rgba(*fg, (1.0 if item.ativo else 0.7) * item.visivel)
+                cr.fill()
+
+
 # ---------- a janela-camada ----------
 
 class Dock(Gtk.ApplicationWindow):
@@ -298,6 +447,7 @@ class Dock(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Dock")
         self.add_css_class("dock")
         self.app = app
+        self.dots = visual_atual() == "DotStyle"      # DotStyle: halftone dock (Faixa.snapshot_pontos)
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.TOP)             # acima das janelas (abaixo de tela cheia)
         Camada.set_namespace(self, "dock")
@@ -421,8 +571,11 @@ class Dock(Gtk.ApplicationWindow):
         bolha = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
         bolha.add_css_class("bolha")
         bolha.set_size_request(self.tam_max, self.tam_max)
-        icone = Gtk.Image(gicon=item.app.get_icon() or Gio.ThemedIcon.new("application-x-executable"),
-                          pixel_size=int(self.tam_max * 0.72), hexpand=True, vexpand=True)
+        gicon = item.app.get_icon() or Gio.ThemedIcon.new("application-x-executable")
+        if getattr(self, "dots", False):
+            icone = BolhaIcone(gicon, self.tam_max, item.app.get_display_name() or "")
+        else:
+            icone = Gtk.Image(gicon=gicon, pixel_size=int(self.tam_max * 0.72), hexpand=True, vexpand=True)
         bolha.append(icone)
         bolha.set_tooltip_text(item.app.get_display_name())
         clique = Gtk.GestureClick(button=0)
