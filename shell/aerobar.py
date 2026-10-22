@@ -57,6 +57,7 @@ PADRAO = {
     "colors": {"text": "#ecebe8", "dim": "#8c8b88", "alert": "#ff3b30", "plugged": "#4cc2ff",
                "saver": "#ffd23f", "good": "#3dff9a", "background": "#0b0b0c"},
     "glow": True,               # coloured dots light up with a soft halo
+    "auto_contrast": True,      # read the wallpaper under each icon: dark icons on light parts, light on dark
 }
 OCULTAVEIS = {"workspaces", "min", "clock", "lang", "vol", "wifi", "bt", "bat", "ultrasu", "bell", "gear", "central"}
 
@@ -84,7 +85,7 @@ def ler_config():
                       ("icon_size", 10, 28), ("clock_size", 10, 32), ("number_size", 10, 28)):
         if isinstance(bruto.get(k), int) and not isinstance(bruto.get(k), bool):
             c[k] = min(hi, max(lo, bruto[k]))
-    for k in ("outline", "date", "hover", "glow"):
+    for k in ("outline", "date", "hover", "glow", "auto_contrast"):
         if isinstance(bruto.get(k), bool):
             c[k] = bruto[k]
     if isinstance(bruto.get("hide"), list):
@@ -108,6 +109,51 @@ BLUE = _hex(CFG["colors"]["plugged"], PADRAO["colors"]["plugged"])
 YELLOW = _hex(CFG["colors"]["saver"], PADRAO["colors"]["saver"])
 FUNDO = _hex(CFG["colors"]["background"], PADRAO["colors"]["background"])
 ICONE = CFG["icon_size"]
+
+# two palettes: the user's colours for dark backgrounds, and strong versions for light ones
+ESCURA = {"FG": FG, "DIM": DIM, "RED": RED, "BLUE": BLUE, "YELLOW": YELLOW,
+          "GREEN": _hex(CFG["colors"]["good"], PADRAO["colors"]["good"])}
+CLARA = {"FG": (0.07, 0.07, 0.08), "DIM": (0.28, 0.28, 0.27), "RED": (0.85, 0.09, 0.06),
+         "BLUE": (0.0, 0.42, 0.95), "YELLOW": (0.72, 0.5, 0.0), "GREEN": (0.0, 0.6, 0.3)}
+
+
+def usar_paleta(clara):
+    """Switches the drawing colours (module-level names the modules read) for the next module."""
+    global FG, DIM, RED, BLUE, YELLOW, GREEN
+    pal = CLARA if clara else ESCURA
+    FG, DIM, RED, BLUE, YELLOW, GREEN = pal["FG"], pal["DIM"], pal["RED"], pal["BLUE"], pal["YELLOW"], pal["GREEN"]
+
+
+def luz_do_papel(caminho, largura, altura_tela, faixa, colunas=256):
+    """Brightness (0..1) along the top strip of the wallpaper as the screen shows it (fit_mode cover):
+    a list of `colunas` values left to right. None if the picture can't be read."""
+    try:
+        from gi.repository import GdkPixbuf
+        info = GdkPixbuf.Pixbuf.get_file_info(caminho)
+        iw, ih = info[1], info[2]
+        if not iw or not ih:
+            return None
+        esc = max(largura / iw, altura_tela / ih)            # cover: fills the screen, crops the rest
+        vis_w, vis_h = largura / esc, altura_tela / esc       # part of the picture that is visible
+        x0, y0 = (iw - vis_w) / 2, (ih - vis_h) / 2
+        alvo_w = colunas
+        alvo_h = max(4, int(colunas * ih / iw))
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(caminho, int(alvo_w * iw / vis_w), -1, True)
+        k = pb.get_width() / iw
+        d, rs, n = pb.get_pixels(), pb.get_rowstride(), pb.get_n_channels()
+        y_a, y_b = int(y0 * k), max(int(y0 * k) + 1, int((y0 + faixa / esc) * k))
+        valores = []
+        for c in range(colunas):
+            x = int((x0 + (c + 0.5) / colunas * vis_w) * k)
+            x = min(pb.get_width() - 1, max(0, x))
+            soma = 0.0
+            for y in range(y_a, min(y_b, pb.get_height())):
+                i = y * rs + x * n
+                soma += (d[i] * 0.2126 + d[i + 1] * 0.7152 + d[i + 2] * 0.0722) / 255
+            valores.append(soma / max(1, min(y_b, pb.get_height()) - y_a))
+        return valores
+    except (GLib.Error, OSError, IndexError, ZeroDivisionError, TypeError):
+        return None
 GREEN = _hex(CFG["colors"]["good"], PADRAO["colors"]["good"])
 F_RELOGIO = f"Doto Black {CFG['clock_size']}"
 F_NUMERO = f"Doto Black {CFG['number_size']}"
@@ -446,6 +492,7 @@ class Barra(Gtk.Window):
         self.n_bandeja = 0
         self.sobre = None
         self.pulso = None
+        self.papel, self.luz = "", None
 
         cfg = os.path.join(BIN, "configuracoes")
         som = os.path.join(BIN, "som")
@@ -534,6 +581,7 @@ class Barra(Gtk.Window):
         for m in self.visiveis(self.esquerda + self.centro + self.direita):
             if m.w <= 0:
                 continue
+            usar_paleta(self.claro_em(m.x, m.x + m.w, w))
             if m is self.sobre and CFG["hover"] and not isinstance(m, EspacoBandeja):
                 cr.set_source_rgba(*FG, 0.08)
                 rr = 9
@@ -545,6 +593,40 @@ class Barra(Gtk.Window):
                 cr.close_path()
                 cr.fill()
             m.desenhar(cr, m.x)
+        usar_paleta(False)
+
+    def claro_em(self, x0, x1, w):
+        """Is the wallpaper light under [x0, x1]? Only with no background (or glass) and auto contrast on."""
+        if not CFG["auto_contrast"] or CFG["background"] == "solid" or not self.luz:
+            return False
+        n = len(self.luz)
+        a, b = int(max(0, x0) / w * n), int(min(w, x1) / w * n) + 1
+        trecho = self.luz[a:b] or self.luz
+        media = sum(trecho) / len(trecho)
+        if CFG["background"] == "glass":                     # the dark glass darkens what is behind it
+            media *= 1 - CFG["opacity"] * 0.55
+        return media > 0.55
+
+    def ler_papel(self):
+        """Current wallpaper (hyprpaper) -> brightness of the strip under the bar. Runs in a thread."""
+        saida = rodar("hyprctl", "hyprpaper", "listactive")
+        caminho = ""
+        for linha in saida.splitlines():
+            if ":" in linha:
+                caminho = linha.split(":", 1)[1].strip()
+                break
+        if not caminho or caminho == self.papel:
+            return False
+        self.papel = caminho
+        tela_w, tela_h = 2560, 1440
+        try:
+            for m in json.loads(rodar("hyprctl", "monitors", "-j") or "[]"):
+                if m.get("focused"):
+                    tela_w, tela_h = m["width"] / (m.get("scale") or 1), m["height"] / (m.get("scale") or 1)
+        except (ValueError, KeyError, TypeError):
+            pass
+        self.luz = luz_do_papel(caminho, tela_w, tela_h, TOPO + ALTURA)
+        return True
 
     def modulo_em(self, x):
         for m in self.esquerda + self.centro + self.direita:
@@ -608,6 +690,7 @@ class Barra(Gtk.Window):
         self.cada(2, self.ler_notificacoes)
         self.cada(10, self.ler_rede)
         self.cada(15, self.ler_ultrasu)
+        self.cada(3, self.ler_papel)              # per-workspace wallpapers change on switch: cheap check
         threading.Thread(target=self.ouvir_hyprland, daemon=True).start()
         threading.Thread(target=self.ouvir_pactl, daemon=True).start()
         self.ouvir_perfil()
