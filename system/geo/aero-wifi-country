@@ -210,6 +210,9 @@ def aplicar(pais):
     The channel in use stays allowed (it is the routers' own country), so the connection does not drop."""
     mudou = False
     if regdom_atual() != pais:
+        # "reload" first: if the kernel started without regulatory.db (installed later), "set" alone
+        # stays pending forever and the radio keeps the strict world rules
+        subprocess.run([IW, "reg", "reload"], capture_output=True, timeout=5)
         subprocess.run([IW, "reg", "set", pais], capture_output=True, timeout=5)
         mudou = True
     linha = f"# Written by aero-wifi-country: the last Wi-Fi country, so 6 GHz works right after boot.\n" \
