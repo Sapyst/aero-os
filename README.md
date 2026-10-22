@@ -25,7 +25,8 @@
 | `music/` | TerMusic / YTMusic: a YouTube Music engine (mpv + ytmusicapi) with a terminal UI and a GTK app | `~/.local/share/ytmotor` |
 | `login/` | the greetd login screen (GTK, runs in its own Hyprland) | `/etc/greetd` |
 | `boot/` | the start-up animation: the Venus de Milo in ASCII (boot splash, login, first second of the desktop) | `/usr/share/aero` |
-| `system/` | hardware snippets used on the original laptop (hybrid AMD + NVIDIA) | `/etc/...` |
+| `x9/` | **X9**, the admin activity log app: every sudo, pkexec and su call, who asked and what for | `~/.local/share/x9` |
+| `system/` | root parts: the X9 service, the memory guard, Btrfs snapshots, polkit rules, and hardware snippets used on the original laptop (hybrid AMD + NVIDIA) | `/etc/...`, `/usr/local` |
 
 Code comments are in Portuguese; everything on screen is in English.
 
@@ -68,6 +69,44 @@ shortcut stops it. Ctrl+Print goes straight to the area. NVENC when available, c
 
 **Also:** Alt+Tab like Windows with live thumbnails, a dock with intellihide, a wave effect and minimize-to-icon
 animations, one theme color for the whole system with light/dark by time.
+
+### Safety: X9, polkit and snapshots
+
+**X9 is the admin activity log.** (In Brazilian slang an *X9* is a snitch: it tells on whoever used root.)
+A small root service follows the system journal and archives **every sudo, pkexec and su call**, one file
+per day. For each call it shows:
+
+- **when**, and **which app asked** (a terminal, Settings, Claude, Steam...), read from the app's systemd scope;
+- the **command**, the folder, and whether it came from a terminal or from an app with no terminal;
+- a **category** (Packages, Services, Files & config, Disks, Network, Users & security, Kernel & boot, Power,
+  Root shell, Scripts & code, Inspect, Aero system...) and **what it was for** in plain words, like
+  *Install packages: htop* or *Restart service: bluetooth.service*. It is a best guess from the command line;
+  X9 can't see inside a script;
+- a **risk** level and the **result**: allowed, denied, wrong password or cancelled.
+
+When an app tries to reuse a cached sudo password **without asking**, the entry turns red: a normal app never
+needs that. Filters combine freely: days, time of day (22:00 to 06:00 crosses midnight), category, result, risk,
+app and text. Entries can be deleted one by one, several at a time or all, and auto-delete rules keep the archive
+small ("keep 90 days", "delete read-only entries after 24 hours").
+
+How it is protected:
+
+- The app is **not root**: it only reads the archive (`/var/log/x9`, group `wheel`).
+- Deleting entries or changing auto-delete goes through a root helper, and polkit asks the **admin password
+  every time**. A deletion leaves a note that entries were deleted.
+- Lines that only *claim* to come from sudo (`logger -t sudo ...`) are ignored: X9 trusts the real program
+  that wrote them, as recorded by journald.
+- The X9 password locks the app on your screen (*Forgot password?* asks the admin password to set a new one).
+  It is a screen lock, not encryption.
+- The service is sandboxed (no network, read-only system, writes only its own folders) and stays around 20 MB.
+
+**Settings never uses sudo.** Every root change (power, memory, system upgrade) goes through `pkexec`, and polkit
+asks the admin password **every time**, so an open sudo ticket in some terminal does not count there.
+
+**Snapshots.** snapper + snap-pac take a Btrfs snapshot of `/` before and after every pacman change, and
+`aero-snap "what" <command>` wraps any installer in a before/after pair (`sudo aero-snap undo PRE POST` puts the
+files back). Bounded (10 pairs, at most 20% of the disk) and with no resident daemon. `/home` and `/var/log`
+are left out on purpose, so your files and X9's log survive a rollback.
 
 <sub>Screenshots: wallpapers from [ascii-walls](https://github.com/Sapyst/ascii-walls). Process names,
 places and personal items are blurred.</sub>
