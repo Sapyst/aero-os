@@ -13,6 +13,7 @@ Everything visual comes from the settings (hermes.PADRAO): style, colours, fonts
 """
 import math
 import os
+import re
 import subprocess
 import time
 
@@ -211,8 +212,8 @@ CSS = """
 """
 
 
-def css_do_tema(config):
-    c, f = config["colors"], config["font"]
+def css_do_tema(config, claro=False):
+    c, f = config["colors_light" if claro else "colors"], config["font"]
     trocas = {"@hermes_bg": c["background"], "@hermes_fg": c["text"], "@hermes_dim": c["dim"],
               "@hermes_accent": c["accent"], "@hermes_radius": f"{config['radius']}px",
               "@hermes_mono": f["mono"], "@hermes_body": f["body"]}
@@ -379,28 +380,97 @@ class Cartoes(Gtk.Window):
         return None
 
 
-class HermesUI:
-    """Connects the service to the screen: show/update/close -> cards; every new one -> a wave."""
+STEAM_TOAST = re.compile(r"notification|toast", re.I)
 
-    def __init__(self, servico, eh_tela_cheia=tela_cheia):
+
+def ouvir_hyprland(ao_evento):
+    """Thread: Hyprland's event socket (socket2). ao_evento(name, data) runs in the GTK thread."""
+    import socket
+    import threading
+    caminho = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "hypr",
+                           os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""), ".socket2.sock")
+
+    def laco():
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sk:
+                    sk.connect(caminho)
+                    resto = b""
+                    while True:
+                        bloco = sk.recv(65536)
+                        if not bloco:
+                            break
+                        resto += bloco
+                        *linhas, resto = resto.split(b"\n")
+                        for linha in linhas:
+                            nome, _, dados = linha.decode("utf-8", "replace").partition(">>")
+                            if nome in ("fullscreen", "openwindow"):
+                                GLib.idle_add(lambda n=nome, d=dados: (ao_evento(n, d), False)[1])
+            except OSError:
+                pass
+            time.sleep(3)                                     # Hyprland restarting: try again
+    if os.path.exists(caminho):
+        threading.Thread(target=laco, daemon=True, name="hermes-hyprland").start()
+        return True
+    return False
+
+
+def janela_hyprland(endereco):
+    """Position/size of a window by address (hyprctl clients), or None."""
+    try:
+        import json
+        r = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2)
+        for c in json.loads(r.stdout or "[]"):
+            if c.get("address", "").lstrip("0x") == endereco.lstrip("0x"):
+                return c
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+class HermesUI:
+    """Connects the service to the screen: show/update/close -> cards; every new one -> a wave.
+    Also: settings/modes reload, fullscreen hold (from Hyprland events) and Steam's own popups."""
+
+    def __init__(self, servico, eh_tela_cheia=tela_cheia, ouvir=True):
         self.servico = servico
         self.config = servico.config
         self.eh_tela_cheia = eh_tela_cheia
         self.provedor = Gtk.CssProvider()
-        self.provedor.load_from_string(css_do_tema(self.config))
+        self.aplicar_css()
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.onda = Onda(self.config)
         self.cartoes = Cartoes(self.config, servico)
         self.guardadas = []                                   # held while a fullscreen app has focus
+        self._cheia = False
+        servico.segurar = self._segurar
         servico.ouvir(self.evento)
+        if ouvir:
+            ouvir_hyprland(self.hyprland)
+
+    def aplicar_css(self):
+        self.provedor.load_from_string(css_do_tema(self.config, "claro" in self.servico.modos))
+
+    def _segurar(self, n):
+        """Called by the service before "show": is this card held right now?"""
+        self._cheia = self.eh_tela_cheia()
+        return self._cheia and self.config["fullscreen"] == "hold" and n.urgencia < 2
 
     def evento(self, ev, n):
+        if ev in ("config", "modes"):
+            self.config = self.servico.config
+            self.onda.config = self.cartoes.config = self.config
+            self.aplicar_css()
+            if ev == "config":
+                self.cartoes.ancorar()
+            return
         if ev == "close":
             self.guardadas = [x for x in self.guardadas if x.id != n.id]
             self.cartoes.tirar(n.id)
             return
-        cheia = self.eh_tela_cheia()
+        cheia = self._cheia
+        self._cheia = False
         if ev == "show" and n.onda:
             self.onda.soltar(urgente=n.urgencia == 2, sobre_tela_cheia=cheia)
         if cheia and self.config["fullscreen"] == "hold" and n.urgencia < 2:
@@ -409,8 +479,53 @@ class HermesUI:
         self.cartoes.mostrar(n)
 
     def saiu_da_tela_cheia(self):
-        """Hyprland said fullscreen ended: the held cards come in now (only those still open)."""
+        """Fullscreen ended: the held cards come in now (only those still open), timers start now."""
         guardadas, self.guardadas = self.guardadas, []
         for n in guardadas:
             if n.id in self.servico.ativas:
                 self.cartoes.mostrar(n)
+                self.servico.armar(n.id)
+
+    def hyprland(self, nome, dados):
+        if nome == "fullscreen":
+            if dados.strip() == "0" and self.guardadas and not self.eh_tela_cheia():
+                self.saiu_da_tela_cheia()
+            return
+        # openwindow>>ADDRESS,WORKSPACE,CLASS,TITLE : Steam's own notification popups
+        partes = dados.split(",", 3)
+        if len(partes) < 4 or self.config["steam"] == "off":
+            return
+        endereco, _ws, classe, titulo = partes
+        if classe.lower() != "steam" or not STEAM_TOAST.search(titulo):
+            return
+        GLib.timeout_add(120, lambda: (self.popup_da_steam(endereco), False)[1])   # let it get its size
+
+    def popup_da_steam(self, endereco):
+        c = janela_hyprland(endereco)
+        if c is None:
+            return
+        cheia = self.eh_tela_cheia()
+        x, y = c.get("at", [0, 0])
+        w, h = c.get("size", [0, 0])
+        if self.config["steam"] == "move" and not cheia:
+            m = self.config["margin"]
+            pos = posicao(self.config)
+            mon = self.monitor_tamanho()
+            nx = {"left": m, "center": (mon[0] - w) // 2, "right": mon[0] - w - m}[pos.split("-")[1]]
+            ny = m + 40 if pos.startswith("top") else mon[1] - h - m
+            subprocess.run(["hyprctl", "dispatch", "movewindowpixel", f"exact {nx} {ny},address:0x{endereco.lstrip('0x')}"],
+                           capture_output=True, timeout=2)
+            x, y = nx, ny
+        # the wave comes out of the popup (local coordinates of the focused monitor are close enough)
+        self.onda.soltar(urgente=False, cartao=(x + w / 2, y + h / 2), sobre_tela_cheia=cheia)
+
+    def monitor_tamanho(self):
+        try:
+            import json
+            r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=2)
+            for m in json.loads(r.stdout or "[]"):
+                if m.get("focused"):
+                    return int(m["width"] / m.get("scale", 1)), int(m["height"] / m.get("scale", 1))
+        except (OSError, ValueError, subprocess.TimeoutExpired, KeyError):
+            pass
+        return 1920, 1080

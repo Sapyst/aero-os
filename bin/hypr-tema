@@ -186,7 +186,7 @@ EOF
         fundo_escuro="#1e1e1ecc"; fundo_claro="#f6f6f6cc"
     fi
     cat > "$HOME/.config/mako/config" <<EOF
-# Gerado pelo hypr-tema (cores do tema). O modo "claro" é ativado com: makoctl mode -s claro
+# Gerado pelo hypr-tema (cores do tema). O modo "claro" é ativado com: "$HOME/.local/bin/hermesctl" mode -s claro
 anchor=top-right
 margin=12
 padding=12,16
@@ -222,7 +222,7 @@ default-timeout=1500
 background-color=$fundo_claro
 text-color=#1e1e1e
 EOF
-    makoctl reload >/dev/null 2>&1
+    "$HOME/.local/bin/hermesctl" reload >/dev/null 2>&1
     pkill -SIGUSR2 -x waybar    # SIGUSR2 = "waybar, recarregue o visual"
 }
 
@@ -257,8 +257,8 @@ aplicar_tema() {
     done
     printf '# Gerado pelo hypr-tema (doc 46)\ngtk-theme-name="%s"\n' "$nome" > "$HOME/.gtkrc-2.0"
     # -a/-r (acrescentar/tirar) em vez de -s (substituir tudo): assim o "dnd" (Não perturbe) sobrevive
-    if [ "$mako" = claro ]; then makoctl mode -a claro >/dev/null 2>&1
-    else makoctl mode -r claro >/dev/null 2>&1; fi
+    if [ "$mako" = claro ]; then "$HOME/.local/bin/hermesctl" mode -a claro >/dev/null 2>&1
+    else "$HOME/.local/bin/hermesctl" mode -r claro >/dev/null 2>&1; fi
     echo "$tema" > "$ESTADO/tema"
     echo "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" > "$ESTADO/cores"
 }

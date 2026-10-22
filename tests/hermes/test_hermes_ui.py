@@ -66,7 +66,8 @@ class Falsa:
 class TestCartaoEFluxo(unittest.TestCase):
     def setUp(self):
         r = {}
-        self.s = h.Hermes(h.validar_config({}), lambda ms, f: r.setdefault(len(r), f), lambda t: None)
+        self.s = h.Hermes(h.validar_config({}), lambda ms, f: r.setdefault(len(r), f) and len(r) or len(r),
+                          lambda t: None)
 
     def test_css_e_cartao(self):
         css = ui.css_do_tema(self.s.config)
@@ -84,7 +85,7 @@ class TestCartaoEFluxo(unittest.TestCase):
         orig_onda, orig_cart = ui.Onda, ui.Cartoes
         ui.Onda, ui.Cartoes = Falsa, Falsa
         try:
-            hu = ui.HermesUI(self.s, eh_tela_cheia=lambda: cheia[0])
+            hu = ui.HermesUI(self.s, eh_tela_cheia=lambda: cheia[0], ouvir=False)
             i = self.s.notificar("Steam", 0, "", "Amigo online", "", [], {}, -1, ":1")
             self.assertEqual(hu.onda.chamadas[-1][2], {"urgente": False, "sobre_tela_cheia": True})
             self.assertEqual([c[0] for c in hu.cartoes.chamadas], [])       # held
@@ -94,6 +95,7 @@ class TestCartaoEFluxo(unittest.TestCase):
             cheia[0] = False
             hu.saiu_da_tela_cheia()
             self.assertEqual(hu.cartoes.chamadas[-1][1][0].id, i)
+            self.assertEqual(len(self.s.timers), 1)                          # timer starts only now
             self.s.fechar(c)
             self.assertEqual(hu.cartoes.chamadas[-1][0], "tirar")
         finally:

@@ -31,6 +31,13 @@ HISTORICO = os.path.expanduser("~/.local/state/aero/hermes-history.json")
 
 XML = """
 <node>
+  <interface name="com.aero.Hermes">
+    <method name="History"><arg type="s" direction="out"/></method>
+    <method name="Modes"><arg type="as" direction="out"/></method>
+    <method name="SetModes"><arg type="as" name="modes" direction="in"/></method>
+    <method name="DismissAll"/>
+    <method name="Reload"/>
+  </interface>
   <interface name="org.freedesktop.Notifications">
     <method name="GetCapabilities"><arg type="as" direction="out"/></method>
     <method name="Notify">
@@ -84,6 +91,7 @@ PADRAO = {
         "fullscreen_intensity": 0.22,    # how bright the faded wave is
     },
     "colors": {"background": "#0b0b0c", "text": "#ecebe8", "dim": "#8c8b88", "accent": "#e8312a"},
+    "colors_light": {"background": "#f4f4f1", "text": "#151516", "dim": "#6b6a67", "accent": "#d42a22"},
     "font": {"title": "Doto", "body": "Geist", "mono": "Geist Mono"},
     "radius": 22,
     "icons": True,
@@ -154,11 +162,12 @@ def validar_config(bruto):
         if w.get("fullscreen") in ("faded", "normal", "off"):
             cw["fullscreen"] = w["fullscreen"]
         cw["fullscreen_intensity"] = _num(w.get("fullscreen_intensity"), cw["fullscreen_intensity"], 0.02, 1.0, False)
-    cores = bruto.get("colors")
-    if isinstance(cores, dict):
-        for k in c["colors"]:
-            if isinstance(cores.get(k), str) and COR_RE.match(cores[k]):
-                c["colors"][k] = cores[k]
+    for grupo in ("colors", "colors_light"):
+        cores = bruto.get(grupo)
+        if isinstance(cores, dict):
+            for k in c[grupo]:
+                if isinstance(cores.get(k), str) and COR_RE.match(cores[k]):
+                    c[grupo][k] = cores[k]
     fonte = bruto.get("font")
     if isinstance(fonte, dict):
         for k in c["font"]:
@@ -292,13 +301,13 @@ def ler_imagem(v):
 class Notificacao:
     __slots__ = ("id", "app", "icone", "titulo", "corpo", "acoes", "urgencia", "categoria", "entrada",
                  "valor", "imagem", "etiqueta", "transitoria", "residente", "som", "timeout", "remetente",
-                 "criada", "escondida", "onda", "guardar")
+                 "criada", "escondida", "onda", "guardar", "pendente")
 
     def __init__(self, id_):
         self.id = id_
         self.criada = time.time()
         self.acoes, self.imagem, self.etiqueta, self.valor = [], None, None, None
-        self.escondida, self.onda, self.guardar = False, True, True
+        self.escondida, self.onda, self.guardar, self.pendente = False, True, True, False
 
     def resumo(self):
         """What the history and the quick center see (no image bytes)."""
@@ -359,7 +368,8 @@ class Hermes:
         self.dono = None
         self.taxa = {}                       # sender -> (second, count)
         self.modos = set(["dnd"] if self.config["dnd"]["enabled"] else [])
-        self.segurando = lambda: False       # UI sets: True while a fullscreen app has focus
+        self.segurar = lambda n: False       # UI sets: True = the card is held (fullscreen); its timer
+                                             # starts only when the card really shows (armar)
 
     # --- plumbing ---
 
@@ -451,8 +461,12 @@ class Hermes:
         if n.guardar and not n.transitoria:
             self._guardar(n)
         self._parar_timer(n.id)
+        n.pendente = False
         if n.timeout > 0 and not n.escondida:
-            self.timers[n.id] = self.agendar(n.timeout, lambda i=n.id: self.fechar(i, EXPIROU))
+            if self.segurar(n):
+                n.pendente = True
+            else:
+                self.timers[n.id] = self.agendar(n.timeout, lambda i=n.id: self.fechar(i, EXPIROU))
         if n.escondida:
             # hidden by DND or a rule: kept in the history, never drawn; closed right away for the app
             del self.ativas[n.id]
@@ -460,6 +474,28 @@ class Hermes:
         else:
             self._avisar("show" if nova else "update", n)
         return n.id
+
+    def armar(self, id_):
+        """A held card is on screen now: its timeout starts counting from here."""
+        n = self.ativas.get(id_)
+        if n is not None and n.pendente:
+            n.pendente = False
+            self.timers[id_] = self.agendar(n.timeout, lambda: self.fechar(id_, EXPIROU))
+
+    def historico_mako(self):
+        """History in makoctl's JSON shape (newest first), so old callers keep working."""
+        saida = []
+        for x in reversed(self.historico):
+            saida.append({"id": x["id"], "app_name": x["app"], "app_icon": x["icon"] or None,
+                          "category": x["category"] or None, "desktop_entry": x["desktop_entry"] or None,
+                          "summary": x["summary"], "body": x["body"], "urgency": x["urgency"],
+                          "actions": {k: t for k, t in x["actions"]}})
+        return saida
+
+    def recarregar(self, config=None):
+        self.config = config or ler_config()
+        self.historico = deque(self.historico, maxlen=max(1, self.config["history"]["size"]))
+        self._avisar("config", None)
 
     def _guardar(self, n):
         self.historico = deque((x for x in self.historico if x["id"] != n.id), maxlen=self.historico.maxlen)
@@ -507,6 +543,11 @@ class Hermes:
 
     def modo(self, nome, ligado):
         (self.modos.add if ligado else self.modos.discard)(nome)
+        self._avisar("modes", None)
+
+    def definir_modos(self, modos):
+        self.modos = {m for m in modos if isinstance(m, str) and re.match(r"^[\w-]{1,32}$", m)}
+        self._avisar("modes", None)
 
     # --- D-Bus ---
 
@@ -518,14 +559,52 @@ class Hermes:
         except GLib.Error:
             pass
 
-    def publicar(self, conexao, ao_perder=None):
-        """Registers the object and asks for the name. Returns the owner id."""
+    def publicar(self, conexao, ao_ganhar=None, ao_perder=None):
+        """Registers the object and asks for org.freedesktop.Notifications (fails quietly if another
+        daemon, like mako, has it). Only once it is ours, com.aero.Hermes is taken too: that second
+        name is how hermesctl knows Hermes is the one in charge."""
         self.conexao = conexao
         no = Gio.DBusNodeInfo.new_for_xml(XML)
-        self.registro = conexao.register_object(CAMINHO, no.interfaces[0], self._chamada, None, None)
+        self.registro = conexao.register_object(CAMINHO, no.lookup_interface(NOME), self._chamada, None, None)
+        self.registro_ctl = conexao.register_object(CAMINHO, no.lookup_interface("com.aero.Hermes"),
+                                                    self._controle, None, None)
+
+        def ganhou(*_):
+            self.dono_ctl = Gio.bus_own_name_on_connection(conexao, "com.aero.Hermes",
+                                                           Gio.BusNameOwnerFlags.NONE, None, None)
+            if ao_ganhar:
+                ao_ganhar()
+
+        def perdeu(*_):
+            if ao_perder:
+                ao_perder()
+        self.dono_ctl = None
         self.dono = Gio.bus_own_name_on_connection(conexao, NOME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
-                                                   None, ao_perder)
+                                                   ganhou, perdeu)
         return self.dono
+
+    def _controle(self, conexao, remetente, _caminho, _iface, metodo, params, invocacao):
+        """hermesctl. Only processes of THIS user reach the session bus, but changing modes/settings
+        or clearing is still limited to the same uid as the daemon."""
+        try:
+            if metodo == "History":
+                invocacao.return_value(GLib.Variant("(s)", (json.dumps(self.historico_mako()),)))
+            elif metodo == "Modes":
+                invocacao.return_value(GLib.Variant("(as)", (sorted(self.modos),)))
+            elif metodo == "SetModes":
+                (modos,) = params.unpack()
+                self.definir_modos(modos[:20])
+                invocacao.return_value(None)
+            elif metodo == "DismissAll":
+                self.dispensar_tudo()
+                invocacao.return_value(None)
+            elif metodo == "Reload":
+                self.recarregar()
+                invocacao.return_value(None)
+            else:
+                invocacao.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", metodo)
+        except Exception as erro:  # noqa: BLE001
+            invocacao.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(erro)[:200])
 
     def _chamada(self, _con, remetente, _caminho, _iface, metodo, params, invocacao):
         try:

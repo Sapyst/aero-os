@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# hermesctl — controls Hermes (the notification daemon), with the same words as makoctl:
+#   hermesctl mode                     prints the active modes (one per line)
+#   hermesctl mode -a dnd | -r dnd     adds / removes a mode (several -a/-r allowed)
+#   hermesctl mode -s claro            sets exactly these modes
+#   hermesctl history [-j]             the history as JSON (newest first)
+#   hermesctl dismiss [--all|-a]       closes every card on screen
+#   hermesctl reload                   reads ~/.config/aero/hermes.json again
+# If Hermes is not the one running (mako is), the same command goes to makoctl, so scripts work either way.
+set -uo pipefail
+DEST=com.aero.Hermes OBJ=/org/freedesktop/Notifications IF=com.aero.Hermes
+if ! busctl --user status "$DEST" >/dev/null 2>&1; then
+    command -v makoctl >/dev/null && exec makoctl "$@"
+    echo "hermesctl: no notification daemon is running" >&2; exit 1
+fi
+chamar() { busctl --user call "$DEST" "$OBJ" "$IF" "$@"; }
+modos() { chamar Modes | python3 -c 'import sys,shlex; p=shlex.split(sys.stdin.read()); print("\n".join(p[2:]))'; }
+case "${1:-}" in
+  mode)
+    shift
+    [ $# -eq 0 ] && { modos; exit 0; }
+    mapfile -t atuais < <(modos)
+    declare -A conj=(); for m in "${atuais[@]}"; do [ -n "$m" ] && conj[$m]=1; done
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -a) [ $# -ge 2 ] || exit 2; conj[$2]=1; shift 2 ;;
+        -r) [ $# -ge 2 ] || exit 2; unset "conj[$2]"; shift 2 ;;
+        -s) shift; conj=(); while [ $# -gt 0 ] && [[ $1 != -* ]]; do conj[$1]=1; shift; done ;;
+        *) echo "hermesctl: unknown mode option $1" >&2; exit 2 ;;
+      esac
+    done
+    lista=("${!conj[@]}")
+    chamar SetModes as "${#lista[@]}" "${lista[@]}" >/dev/null
+    modos ;;
+  history)
+    chamar History | python3 -c 'import sys,shlex,json; s=shlex.split(sys.stdin.read())[1]; print(json.dumps(json.loads(s), indent=2, ensure_ascii=False))' ;;
+  dismiss) chamar DismissAll >/dev/null ;;
+  reload) chamar Reload >/dev/null ;;
+  *) sed -n 2,9p "$0"; exit 2 ;;
+esac

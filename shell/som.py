@@ -396,6 +396,40 @@ class Janelinha(Gtk.Window):
         self.fechar()
 
 
+# ---------- notificações: Hermes (dentro deste processo) ou, se ele não estiver no comando, o mako ----------
+# Nada de chamar o hermesctl daqui: o Hermes mora NESTE processo e a chamada esperaria por ela mesma.
+HERMES = None          # o serviço (hermes.Hermes) quando é ele que recebe as notificações
+
+
+def notif_historico():
+    import json
+    if HERMES is not None:
+        return HERMES.historico_mako()
+    try:
+        return json.loads(rodar("makoctl", "history", "-j") or "[]")
+    except ValueError:
+        return []
+
+
+def notif_modos():
+    return set(HERMES.modos) if HERMES is not None else set(rodar("makoctl", "mode").split())
+
+
+def notif_modo(nome, ligado):
+    """Pode ser chamada de uma thread: a mudança no Hermes acontece na thread da tela."""
+    if HERMES is not None:
+        GLib.idle_add(lambda: (HERMES.modo(nome, ligado), False)[1])
+    else:
+        rodar("makoctl", "mode", "-a" if ligado else "-r", nome)
+
+
+def notif_dispensar():
+    if HERMES is not None:
+        GLib.idle_add(lambda: (HERMES.dispensar_tudo(), False)[1])
+    else:
+        notif_dispensar()
+
+
 class CentralNotificacoes(Janelinha):
     """O sininho da barra (doc 25): últimas notificações (histórico do mako), "Não perturbe" e
     "Clear all". O mako não tem comando pra apagar o histórico, então "Clear all" anota o número da
@@ -418,10 +452,7 @@ class CentralNotificacoes(Janelinha):
         import re
         while (filho := self.cartao.get_first_child()) is not None:
             self.cartao.remove(filho)
-        try:
-            historico = json.loads(rodar("makoctl", "history", "-j") or "[]")
-        except ValueError:
-            historico = []
+        historico = notif_historico()
         corte = self.limpas_ate()
         itens = [n for n in historico if n.get("id", 0) > corte]
 
@@ -438,7 +469,7 @@ class CentralNotificacoes(Janelinha):
         dnd = Gtk.Box(spacing=8, margin_start=4, margin_end=4, margin_bottom=4)
         dnd.append(Gtk.Image(icon_name="notifications-disabled-symbolic"))
         dnd.append(Gtk.Label(label="Do not disturb", xalign=0, hexpand=True))
-        chave = Gtk.Switch(active="dnd" in rodar("makoctl", "mode").split(), valign=Gtk.Align.CENTER)
+        chave = Gtk.Switch(active="dnd" in notif_modos(), valign=Gtk.Align.CENTER)
         chave.connect("notify::active", lambda c, _p: self.nao_perturbe(c.get_active()))
         dnd.append(chave)
         self.cartao.append(dnd)
@@ -495,7 +526,7 @@ class CentralNotificacoes(Janelinha):
         self.montar()
 
     def nao_perturbe(self, ligar):
-        rodar("makoctl", "mode", "-a" if ligar else "-r", "dnd")
+        notif_modo("dnd", ligar)
         rodar("pkill", "-RTMIN+10", "-x", "waybar")     # a barra troca o sininho na hora
 
 
@@ -1365,7 +1396,7 @@ class CentralRapida(Janelinha):
         ~0,7 s uma atrás da outra. Roda em segundo plano; a tela não espera por ela."""
         from concurrent.futures import ThreadPoolExecutor
         tarefas = {"player": self.player, "wifi": self.wifi, "bluetooth": self.bluetooth,
-                   "modos": lambda: rodar("makoctl", "mode").split(), "filtro": self.filtro_ligado,
+                   "modos": lambda: sorted(notif_modos()), "filtro": self.filtro_ligado,
                    "tema": lambda: rodar("cat", os.path.expanduser("~/.cache/hypr-tema/tema")).strip(),
                    "sinks": lambda: listar("sinks"), "sources": lambda: listar("sources"),
                    "brilho": self.ler_brilho}
@@ -1491,7 +1522,7 @@ class CentralRapida(Janelinha):
                               # clique liga/desliga; a setinha ">" abre a lista (e já procura aparelhos)
                               lambda: rodar("bluetoothctl", "power", "off" if bt_on else "on"), "sub:bt"),
             self.botao_grande("notifications-disabled-symbolic", "Do not disturb", "On" if dnd else "Off", dnd,
-                              lambda: (rodar("makoctl", "mode", "-r" if dnd else "-a", "dnd"),
+                              lambda: (notif_modo("dnd", not dnd),
                                        rodar("pkill", "-RTMIN+10", "-x", "waybar"))),
             self.botao_grande("night-light-symbolic", "Night light", "On" if filtro else "Off", filtro,
                               lambda: self.alternar_filtro(not filtro), "sub:noite"),
@@ -1845,6 +1876,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         self.menu_janela = MenuJanela()
         self.central_rapida = CentralRapida()
         self.osd = Osd()
+        self.iniciar_hermes()
         self.hold()
         # Ações no D-Bus: o lançador chama com gdbus, sem iniciar outro Python
         for nome, funcao in (("popup", lambda p: self.janelinha.abrir(p == "completo")),
@@ -1858,6 +1890,28 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
             acao.connect("activate", lambda _a, valor, f=funcao: f(valor.get_string()))
             self.add_action(acao)
         threading.Thread(target=self.vigiar, daemon=True).start()
+
+    def iniciar_hermes(self):
+        """Hermes (doc: shell/hermes.py) recebe as notificações se o nome estiver livre. Com o mako
+        rodando, o nome é dele e o Hermes fica quieto (sem janelas, sem custo)."""
+        try:
+            import hermes
+            import hermes_ui
+        except Exception as erro:  # noqa: BLE001 — sem Hermes a central continua igual
+            print(f"hermes: not loaded: {erro!r}", flush=True)
+            return
+        servico = hermes.Hermes()
+
+        def ganhou():
+            global HERMES
+            HERMES = servico
+            self.hermes_ui = hermes_ui.HermesUI(servico)
+            servico.ouvir(lambda ev, _n: ev == "modes" and rodar("pkill", "-RTMIN+10", "-x", "waybar"))
+            print("hermes: in charge of notifications", flush=True)
+
+        def perdeu():
+            print("hermes: another notification daemon has the name (mako?); staying idle", flush=True)
+        servico.publicar(Gio.bus_get_sync(Gio.BusType.SESSION), ganhou, perdeu)
 
     def vigiar(self):
         """pactl subscribe: uma linha por mudança ("Event 'change' on sink #52")."""
