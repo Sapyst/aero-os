@@ -511,7 +511,7 @@ class Barra(Gtk.Window):
         som = os.path.join(BIN, "som")
         self.esquerda = [Workspaces(self, "workspaces"),
                          Minimizados(self, "min", {1: f"{BIN}/hypr-minimizados"}, "Minimized windows")]
-        self.centro = [Relogio(self, "clock", {1: f"{som} notificacoes abrir"})]
+        self.centro = [Relogio(self, "clock", {1: lambda: self.calendario.alternar(self.centro[0])})]
         self.direita = [
             Idioma(self, "lang", {1: "hyprctl switchxkblayout all next"}, "Keyboard layout"),
             Volume(self, "vol", {1: f"{som} popup simples", 3: f"{som} popup completo",
@@ -545,6 +545,8 @@ class Barra(Gtk.Window):
         self.area.add_controller(mov)
 
         self.gota = Gota()
+        self.calendario = Calendario()
+        self._sino_escrito = None
         self.iniciar_fontes()
         self.present()
 
@@ -556,6 +558,31 @@ class Barra(Gtk.Window):
             sup.set_input_region(cairo.Region(cairo.RectangleInt(0, 0, int(largura), ALTURA)))
 
     # ---------- layout / drawing ----------
+
+    def anotar_sino(self, w):
+        """Tells Hermes exactly where the bell is (its wave and cards start there):
+        ~/.cache/aero-shell/sino.json, rewritten only when the bell moves."""
+        sino = next((m for m in self.direita if m.nome == "bell"), None)
+        if sino is None or sino.w <= 0:
+            return
+        ponto = (round(LADO + sino.x + sino.w / 2), round(TOPO + ALTURA / 2))
+        if ponto == self._sino_escrito:
+            return
+        self._sino_escrito = ponto
+        tela_w, tela_h = w + 2 * LADO, 1440
+        try:
+            mon = Gdk.Display.get_default().get_monitor_at_surface(self.get_surface())
+            g = mon.get_geometry()
+            tela_w, tela_h = g.width, g.height
+        except (AttributeError, TypeError):
+            pass
+        caminho = os.path.join(H, ".cache/aero-shell/sino.json")
+        try:
+            with open(caminho + ".tmp", "w") as f:
+                json.dump({"x": ponto[0], "y": ponto[1], "w": tela_w, "h": tela_h, "fonte": "aerobar"}, f)
+            os.replace(caminho + ".tmp", caminho)
+        except OSError:
+            pass
 
     def visiveis(self, lista):
         return [m for m in lista if m.nome not in CFG["hide"]]
@@ -579,6 +606,7 @@ class Barra(Gtk.Window):
         for m in dir_:
             m.x, m.w = x, m.largura(cr)
             x += m.w
+        self.anotar_sino(w)
 
     def desenhar(self, _area, cr, w, h):
         h = ALTURA                                            # below it is only room for the glow
@@ -987,6 +1015,160 @@ class Barra(Gtk.Window):
         if n != self.n_bandeja:
             self.n_bandeja = n
             self.redesenhar()
+
+
+class Calendario(Gtk.Window):
+    """A month in dots under the clock: today is a lit dot with a red ring, weekends dimmer, the other
+    days small dots with their number in Doto. Scroll or the arrows change month; a click outside closes.
+    It opens like the cards: the grid pops in from the top, day by day."""
+
+    COL, LIN = 7, 6
+    PASSO, TOPO_GRADE = 46, 74
+
+    def __init__(self):
+        super().__init__(decorated=False)
+        Camada.init_for_window(self)
+        Camada.set_layer(self, Camada.Layer.OVERLAY)
+        Camada.set_namespace(self, "aerobar-calendario")
+        Camada.set_anchor(self, Camada.Edge.TOP, True)
+        Camada.set_keyboard_mode(self, Camada.KeyboardMode.ON_DEMAND)
+        self.add_css_class("aerobar-gota")
+        self.largura = self.COL * self.PASSO + 36
+        self.altura = self.TOPO_GRADE + self.LIN * self.PASSO + 20
+        self.area = Gtk.DrawingArea(content_width=self.largura, content_height=self.altura)
+        self.area.set_draw_func(self.desenhar)
+        self.set_child(self.area)
+        hoje = time.localtime()
+        self.ano, self.mes = hoje.tm_year, hoje.tm_mon
+        self.t0, self.saindo, self.tique = 0.0, False, None
+        clique = Gtk.GestureClick()
+        clique.connect("released", self._clique)
+        self.area.add_controller(clique)
+        rolar = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        rolar.connect("scroll", lambda _c, _dx, dy: (self.mudar_mes(1 if dy > 0 else -1), True)[1])
+        self.area.add_controller(rolar)
+        teclas = Gtk.EventControllerKey()
+        teclas.connect("key-pressed", self._tecla)
+        self.add_controller(teclas)
+        foco = Gtk.EventControllerFocus()
+        foco.connect("leave", lambda *_: self.esconder())
+        self.add_controller(foco)
+
+    def alternar(self, modulo):
+        if self.get_visible() and not self.saindo:
+            self.esconder()
+            return
+        hoje = time.localtime()
+        self.ano, self.mes = hoje.tm_year, hoje.tm_mon
+        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA + 6)
+        self.t0, self.saindo = time.monotonic(), False
+        self.set_visible(True)
+        self.present()
+        self.animar()
+
+    def esconder(self):
+        if self.get_visible() and not self.saindo:
+            self.saindo, self.t0 = True, time.monotonic()
+            self.animar()
+
+    def mudar_mes(self, d):
+        self.mes += d
+        if self.mes > 12:
+            self.mes, self.ano = 1, self.ano + 1
+        elif self.mes < 1:
+            self.mes, self.ano = 12, self.ano - 1
+        self.t0 = time.monotonic() - 0.15                  # the new month pops in quickly
+        self.animar()
+
+    def animar(self):
+        if self.tique is None:
+            self.tique = self.area.add_tick_callback(self._quadro)
+
+    def _quadro(self, *_):
+        e = time.monotonic() - self.t0
+        self.area.queue_draw()
+        if self.saindo and e > 0.3:
+            self.tique = None
+            self.set_visible(False)
+            return GLib.SOURCE_REMOVE
+        if not self.saindo and e > 0.9:
+            self.tique = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _tecla(self, _c, tecla, _cod, _mods):
+        if tecla == Gdk.KEY_Escape:
+            self.esconder()
+        elif tecla in (Gdk.KEY_Left, Gdk.KEY_Up, Gdk.KEY_Page_Up):
+            self.mudar_mes(-1)
+        elif tecla in (Gdk.KEY_Right, Gdk.KEY_Down, Gdk.KEY_Page_Down):
+            self.mudar_mes(1)
+        return True
+
+    def _clique(self, _g, _n, x, y):
+        if y < 50:
+            if x < 60:
+                self.mudar_mes(-1)
+            elif x > self.largura - 60:
+                self.mudar_mes(1)
+
+    def desenhar(self, _a, cr, w, h):
+        import calendar
+        e = time.monotonic() - self.t0
+        if self.saindo:
+            geral = max(0.0, 1 - e / 0.3)
+        else:
+            geral = min(1.0, e / 0.2)
+        r = 22
+        cr.new_sub_path()
+        for (ax, ay, a0) in ((w - r, r, -math.pi / 2), (w - r, h - r, 0), (r, h - r, math.pi / 2), (r, r, math.pi)):
+            cr.arc(ax, ay, r, a0, a0 + math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(0.043, 0.043, 0.047, 0.93 * geral)
+        cr.fill()
+        # month title and arrows
+        titulo = time.strftime("%B %Y", (self.ano, self.mes, 1, 0, 0, 0, 0, 1, -1)).upper()
+        texto(cr, None, "<", 22, 30, "Doto Black 16", ESCURA["DIM"], geral)
+        tw = texto(cr, None, titulo, 0, 0, "Doto Black 17", ESCURA["FG"], medir=True)
+        texto(cr, None, titulo, w / 2 - tw / 2, 30, "Doto Black 17", ESCURA["FG"], geral)
+        texto(cr, None, ">", w - 34, 30, "Doto Black 16", ESCURA["DIM"], geral)
+        for i, nome in enumerate(("MO", "TU", "WE", "TH", "FR", "SA", "SU")):
+            nw = texto(cr, None, nome, 0, 0, "Geist Mono 9", ESCURA["DIM"], medir=True)
+            texto(cr, None, nome, 18 + i * self.PASSO + self.PASSO / 2 - nw / 2, 58, "Geist Mono 9",
+                  ESCURA["DIM"], geral * (0.6 if i >= 5 else 1.0))
+        hoje = time.localtime()
+        semanas = calendar.Calendar(0).monthdayscalendar(self.ano, self.mes)
+        for j, semana in enumerate(semanas):
+            for i, dia in enumerate(semana):
+                if not dia:
+                    continue
+                cx = 18 + i * self.PASSO + self.PASSO / 2
+                cy = self.TOPO_GRADE + j * self.PASSO + self.PASSO / 2
+                atraso = (j * 7 + i) * 0.012
+                k = 1.0 if self.saindo else min(1.0, max(0.0, (e - atraso) / 0.22))
+                k = 1 - (1 - k) ** 3
+                if k <= 0:
+                    continue
+                eh_hoje = (self.ano, self.mes, dia) == (hoje.tm_year, hoje.tm_mon, hoje.tm_mday)
+                fim_semana = i >= 5
+                if eh_hoje:
+                    halo(cr, cx, cy, 30, ESCURA["RED"], 0.5 * geral)
+                    cr.set_source_rgba(*ESCURA["FG"], geral)
+                    cr.arc(cx, cy, 17 * k, 0, 2 * math.pi)
+                    cr.fill()
+                    cr.set_source_rgba(*ESCURA["RED"], geral)
+                    cr.set_line_width(2)
+                    cr.arc(cx, cy, 20 * k, 0, 2 * math.pi)
+                    cr.stroke()
+                    cor_num, a_num = (0.05, 0.05, 0.06), 1.0
+                else:
+                    cr.set_source_rgba(*ESCURA["FG"], 0.07 * geral * k)
+                    cr.arc(cx, cy, 17 * k, 0, 2 * math.pi)
+                    cr.fill()
+                    cor_num, a_num = ESCURA["FG"], 0.55 if fim_semana else 0.9
+                num = str(dia)
+                nw = texto(cr, None, num, 0, 0, "Doto Black 15", cor_num, medir=True)
+                texto(cr, None, num, cx - nw / 2, cy - 4 * (1 - k), "Doto Black 15", cor_num, a_num * geral * k)
 
 
 class Gota(Gtk.Window):

@@ -45,7 +45,7 @@ AEROS_WALL = os.path.join(H, "Pictures/Wallpapers/aeros-glass.png")
 
 # o DotStyle na primeira vez: parte do AeroTerm (ícones, dock...) e troca só o que é dele
 DOTSTYLE = {"TEMA_MODO": "escuro", "COR_ESCURA": "0b0b0c", "COR_ALFA": "0.86", "COR_SINC": "1", "WALL_CORES": "0",
-            "COR_DESTAQUE": "ecebe8", "TRANS_EFFECT": "dots", "TRANS_TINT": "none", "ESMAECER": "0.0", "ANIM": "1",
+            "COR_DESTAQUE": "ecebe8", "ICONES_ASCII": "0", "TRANS_EFFECT": "dots", "TRANS_TINT": "none", "ESMAECER": "0.0", "ANIM": "1",
             "ANIM_VEL": "normal"}
 DOTSTYLE_WALL = os.path.join(H, "Pictures/Wallpapers/dotstyle-venus.png")
 

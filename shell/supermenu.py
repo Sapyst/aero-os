@@ -26,14 +26,15 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import GdkPixbuf  # noqa: E402
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import apps  # noqa: E402
 import clima  # noqa: E402
 
-LARGURA, ALTURA = 1040, 760     # tamanho do painel
-ALTURA_FAIXA = 140              # a faixa com o papel de parede, no topo (doc 36)
+LARGURA, ALTURA = 1080, 700     # tamanho do painel
+LARGURA_CAIXA = 380             # a CAIXA DA IMAGEM à esquerda (wallpaper + busca + clima + seções)
 PASTA_FAIXA = os.path.expanduser("~/.cache/aero-shell/menu-faixa")   # cópias pequenas da imagem
 # A imagem da faixa: a mesma do desktop (padrão) ou uma só do menu (Settings → Wallpapers, doc 37)
 IMAGEM_PROPRIA = os.path.expanduser("~/.local/share/aero-shell/fundos/menu")
@@ -41,36 +42,42 @@ FIXADOS_PADRAO = ["com.anthropic.Claude.desktop", "firefox.desktop", "com.aero.S
                   "kitty.desktop", "thunar.desktop", "steam.desktop"]
 
 CSS = """
-/* O Super Menu é uma CAMADA (não uma janela/app, doc 33): a janela é transparente e o cartão tem a
-   cor do tema, cantos de 22 px e contorno fino por dentro. Nada de desfoque/sombra grande em camada:
-   viraria um quadrado em volta dos cantos (doc 26). */
+/* O Super Menu é uma CAMADA (não uma janela/app, doc 33): janela transparente, cartão com a cor do tema.
+   Layout (13/10, ideia do menu do binnewbs/arch-hyprland, escrito do zero aqui): à esquerda uma CAIXA
+   DA IMAGEM grande (o wallpaper) com a busca em cima, o clima animado e as seções embaixo; à direita as
+   categorias em "chips", os apps e o rodapé. Nada de desfoque/sombra grande em camada (doc 26). */
 window.supermenu { background: transparent; backdrop-filter: none; }
-/* O fundo do cartão fica SÓ embaixo da faixa (no .corpo). Se ficasse atrás da faixa também, a borda
-   suavizada (antialias) da curva da imagem deixava o fundo escuro vazar: uma linha fininha na curva. */
-.conteudo { background: none; border-radius: 22px; }
-.corpo { padding: 16px; background-color: var(--popover-bg-color, @popover_bg_color);
-         border-radius: 0 0 22px 22px; border: 1px solid alpha(currentColor, 0.10); border-top-width: 0; }
-/* Faixa do topo (doc 36): o papel de parede atual, com os MESMOS cantos de 22 px do cartão em cima.
-   O degradê escuro embaixo garante que o texto branco sempre dá pra ler, em qualquer wallpaper. */
-/* A imagem e os degradês são desenhados em código (desenhar_faixa), com a curva recortada lá. */
-.faixa { border-radius: 22px 22px 0 0; }
-.faixa .temp, .faixa .condicao, .faixa .detalhes { text-shadow: 0 1px 3px rgba(0,0,0,0.55); }
-.faixa .temp { color: white; font-size: 40px; font-weight: 300; }
-.faixa .condicao { color: white; font-size: 16px; font-weight: 700; }
-.faixa .detalhes { color: rgba(255,255,255,0.90); font-size: 13px; }
-.conteudo searchentry { min-height: 40px; border-radius: 12px; font-size: 15px; }
-.lateral { background: transparent; }
-.lateral row { border-radius: 10px; padding: 6px 10px; }
-.lateral row:selected { background: alpha(currentColor, 0.12); }
-.rotulo-lateral { font-size: 11px; font-weight: 700; opacity: 0.55; margin: 12px 10px 4px 10px; }
-flowboxchild.cartao { padding: 10px 12px; border-radius: 12px; background: alpha(currentColor, 0.045); }
-flowboxchild.cartao:selected { background: @accent_bg_color; color: @accent_fg_color; }
+.conteudo { padding: 12px; background-color: var(--popover-bg-color, @popover_bg_color); border-radius: 24px;
+            border: 1px solid alpha(currentColor, 0.10); }
+.caixa-imagem searchentry { min-height: 42px; border-radius: 14px; font-size: 15px;
+                            background: alpha(black, 0.38); color: white; border: 1px solid alpha(white, 0.22); }
+.caixa-imagem searchentry text { color: white; }
+.caixa-imagem searchentry image { color: alpha(white, 0.8); }
+.caixa-imagem .temp, .caixa-imagem .condicao, .caixa-imagem .detalhes, .caixa-imagem .dia-sem,
+.caixa-imagem .dia-temp { color: white; text-shadow: 0 1px 4px rgba(0,0,0,0.55); }
+.caixa-imagem .temp { font-size: 54px; font-weight: 200; }
+.caixa-imagem .condicao { font-size: 17px; font-weight: 700; }
+.caixa-imagem .detalhes { font-size: 12.5px; opacity: 0.92; }
+.caixa-imagem .dia-sem { font-size: 11px; font-weight: 700; opacity: 0.85; }
+.caixa-imagem .dia-temp { font-size: 11.5px; }
+.previsao { background: alpha(black, 0.28); border-radius: 14px; padding: 8px 6px; border: 1px solid alpha(white, 0.12); }
+.modo { padding: 9px 10px; border-radius: 12px; background: alpha(black, 0.32); color: white; font-weight: 600;
+        border: 1px solid alpha(white, 0.14); }
+.modo:checked { background: var(--accent-bg-color); color: var(--accent-fg-color); border-color: transparent; }
+.modo:hover { background: alpha(black, 0.45); }
+.modo:checked:hover { background: var(--accent-bg-color); }
+.lado { padding: 6px 6px 0 18px; }
+.chip { padding: 6px 12px; border-radius: 99px; background: alpha(currentColor, 0.06); font-size: 13px; }
+.chip:checked { background: alpha(var(--accent-bg-color), 0.22); font-weight: 600; }
+flowboxchild.cartao { padding: 10px 12px; border-radius: 14px; background: alpha(currentColor, 0.045); }
+flowboxchild.cartao:selected { background: var(--accent-bg-color); color: var(--accent-fg-color); }
 .cartao .nome { font-weight: 600; }
 .cartao .descricao { font-size: 12px; opacity: 0.7; }
 flowboxchild.cartao:selected .descricao { opacity: 0.9; }
-.titulo-secao { font-size: 18px; font-weight: 700; }
-.rodape { padding-top: 8px; border-top: 1px solid alpha(currentColor, 0.10); }
+.titulo-secao { font-size: 22px; font-weight: 700; }
+.rodape { padding-top: 10px; border-top: 1px solid alpha(currentColor, 0.10); }
 """
+
 
 # Itens da coluna da esquerda: (chave, nome, ícone). Chaves de categoria vêm de apps.CATEGORIAS.
 SECOES = [("fixados", "Pinned", "view-pin-symbolic"),
@@ -113,47 +120,68 @@ class SuperMenu(Gtk.ApplicationWindow):
     # ---------- conteúdo ----------
 
     def montar_faixa(self):
-        """A faixa do topo: papel de parede (cortado pra caber) + degradê + "Good evening, nome"."""
-        faixa = Gtk.Overlay(height_request=ALTURA_FAIXA)
-        faixa.add_css_class("faixa")
-        # A imagem e o degradê são DESENHADOS aqui (cairo), com a curva de 22 px recortada no próprio
-        # desenho. Com fundo CSS, o renderizador do GTK deixava o canto de cima à esquerda reto na tela
-        # real (doc 37). DrawingArea não impõe tamanho: obedece aos 140 px.
+        """A CAIXA DA IMAGEM (esquerda): o wallpaper inteiro na altura do menu e, por cima, a busca,
+        o clima de agora (ícone ANIMADO), a previsão dos próximos dias e os botões de seção."""
+        faixa = Gtk.Overlay(width_request=LARGURA_CAIXA, vexpand=True)
+        faixa.add_css_class("caixa-imagem")
         self.pixbuf_faixa = None
-        self.imagem_faixa = Gtk.DrawingArea(hexpand=True)      # sem vexpand: senão a faixa cresce além dos 140 px
+        self.imagem_faixa = Gtk.DrawingArea(vexpand=True)
         self.imagem_faixa.set_draw_func(self.desenhar_faixa)
         faixa.set_child(self.imagem_faixa)
-        # O clima de agora (doc 37): desenho + temperatura + condição + detalhes
+        camada = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_top=16, margin_bottom=16,
+                         margin_start=16, margin_end=16)
+        self.busca = Gtk.SearchEntry(placeholder_text="Search apps")
+        self.busca.connect("search-changed", lambda *_: self.mostrar())
+        self.busca.connect("activate", lambda *_: self.abrir_selecionado())
+        camada.append(self.busca)
+        camada.append(Gtk.Box(vexpand=True))                    # empurra o clima pra parte de baixo
+        # clima de agora: ícone animado (ícones da amCharts via Caule pack, svg_animado.py) + textos
         self.clima = None
-        linha = Gtk.Box(spacing=14, valign=Gtk.Align.END, halign=Gtk.Align.START,
-                        margin_start=22, margin_bottom=14)
-        self.desenho_clima = Gtk.DrawingArea(content_width=76, content_height=76, valign=Gtk.Align.CENTER)
+        self.linha_clima = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        topo = Gtk.Box(spacing=10)
+        self.desenho_clima = Gtk.DrawingArea(content_width=92, content_height=92, valign=Gtk.Align.CENTER)
         self.desenho_clima.set_draw_func(self.desenhar_clima)
-        linha.append(self.desenho_clima)
+        topo.append(self.desenho_clima)
         self.temp = Gtk.Label(xalign=0, valign=Gtk.Align.CENTER)
         self.temp.add_css_class("temp")
-        linha.append(self.temp)
-        textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, spacing=2)
+        topo.append(self.temp)
+        self.linha_clima.append(topo)
         self.condicao = Gtk.Label(xalign=0)
         self.condicao.add_css_class("condicao")
-        self.detalhes = Gtk.Label(xalign=0)
+        self.detalhes = Gtk.Label(xalign=0, wrap=True)
         self.detalhes.add_css_class("detalhes")
-        textos.append(self.condicao)
-        textos.append(self.detalhes)
-        linha.append(textos)
-        self.linha_clima = linha
-        faixa.add_overlay(linha)
+        self.linha_clima.append(self.condicao)
+        self.linha_clima.append(self.detalhes)
+        self.previsao = Gtk.Box(homogeneous=True, spacing=2, margin_top=8)
+        self.previsao.add_css_class("previsao")
+        self.linha_clima.append(self.previsao)
+        camada.append(self.linha_clima)
+        # seções (como os "modos" do rofi): Pinned / Recent / All apps
+        modos = Gtk.Box(spacing=8, homogeneous=True)
+        self.botoes_secao = {}
+        grupo = None
+        for chave, nome, icone in SECOES:
+            b = Gtk.ToggleButton(group=grupo)
+            grupo = grupo or b
+            b.set_child(Adw.ButtonContent(label=nome, icon_name=icone))
+            b.add_css_class("modo")
+            b.connect("toggled", lambda bt, c=chave: bt.get_active() and self.escolher_secao(c))
+            modos.append(b)
+            self.botoes_secao[chave] = b
+        camada.append(modos)
+        faixa.add_overlay(camada)
+        self.animando = None
         return faixa
 
     def desenhar_faixa(self, _area, cr, w, h):
         """Imagem "cover" (preenche cortando as sobras) + degradês, tudo dentro do contorno arredondado."""
         import cairo
-        r = 22
-        cr.new_sub_path()                                  # contorno: cantos de cima redondos, de baixo retos
+        r = 18
+        cr.new_sub_path()                                  # caixa com os 4 cantos redondos
         cr.arc(r, r, r, math.pi, 1.5 * math.pi)
         cr.arc(w - r, r, r, 1.5 * math.pi, 2 * math.pi)
-        cr.line_to(w, h)
-        cr.line_to(0, h)
+        cr.arc(w - r, h - r, r, 0, 0.5 * math.pi)
+        cr.arc(r, h - r, r, 0.5 * math.pi, math.pi)
         cr.close_path()
         cr.clip()
         pb = self.pixbuf_faixa
@@ -170,9 +198,9 @@ class SuperMenu(Gtk.ApplicationWindow):
         else:
             cr.set_source_rgba(0.5, 0.5, 0.5, 0.25)
             cr.paint()
-        # degradês escuros: da esquerda (onde fica o clima) e de baixo — leitura em qualquer imagem
-        for x0, y0, x1, y1, paradas in ((0, 0, w, 0, ((0, 0.50), (0.55, 0.10), (0.75, 0))),
-                                        (0, h, 0, 0, ((0, 0.55), (0.65, 0.12), (1, 0)))):
+        # degradês escuros em cima (busca) e embaixo (clima e seções) — leitura em qualquer imagem
+        for x0, y0, x1, y1, paradas in ((0, 0, 0, h, ((0, 0.35), (0.18, 0.05), (0.3, 0))),
+                                        (0, h, 0, 0, ((0, 0.72), (0.45, 0.30), (0.75, 0)))):
             g = cairo.LinearGradient(x0, y0, x1, y1)
             for pos, a in paradas:
                 g.add_color_stop_rgba(pos, 0, 0, 0, a)
@@ -181,7 +209,47 @@ class SuperMenu(Gtk.ApplicationWindow):
 
     def desenhar_clima(self, _area, cr, largura, altura):
         if self.clima:
-            clima.desenhar(cr, min(largura, altura), self.clima.get("desenho", "nublado"), self.clima.get("dia", True))
+            import time
+            import svg_animado
+            try:
+                svg_animado.icone_clima(self.clima.get("desenho", "nublado"), self.clima.get("dia", True)).desenhar(
+                    cr, 0, 0, min(largura, altura), time.monotonic())
+            except Exception:  # noqa: BLE001 — sem o SVG: o desenho de sempre
+                clima.desenhar(cr, min(largura, altura), self.clima.get("desenho", "nublado"), self.clima.get("dia", True))
+
+    def animar_clima(self, ligar):
+        """O ícone se mexe só com o menu aberto (20 quadros/s); fechado não gasta nada."""
+        if ligar and self.animando is None:
+            self.animando = GLib.timeout_add(50, lambda: (self.desenho_clima.queue_draw(), True)[1])
+        elif not ligar and self.animando is not None:
+            GLib.source_remove(self.animando)
+            self.animando = None
+
+    def mostrar_previsao(self, dias):
+        filho = self.previsao.get_first_child()
+        while filho:
+            prox = filho.get_next_sibling()
+            self.previsao.remove(filho)
+            filho = prox
+        import datetime
+        for d in (dias or [])[1:6]:
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            col.append(Gtk.Label(label=datetime.date.fromisoformat(d["data"]).strftime("%a"), css_classes=["dia-sem"]))
+            area = Gtk.DrawingArea(content_width=30, content_height=30, halign=Gtk.Align.CENTER)
+            area.set_draw_func(lambda _a, cr, w, h, dd=d: self.icone_pequeno(cr, min(w, h), dd))
+            col.append(area)
+            col.append(Gtk.Label(label=f"{d['max']}° {d['min']}°", css_classes=["dia-temp"]))
+            self.previsao.append(col)
+        self.previsao.set_visible(bool(dias))
+        return False
+
+    @staticmethod
+    def icone_pequeno(cr, tam, d):
+        import svg_animado
+        try:
+            svg_animado.icone_clima(d.get("desenho", "nublado"), True).desenhar(cr, 0, 0, tam, 0.0)
+        except Exception:  # noqa: BLE001
+            clima.desenhar(cr, tam, d.get("desenho", "nublado"), True)
 
     def mostrar_clima(self, c):
         self.clima = c
@@ -203,6 +271,13 @@ class SuperMenu(Gtk.ApplicationWindow):
         import threading
         self.mostrar_clima(clima.ler_cache().get("clima"))
         threading.Thread(target=lambda: GLib.idle_add(self.mostrar_clima, clima.obter()), daemon=True).start()
+        def semana():
+            try:
+                dias = (clima.obter_semana(dias=6) or {}).get("dias") or []
+            except Exception:  # noqa: BLE001
+                dias = []
+            GLib.idle_add(self.mostrar_previsao, dias)
+        threading.Thread(target=semana, daemon=True).start()
 
     @staticmethod
     def imagem_da_faixa():
@@ -264,42 +339,45 @@ class SuperMenu(Gtk.ApplicationWindow):
         threading.Thread(target=reduzir, daemon=True).start()
 
     def montar_conteudo(self):
-        # O cartão: a faixa do wallpaper em cima e, embaixo, as colunas (seções | busca e apps)
-        cartao = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        cartao = Gtk.Box(spacing=0)
         cartao.set_size_request(LARGURA - 34, ALTURA - 64)
         cartao.add_css_class("conteudo")
         cartao.append(self.montar_faixa())
-        conteudo = Gtk.Box(spacing=16, vexpand=True)
-        conteudo.add_css_class("corpo")
-        cartao.append(conteudo)
-
-        # Coluna da esquerda: seções e categorias, e no pé o usuário e o botão de energia
-        esquerda = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=False)   # largura fixa: não cresce
-        esquerda.set_size_request(210, -1)
-        self.lateral = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
-        self.lateral.add_css_class("lateral")
-        self.chaves_lateral = []
-        for chave, nome, icone in SECOES:
-            self.adicionar_lateral(chave, nome, icone)
-        rotulo = Gtk.Label(label="CATEGORIES", xalign=0)
-        rotulo.add_css_class("rotulo-lateral")
-        linha_rotulo = Gtk.ListBoxRow(child=rotulo, selectable=False, activatable=False)
-        self.lateral.append(linha_rotulo)
-        self.chaves_lateral.append(None)
+        direita = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True)
+        direita.add_css_class("lado")
+        self.titulo = Gtk.Label(xalign=0)
+        self.titulo.add_css_class("titulo-secao")
+        direita.append(self.titulo)
+        # categorias em "chips" (o que antes era a coluna da esquerda)
+        chips = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=8, row_spacing=6,
+                            column_spacing=6)
+        self.chips = {}
         for chave, nome, _ in apps.CATEGORIAS:
-            if chave != "todos":
-                self.adicionar_lateral(chave, nome, ICONES_CATEGORIA.get(chave, "folder-symbolic"))
-        self.lateral.connect("row-selected", self.ao_escolher_secao)
-        esquerda.append(Gtk.ScrolledWindow(child=self.lateral, vexpand=True,
-                                           hscrollbar_policy=Gtk.PolicyType.NEVER))
-
+            if chave == "todos":
+                continue
+            b = Gtk.ToggleButton(label=nome, group=self.botoes_secao["fixados"])
+            b.add_css_class("chip")
+            b.connect("toggled", lambda bt, c=chave: bt.get_active() and self.escolher_secao(c))
+            chips.append(b)
+            self.chips[chave] = b
+        direita.append(chips)
+        self.grade = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.SINGLE, activate_on_single_click=True,
+                                 homogeneous=True, max_children_per_line=2, min_children_per_line=2,
+                                 row_spacing=8, column_spacing=8, valign=Gtk.Align.START)
+        self.grade.connect("child-activated", lambda _g, filho: self.ativar(filho))
+        self.vazio = Gtk.Label(label="Nothing here yet", vexpand=True, visible=False)
+        self.vazio.add_css_class("dim-label")
+        direita.append(self.vazio)
+        direita.append(Gtk.ScrolledWindow(child=self.grade, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
         rodape = Gtk.Box(spacing=8)
         rodape.add_css_class("rodape")
         nome = GLib.get_real_name()
         avatar = Adw.Avatar(size=24, text=GLib.get_user_name() if nome in ("", "Unknown") else nome,
                             show_initials=True)
         try:
-            avatar.set_custom_image(Gdk.Texture.new_from_filename(os.path.expanduser("~/.face")))
+            # miniatura (a ~/.face pode ser uma foto de 30 MP: decodificar inteira travava o menu; ver som.py)
+            avatar.set_custom_image(Gdk.Texture.new_for_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                os.path.expanduser("~/.face"), 96, 96, True)))
         except GLib.Error:
             pass
         rodape.append(avatar)
@@ -320,36 +398,16 @@ class SuperMenu(Gtk.ApplicationWindow):
             caixa.append(b)
         energia.set_popover(Gtk.Popover(child=caixa))
         rodape.append(energia)
-        esquerda.append(rodape)
-        conteudo.append(esquerda)
-
-        # Área principal: busca, título e os cartões
-        direita = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True)
-        self.busca = Gtk.SearchEntry(placeholder_text="Search apps")
-        self.busca.connect("search-changed", lambda *_: self.mostrar())
-        self.busca.connect("activate", lambda *_: self.abrir_selecionado())
-        direita.append(self.busca)
-        self.titulo = Gtk.Label(xalign=0)
-        self.titulo.add_css_class("titulo-secao")
-        direita.append(self.titulo)
-        self.grade = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.SINGLE, activate_on_single_click=True,
-                                 homogeneous=True, max_children_per_line=3, min_children_per_line=3,
-                                 row_spacing=8, column_spacing=8, valign=Gtk.Align.START)
-        self.grade.connect("child-activated", lambda _g, filho: self.ativar(filho))
-        self.vazio = Gtk.Label(label="Nothing here yet", vexpand=True, visible=False)
-        self.vazio.add_css_class("dim-label")
-        direita.append(self.vazio)
-        direita.append(Gtk.ScrolledWindow(child=self.grade, vexpand=True,
-                                          hscrollbar_policy=Gtk.PolicyType.NEVER))
-        conteudo.append(direita)
+        direita.append(rodape)
+        cartao.append(direita)
         return cartao
 
-    def adicionar_lateral(self, chave, nome, icone):
-        caixa = Gtk.Box(spacing=10)
-        caixa.append(Gtk.Image(icon_name=icone))
-        caixa.append(Gtk.Label(label=nome, xalign=0))
-        self.lateral.append(Gtk.ListBoxRow(child=caixa))
-        self.chaves_lateral.append(chave)
+    def escolher_secao(self, chave):
+        self.secao = chave
+        if self.busca.get_text():
+            self.busca.set_text("")        # dispara mostrar() pelo search-changed
+        else:
+            self.mostrar()
 
     def cartao(self, app):
         caixa = Gtk.Box(spacing=12)
@@ -377,14 +435,6 @@ class SuperMenu(Gtk.ApplicationWindow):
         return filho
 
     # ---------- o que mostrar ----------
-
-    def ao_escolher_secao(self, _lista, linha):
-        if linha is not None and self.chaves_lateral[linha.get_index()]:
-            self.secao = self.chaves_lateral[linha.get_index()]
-            if self.busca.get_text():
-                self.busca.set_text("")        # dispara mostrar() pelo search-changed
-            else:
-                self.mostrar()
 
     def mostrar(self):
         texto = self.busca.get_text()
@@ -557,14 +607,16 @@ class SuperMenu(Gtk.ApplicationWindow):
         self.fixados = apps.ler_lista("menu-fixados", FIXADOS_PADRAO)
         self.busca.set_text("")
         self.secao = "fixados"
-        self.lateral.select_row(self.lateral.get_row_at_index(0))
+        self.botoes_secao["fixados"].set_active(True)
         self.mostrar()
         self.atualizar_faixa()
+        self.animar_clima(True)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.EXCLUSIVE)   # digitar já vai pra busca
         self.present()
         self.busca.grab_focus()
 
     def fechar(self):
+        self.animar_clima(False)
         if self.popover is not None:
             self.popover.popdown()
         if self.get_visible():
@@ -585,11 +637,22 @@ class SuperMenu(Gtk.ApplicationWindow):
         self.fechar()
 
 
+def visual_atual():
+    try:
+        for linha in open(os.path.expanduser("~/.config/hypr/painel.conf")):
+            if linha.startswith("VISUAL="):
+                return linha.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "AeroTerm"
+
+
 class App(Adw.Application):
     def __init__(self):
         super().__init__(application_id="com.aero.SuperMenu",
                          flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.janela = None
+        self.nuvem = None          # DotStyle: the bubble cloud (nuvem.py), made on first use
 
     def do_command_line(self, linha):
         """Roda na instância que já está aberta: "supermenu" alterna; "--daemon" só carrega."""
@@ -605,10 +668,22 @@ class App(Adw.Application):
             self.janela = SuperMenu(self)
             self.hold()       # continua rodando mesmo com a janela escondida
         args = linha.get_arguments()
+        dots = visual_atual() == "DotStyle"
         if "--clique-fora" in args:
-            self.janela.clique_fora()
+            if not dots:
+                self.janela.clique_fora()      # the cloud covers the screen and closes on its own empty clicks
         elif "--daemon" not in args:
-            self.janela.alternar()
+            if dots:
+                if self.janela.get_visible():
+                    self.janela.fechar()
+                if self.nuvem is None:
+                    import nuvem
+                    self.nuvem = nuvem.Nuvem(self)
+                self.nuvem.alternar()
+            else:
+                if self.nuvem is not None and self.nuvem.get_visible():
+                    self.nuvem.fechar()
+                self.janela.alternar()
         return 0
 
 

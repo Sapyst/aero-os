@@ -2003,6 +2003,10 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         self._lembrar_posicao_do_sino()
 
     def _lembrar_posicao_do_sino(self):
+        # Com a AeroBar, ela mesma anota a posição exata do sino (sino.json): nada de adivinhar pelo mouse
+        # (clicar no relógio abria as notificações e "mudava" o sino de lugar).
+        if os.path.exists(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aerobar.pid")):
+            return
         """O sino da barra acabou de ser clicado: o mouse está em cima dele. Anota onde (em coordenadas
         do monitor), pra o Hermes soltar a onda e os cartões dali (~/.cache/aero-shell/sino.json)."""
         def trabalho():
