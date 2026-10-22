@@ -45,6 +45,17 @@ def preparar(gid):
     os.makedirs(x.TRAVAS, mode=0o755, exist_ok=True)
     os.chmod(x.ESTADO, 0o755)
     os.chmod(x.TRAVAS, 0o755)
+    for dia in x.dias():                       # day files readable by the admins (root:wheel 0640)
+        caminho = x.arquivo_do_dia(dia)
+        try:
+            fd = os.open(caminho, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            os.fchown(fd, 0, gid)
+            os.fchmod(fd, 0o640)
+        finally:
+            os.close(fd)
 
 
 def ler_cursor():

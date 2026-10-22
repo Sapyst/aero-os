@@ -13,10 +13,9 @@ IOSchedulingClass=idle
 MemoryMax=128M
 # Only reads the journal and writes its own folders
 ProtectSystem=strict
+# The folders are made by install.sh (root:wheel). Not LogsDirectory=/StateDirectory=: systemd
+# would chown them back to root:root on every start and the app could not read the archive.
 ReadWritePaths=/var/log/x9 /var/lib/x9
-StateDirectory=x9
-LogsDirectory=x9
-LogsDirectoryMode=0750
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

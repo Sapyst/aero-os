@@ -28,7 +28,8 @@ if [ $remover -eq 1 ]; then
   exit 0
 fi
 
-faz install -d -m755 -o root -g root /usr/local/lib/x9 /etc/x9
+faz install -d -m755 -o root -g root /usr/local/lib/x9 /etc/x9 /var/lib/x9 /var/lib/x9/locks
+faz install -d -m750 -o root -g wheel /var/log/x9
 faz install -m644 -o root -g root "$aqui/x9core.py" /usr/local/lib/x9/x9core.py
 for f in x9d x9-admin x9-setlock; do
   faz install -m755 -o root -g root "$aqui/$f" "/usr/local/lib/x9/$f"
