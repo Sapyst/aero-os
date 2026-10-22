@@ -74,6 +74,16 @@ def movimento_reduzido(config):
 
 # ---------- the wave (pure drawing: testable on an image surface) ----------
 
+def suave(a, b, x):
+    """smoothstep: 0 before a, 1 after b, an S-curve in between."""
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (x - a) / (b - a)
+    return t * t * (3 - 2 * t)
+
+
 def desenhar_onda(cr, w, h, p, origem, cfg, cor, forca=1.0):
     """One frame of the wave. p = progress 0..1, origem = (x, y) in px, cfg = settings["wave"],
     forca = 1 normally, fullscreen_intensity/intensity over a fullscreen app."""
@@ -83,7 +93,9 @@ def desenhar_onda(cr, w, h, p, origem, cfg, cor, forca=1.0):
     alcance = math.hypot(w, h) * cfg["reach"]
     largura = cfg["width"]
     raio_base = sp * cfg["dot_size"]
-    brilho = cfg["intensity"] * forca * (1 - p * 0.7)
+    # envelope: a short fade-in, then a long, soft fade-out that reaches exactly 0 at the end
+    # (smoothstep curves: no corner anywhere, so nothing "cuts" when the wave ends)
+    brilho = cfg["intensity"] * forca * suave(0.0, 0.08, p) * (1 - suave(0.35, 1.0, p))
     ox, oy = origem
     r, g, b = cor
     desenhados = 0
@@ -102,6 +114,7 @@ def desenhar_onda(cr, w, h, p, origem, cfg, cor, forca=1.0):
             banda = 1 - min(1.0, abs(d - p) / largura)
             if banda <= 0:
                 continue
+            banda = banda * banda * (3 - 2 * banda)          # soft edges on both sides of the ring
             cr.set_source_rgba(r, g, b, brilho * banda)
             cr.arc(x, y, raio_base * (0.4 + 0.6 * banda), 0, 2 * math.pi)
             cr.fill()
@@ -184,7 +197,7 @@ class Onda(Gtk.Window):
         for t0, cartao, cor, forca, calmo in self.ondas:
             origem = origem_da_onda(self.config, w, h, cartao)
             if calmo:                                        # reduced motion: one soft dot, no ring
-                k = 1 - (agora - t0) / 0.8
+                k = 1 - suave(0.0, 1.0, (agora - t0) / 0.8)
                 cr.set_source_rgba(*cor, max(0.0, k) * self.config["wave"]["intensity"] * forca)
                 cr.arc(origem[0], origem[1], self.config["wave"]["dot_spacing"] * 0.4, 0, 2 * math.pi)
                 cr.fill()

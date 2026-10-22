@@ -48,6 +48,21 @@ class TestOnda(unittest.TestCase):
         self.assertGreater(cheia, fraca * 1.8)
         self.assertGreater(fraca, 0)
 
+    def test_some_suave(self):
+        """Brightness goes down smoothly to zero: no jump in the last frames."""
+        cfg = h.validar_config({})["wave"]
+
+        def soma(p):
+            sup = cairo.ImageSurface(cairo.FORMAT_ARGB32, 600, 400)
+            ui.desenhar_onda(cairo.Context(sup), 600, 400, p, (300, 200), cfg, (1, 1, 1))
+            return sum(sup.get_data()[3::4])
+        valores = [soma(k / 50) for k in range(20, 50)]
+        self.assertLess(valores[-1], valores[0] * 0.02)        # the last frame is almost nothing
+        for a, b in zip(valores, valores[1:]):
+            self.assertLess(b - a, max(valores) * 0.12)          # never a jump up
+        self.assertEqual(ui.suave(0, 1, 1.0), 1.0)
+        self.assertEqual(ui.suave(0, 1, 0.0), 0.0)
+
     def test_origem(self):
         c = h.validar_config({"position": "bottom-left", "margin": 10})
         self.assertEqual(ui.origem_da_onda(c, 1000, 600), (34, 566))
