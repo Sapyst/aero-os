@@ -569,6 +569,10 @@ class Hermes:
         except OSError as erro:
             print(f"hermes: history not saved: {erro}", flush=True)
 
+    def remover_do_historico(self, id_):
+        self.historico = deque((x for x in self.historico if x["id"] != id_), maxlen=self.historico.maxlen)
+        self._agendar_gravacao()
+
     def limpar_historico(self):
         self.historico.clear()
         self._agendar_gravacao()

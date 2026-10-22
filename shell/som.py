@@ -401,6 +401,17 @@ class Janelinha(Gtk.Window):
 HERMES = None          # o serviço (hermes.Hermes) quando é ele que recebe as notificações
 
 
+def visual_atual():
+    """O visual do sistema (painel.conf VISUAL): DotStyle, AeroTerm ou AerOS."""
+    try:
+        for linha in open(os.path.expanduser("~/.config/hypr/painel.conf")):
+            if linha.startswith("VISUAL="):
+                return linha.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "AeroTerm"
+
+
 def notif_historico():
     import json
     if HERMES is not None:
@@ -452,6 +463,9 @@ class CentralNotificacoes(Janelinha):
         import re
         while (filho := self.cartao.get_first_child()) is not None:
             self.cartao.remove(filho)
+        if visual_atual() == "DotStyle":
+            return self.montar_dots()
+        self.remove_css_class("dots")
         historico = notif_historico()
         corte = self.limpas_ate() if HERMES is None else 0      # o Hermes limpa de verdade (sem corte por id)
         itens = [n for n in historico if n.get("id", 0) > corte]
@@ -509,6 +523,87 @@ class CentralNotificacoes(Janelinha):
         rolagem = Gtk.ScrolledWindow(child=lista, hscrollbar_policy=Gtk.PolicyType.NEVER,
                                      propagate_natural_height=True, max_content_height=460)
         self.cartao.append(rolagem)
+
+    def montar_dots(self):
+        """DotStyle: a panel born from bubbles, Doto title, a dot switch for Do not disturb, notifications as
+        rows with the app's real icon in a bubble, smooth scrolling with a dot scrollbar."""
+        import dotkit as dk
+        import hermes_dots as hd
+        dk.aplicar_css()
+        self.add_css_class("dots")
+        historico = notif_historico()
+        corte = self.limpas_ate() if HERMES is None else 0
+        itens = [n for n in historico if n.get("id", 0) > corte]
+        painel = dk.Painel(origem="right", semente=len(itens))
+        painel.set_size_request(LARGURA + 30, -1)
+        dentro = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=16, margin_bottom=14,
+                         margin_start=16, margin_end=12)
+        painel.append(dentro)
+        topo = Gtk.Box(spacing=8)
+        titulo = Gtk.Label(label="NOTIFICATIONS", xalign=0, hexpand=True)
+        titulo.add_css_class("dotkit-titulo")
+        topo.append(titulo)
+        limpar = dk.BotaoDots("Clear all", lambda: self.limpar(historico))
+        limpar.set_sensitive(bool(itens))
+        topo.append(limpar)
+        dentro.append(topo)
+        dnd = Gtk.Box(spacing=10, margin_start=2)
+        rotulo = Gtk.Label(label="Do not disturb", xalign=0, hexpand=True)
+        rotulo.add_css_class("dotkit-forte")
+        dnd.append(rotulo)
+        dnd.append(dk.Interruptor("dnd" in notif_modos(), self.nao_perturbe))
+        dentro.append(dnd)
+        if not itens:
+            vazio = Gtk.Label(label="NOTHING NEW", margin_top=26, margin_bottom=22)
+            vazio.add_css_class("dotkit-titulo")
+            vazio.set_opacity(0.35)
+            dentro.append(vazio)
+        else:
+            lista = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            for n in itens:
+                lista.append(self.item_dots(n, dk, hd))
+            dentro.append(dk.Rolagem(lista, altura_max=520))
+        self.cartao.append(painel)
+
+    def item_dots(self, n, dk, hd):
+        import re
+        linha = Gtk.Box(spacing=11)
+        linha.add_css_class("dotkit-item")
+        icone = n.get("app_icon") or n.get("desktop_entry") or ""
+        linha.append(dk.Bolha(icone, 38, n.get("app_name", "")))
+        textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        resumo = Gtk.Label(label=n.get("summary", ""), xalign=0, ellipsize=3, use_markup=False, max_width_chars=30)
+        resumo.add_css_class("dotkit-forte")
+        textos.append(resumo)
+        corpo = re.sub(r"<[^>]+>", "", n.get("body", ""))
+        if corpo:
+            c = Gtk.Label(label=corpo, xalign=0, wrap=True, lines=2, ellipsize=3, max_width_chars=32,
+                          use_markup=False, natural_wrap_mode=Gtk.NaturalWrapMode.WORD)
+            c.add_css_class("dotkit-texto")
+            textos.append(c)
+        quando = dk.tempo_atras(n.get("time")) if n.get("time") else ""
+        origem = (n.get("desktop_entry") or n.get("app_name") or "").split(".")[-1]
+        meta = Gtk.Label(label=f"{origem.upper()}  ·  {quando.upper()}" if quando else origem.upper(), xalign=0,
+                         ellipsize=3, use_markup=False)
+        meta.add_css_class("dotkit-mono")
+        textos.append(meta)
+        linha.append(textos)
+        fechar = hd.PontoFechar(dk.RED, lambda i=n.get("id"): self.remover(i))
+        fechar.set_opacity(0)
+        linha.append(fechar)
+        mov = Gtk.EventControllerMotion()
+        mov.connect("enter", lambda *_: fechar.set_opacity(1))
+        mov.connect("leave", lambda *_: fechar.set_opacity(0))
+        linha.add_controller(mov)
+        clique = Gtk.GestureClick()
+        clique.connect("released", lambda *_a, app=n.get("desktop_entry"): self.abrir_app(app))
+        linha.add_controller(clique)
+        return linha
+
+    def remover(self, id_):
+        if HERMES is not None and id_:
+            HERMES.remover_do_historico(id_)
+        self.montar()
 
     def abrir_app(self, app):
         """Clique numa notificação = traz o app dela pra frente (ou abre)."""
