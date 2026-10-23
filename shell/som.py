@@ -248,7 +248,20 @@ class Pegador(Gtk.Window):
         self.set_child(Gtk.Box())
 
 
+def margem_de_cima(janela, g):
+    """A margem de cima de uma janelinha presa embaixo da barra. Solid: ela encosta na ilha (margem 0) e o
+    espaço vira margem interna do conteúdo, pra o metaball ter onde escorrer da ilha até o cartão."""
+    if visual_atual() == "Solid":
+        Camada.set_margin(janela, Camada.Edge.TOP, 0)
+        janela.cartao.set_margin_top(g)
+    else:
+        Camada.set_margin(janela, Camada.Edge.TOP, g)
+        janela.cartao.set_margin_top(0)
+
+
 class Janelinha(Gtk.Window):
+    icone_barra = "vol"          # de qual ícone da AeroBar esta janelinha nasce (Solid)
+
     def __init__(self):
         super().__init__()
         self.add_css_class("som")
@@ -396,7 +409,7 @@ class Janelinha(Gtk.Window):
         largura_tela = int(monitor["width"] / monitor["scale"]) if monitor else 2560
         margem = max(8, min(largura_tela - x - (LARGURA + 20) // 2, largura_tela - LARGURA - 28))
         Camada.set_margin(self, Camada.Edge.RIGHT, margem)
-        Camada.set_margin(self, Camada.Edge.TOP, gap())  # o mesmo espaço das janelas (a camada já começa abaixo da barra)
+        margem_de_cima(self, gap())   # o mesmo espaço das janelas (a camada já começa abaixo da barra)
         self.montar()
         self.mostrar((x - 40, x + 40))
 
@@ -483,6 +496,9 @@ class Janelinha(Gtk.Window):
             tela = 2560
         x_janela = tela - Camada.get_margin(self, Camada.Edge.RIGHT) - largura
         meio = (self.zona_icone[0] + self.zona_icone[1]) / 2 if self.zona_icone != (0, 0) else x_janela + largura - 40
+        icones = solido.barra().get("icones", {})              # a AeroBar conta onde o ícone está de verdade
+        if self.icone_barra in icones:
+            meio = icones[self.icone_barra]
         return min(max(12.0, meio - x_janela), largura - 12.0)
 
     def _metaball(self, abrindo, depois=None):
@@ -660,6 +676,8 @@ def carregar_dicas_dotstyle():
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
 
 class CentralNotificacoes(Janelinha):
+    icone_barra = "bell"
+
     """O sininho da barra (doc 25): últimas notificações (histórico do mako), "Não perturbe" e
     "Clear all". O mako não tem comando pra apagar o histórico, então "Clear all" anota o número da
     última notificação e a lista passa a mostrar só as mais novas que ela."""
@@ -851,6 +869,8 @@ class CentralNotificacoes(Janelinha):
 
 
 class MenuJanela(Janelinha):
+    icone_barra = None
+
     """Botão direito na BARRA DE TÍTULO de uma janela (doc 26): menu tipo Windows.
 
     O Hyprland avisa TODO clique direito (atalho "bindn" = não engole o clique, o app recebe normal);
@@ -963,6 +983,8 @@ class MenuJanela(Janelinha):
 
 
 class CentralRapida(Janelinha):
+    icone_barra = "central"
+
     """Central rápida (doc 30): o que está tocando + brilho/volume + botões grandes (Wi-Fi, Bluetooth...).
 
     O PLAYER: quase todo app de música/vídeo do Linux publica o que está tocando num padrão chamado
@@ -2106,7 +2128,7 @@ class CentralRapida(Janelinha):
         # SEMPRE no canto superior direito, embaixo do ícone dela, com o mesmo espaço das janelas
         g = gap()
         Camada.set_margin(self, Camada.Edge.RIGHT, g)
-        Camada.set_margin(self, Camada.Edge.TOP, g)
+        margem_de_cima(self, g)
         monitor = next((m for m in hyprctl_json("monitors") or [] if m.get("focused")), None)
         largura_tela = int(monitor["width"] / monitor["scale"]) if monitor else 2560
         self.sub = None
@@ -2124,7 +2146,15 @@ class CentralRapida(Janelinha):
 
 
 class Osd(Gtk.Window):
-    """A "pílula" que aparece no rodapé quando você muda volume ou brilho pelas teclas."""
+    """A "pílula" que aparece no rodapé quando você muda volume ou brilho pelas teclas.
+    Solid: ela nasce da ilha da barra (embaixo do ícone de volume; brilho = embaixo da Hestia) num metaball
+    e se recolhe de volta — o mesmo código das janelinhas (Janelinha._metaball)."""
+
+    # o metaball das janelinhas serve igual aqui (só usa cartao, raiz_s, zona_icone e icone_barra)
+    _com_solido = Janelinha._com_solido
+    _cartoes_solidos = Janelinha._cartoes_solidos
+    _ponto_do_icone = Janelinha._ponto_do_icone
+    _metaball = Janelinha._metaball
 
     def __init__(self):
         super().__init__()
@@ -2134,8 +2164,14 @@ class Osd(Gtk.Window):
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.OVERLAY)
         Camada.set_namespace(self, "osd")
-        Camada.set_anchor(self, Camada.Edge.BOTTOM, True)
-        Camada.set_margin(self, Camada.Edge.BOTTOM, 150)   # acima do Dock
+        self.solido = visual_atual() == "Solid"
+        self.zona_icone, self.icone_barra, self.raiz_s, self._anim_s = (0, 0), "vol", None, None
+        if self.solido:                                    # presa embaixo da barra, encostada na ilha
+            Camada.set_anchor(self, Camada.Edge.TOP, True)
+            Camada.set_anchor(self, Camada.Edge.RIGHT, True)
+        else:
+            Camada.set_anchor(self, Camada.Edge.BOTTOM, True)
+            Camada.set_margin(self, Camada.Edge.BOTTOM, 150)   # acima do Dock
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
         caixa = Gtk.Box(spacing=14)
         caixa.add_css_class("pilula")
@@ -2148,7 +2184,11 @@ class Osd(Gtk.Window):
         self.por_cento.add_css_class("por-cento")
         for w in (self.esfera, self.icone, self.barra, self.por_cento):
             caixa.append(w)
+        self.cartao = caixa
         self.set_child(caixa)
+        if self.solido:
+            caixa.set_margin_top(gap())
+            self._com_solido()
         self.relogio = None
 
     def mostrar(self, tipo):
@@ -2176,13 +2216,32 @@ class Osd(Gtk.Window):
         self.esfera.set_nivel(min(v, 100) / 100)
         self.barra.set_value(min(v, 100))
         self.por_cento.set_label(f"{v}%")
-        self.present()
+        if self.solido:
+            self.icone_barra = "central" if tipo == "brilho" else "vol"
+            x = solido.barra().get("icones", {}).get(self.icone_barra)
+            if x is not None and not self.get_visible():            # centrada embaixo do ícone, sem sair da tela
+                larg = 300 + 2 + 40
+                try:
+                    mon = next((m for m in hyprctl_json("monitors") or [] if m.get("focused")), None)
+                    tela = int(mon["width"] / mon["scale"]) if mon else 2560
+                except (TypeError, KeyError, ZeroDivisionError):
+                    tela = 2560
+                Camada.set_margin(self, Camada.Edge.RIGHT, int(max(gap(), min(tela - x - larg / 2, tela - larg - gap()))))
+            abrir = not self.get_visible() or self._anim_s is not None
+            self.present()
+            if abrir:
+                self._metaball(True)
+        else:
+            self.present()
         if self.relogio:
             GLib.source_remove(self.relogio)
         self.relogio = GLib.timeout_add(1300, self.esconder)
 
     def esconder(self):
         self.relogio = None
+        if self.solido and self.get_visible():
+            self._metaball(False, lambda: (self.set_visible(False), self.cartao.set_opacity(1.0)))
+            return GLib.SOURCE_REMOVE
         self.set_visible(False)
         return GLib.SOURCE_REMOVE
 

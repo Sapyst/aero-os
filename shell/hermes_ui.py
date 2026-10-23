@@ -560,6 +560,9 @@ class Cartoes(Gtk.Window):
         """O sino nas coordenadas desta janela (a gota nasce ali, na borda de cima); sem sino: o meio."""
         larg = self.get_width() or self.config["width"]
         sino = lugar_do_sino()
+        x_barra = solido.barra().get("icones", {}).get("bell")       # a AeroBar sabe onde o sino está agora
+        if sino and x_barra is not None:
+            sino = dict(sino, x=x_barra)
         if not sino or not Camada.get_anchor(self, Camada.Edge.RIGHT):
             return larg / 2
         x_janela = sino["w"] - Camada.get_margin(self, Camada.Edge.RIGHT) - larg
