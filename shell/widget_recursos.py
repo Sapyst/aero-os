@@ -7,7 +7,8 @@ import math
 import os
 import time
 
-from widgets import DOTS, LARGURA_ESTREITA, PASTEL, arco_pontos, Widget, anel, cor_texto, painel_cairo, registrar, retangulo_redondo, texto, tracejado
+import solido
+from widgets import DOTS, LARGURA_ESTREITA, PASTEL, SOLIDO, arco_pontos, arco_solido, Widget, anel, cor_texto, painel_cairo, registrar, retangulo_redondo, texto, tracejado
 
 VERMELHO = (0.88, 0.34, 0.31)
 AZUL = (0.45, 0.66, 1.0)
@@ -189,6 +190,11 @@ class Recursos(Widget):
                       "swap": de["swap"] + (para["swap"] - de["swap"]) * t,
                       "rx": de["rx"] + (para["rx"] - de["rx"]) * t, "tx": de["tx"] + (para["tx"] - de["tx"]) * t}
             self.tela.queue_draw()
+        # mudança pequena (o normal parado: 1-2 %) = um quadro só; deslizar só quando dá pra ver (CPU ~3x menor)
+        salto = max(abs(para[k] - de[k]) for k in ("cpu", "mem", "swap"))     # (os núcleos pulam sempre)
+        if salto < 0.06:
+            passo(1.0)
+            return
         self.animar(400, passo, fps=12)
 
     # ---- peças ----
@@ -198,6 +204,9 @@ class Recursos(Widget):
         a0, a1 = math.pi * 0.75, math.pi * 2.25
         if DOTS:
             arco_pontos(cr, cx, cy, r, a0, a1, fracao, cor, esp)
+            return
+        if SOLIDO:
+            arco_solido(cr, cx, cy, r, a0, a1, fracao, cor, esp)
             return
         cr.set_line_width(esp)
         cr.set_line_cap(1)
@@ -308,11 +317,15 @@ class Recursos(Widget):
                     yb = y + alt - 20 * e
                     for i, u in enumerate(v["nuc"]):
                         x = x0 + i * (lw + folga)
-                        retangulo_redondo(cr, x, yb, lw, 10 * e, 2.5 * e)
-                        cr.set_source_rgba(*cor[:3], 0.08)
+                        rc = lw / 2 if SOLIDO else 2.5 * e               # Solid: pílulas inteiras
+                        retangulo_redondo(cr, x, yb, lw, 10 * e, rc)
+                        if SOLIDO:
+                            cr.set_source_rgb(*solido.rgb("surface_container_highest"))
+                        else:
+                            cr.set_source_rgba(*cor[:3], 0.08)
                         cr.fill()
                         a = max(3 * e, 10 * e * min(1, u))           # traço de 3 px no mínimo (não vira bolinha)
-                        retangulo_redondo(cr, x, yb + 10 * e - a, lw, a, 2.5 * e)
+                        retangulo_redondo(cr, x, yb + 10 * e - a, lw, a, rc)
                         cr.set_source_rgba(*PASTEL["rosa"], 0.9)
                         cr.fill()
             elif nome == "medidores":

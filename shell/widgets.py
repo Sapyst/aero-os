@@ -17,6 +17,12 @@ Como funciona:
   recursos a cada 2 s lendo /proc, clima a cada 30 min...) e as animações só existem enquanto acontecem.
 - Tema: cores do libadwaita (var(--window-bg-color) etc., escritas pelo hypr-tema), claro/escuro ao vivo.
   Os desenhos (cairo) pegam a cor do texto do próprio widget na hora de desenhar.
+- Visual Solid (solido.py): cartões tonais chapados (surface-container), Inter, acentos na primária, sem vidro
+  nem contorno. Aparecer, sumir e mudar de tamanho é um METABALL em cairo desenhado na camada do desktop (que
+  já existe e fica embaixo dos cartões): o cartão escorre do vizinho mais perto (ou nasce de uma gota), com
+  molas criticamente amortecidas e um pescoço líquido que afina e rompe. Só existe enquanto anima.
+- Memória: tudo é desenhado com cairo (GSK_RENDERER=cairo: o driver de vídeo nem é carregado — era mais da
+  metade do processo), sem libadwaita, e o clima baixa a previsão num curl à parte (sem ssl no processo).
 
 Uso: widgets [--daemon] | --editar | --adicionar TIPO | --recarregar     (lançador: ~/.local/bin/widgets)
 """
@@ -31,18 +37,28 @@ import sys
 import threading
 import time
 
-import cairo
-import gi
+# Os widgets só pintam com cairo (cartões pequenos e parados): com o renderizador cairo o GTK nem abre o
+# OpenGL, e o driver de vídeo (dezenas de MB no processo) fica de fora. WIDGETS_RENDERER=gl volta ao antigo.
+os.environ["GSK_RENDERER"] = os.environ.get("WIDGETS_RENDERER", "cairo")
+# O PyGObject importa o asyncio, que puxa o ssl (libssl + libcrypto, ~2 MB) sem ninguém aqui usar: o clima
+# baixa por curl. Sem curl, o ssl fica (o clima cai no urllib).
+if __import__("shutil").which("curl"):
+    sys.modules.setdefault("ssl", None)
+
+import cairo  # noqa: E402
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
-gi.require_version("Adw", "1")
 gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import solido  # noqa: E402  (a paleta tonal e as molas do Solid; puro Python)
 
 CONFIG = os.path.expanduser("~/.config/aero-shell/widgets.json")
 HYPR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr",
@@ -59,13 +75,18 @@ def _visual():
 
 # DotStyle: cartão escuro com a borda que se desfaz num halo de pontos (halftone), molduras sem linha,
 # anéis e barras feitos de pontos, títulos em Doto. Lido uma vez: trocar de visual reinicia os widgets.
-DOTS = _visual() == "DotStyle"
+VISUAL = _visual()
+DOTS = VISUAL == "DotStyle"
+# Solid: cartão tonal chapado, sem sombra nem borda (a janela é o cartão), cantos = RAIO_CANTOS do sistema
+SOLIDO = VISUAL == solido.NOME
 FG_DOTS = (0.925, 0.92, 0.91)
 FUNDO_DOTS = (0.043, 0.043, 0.047)
 VERMELHO_DOTS = (1.0, 0.231, 0.188)
 DOTO = "Doto"
-RAIO = 26 if DOTS else 14  # cantos do cartão (= o arredondamento das janelas); molduras internas usam 10
-SOMBRA = 34 if DOTS else 14   # margem do cartão dentro da janela: é onde a sombra é desenhada
+RAIO = 26 if DOTS else solido.raio() if SOLIDO else 14  # cantos do cartão (= o arredondamento das janelas)
+SOMBRA = 34 if DOTS else 0 if SOLIDO else 14   # margem do cartão dentro da janela: é onde a sombra é desenhada
+RAIO_DENTRO = max(12, RAIO - 8)   # Solid: os sub-cartões (surface-container-high) dentro do cartão
+INTER = "Inter"                   # Solid: a fonte da barra e do resto do shell
 LARGURA_ESTREITA = 320    # largura padrão do conteúdo da coluna estreita (System, Resources, Processes)
 LARGURA_LARGA = 518       # ...e da coluna larga (Clock, Weather)
 CORES_BARRA = os.path.expanduser("~/.config/waybar/cores.css")   # cores do tema (o hypr-tema gera)
@@ -125,9 +146,60 @@ window.aero-widget { color: #ecebe8; }
 if DOTS:
     CSS += CSS_DOTS
 
+
+def css_solido():
+    """Solid: o CSS das peças do shell (@solid_* + .solid-*) e o dos widgets, num provedor só (as cores com
+    nome só valem dentro do mesmo provedor). Recarregado quando a paleta muda (solido.vigiar)."""
+    return solido.css_shell() + """
+window.aero-widget { color: @solid_on_surface; font-family: Inter; }
+.cartao { background-color: @solid_surface_container; border-radius: RAIOpx; }
+.cartao label { color: @solid_on_surface; }
+.brilho { border-radius: RAIOpx; }
+.moldura:hover .brilho { background-color: alpha(@solid_on_surface, 0.04); }
+.mono, .prompt, .cursor, .chave { font-family: Inter; font-feature-settings: "tnum"; }
+.chave { font-size: 11px; font-weight: 500; letter-spacing: 0; opacity: 1; color: @solid_on_surface_variant; }
+.dim, .apagado { opacity: 1; }
+.cartao .dim { color: @solid_on_surface_variant; }
+.cartao .apagado { color: alpha(@solid_on_surface_variant, 0.8); }
+.pequeno { font-size: 12px; }
+.medio { font-size: 15px; font-weight: 500; }
+.negrito { font-weight: 500; }
+.hora { font-family: Inter; font-size: 46px; font-weight: 400; letter-spacing: -0.01em; font-feature-settings: "tnum"; }
+.cartao .hora { color: @solid_primary; }
+.cartao .hora.hora-dim { color: @solid_on_surface; opacity: 1; font-weight: 400; }
+.cartao .rosa, .cartao .verde { color: @solid_primary; }
+.cartao .azul, .cartao .lilas { color: @solid_tertiary; }
+.cartao .pessego, .cartao .amarelo { color: @solid_secondary; }
+.cartao .chave-s { color: @solid_on_surface_variant; font-weight: 500; }
+.cartao .titulo-s { font-size: 14px; font-weight: 500; }
+.chip { font-family: Inter; font-size: 10px; font-weight: 500; padding: 2px 10px; border-radius: 999px; letter-spacing: 0; }
+.pilula { background-color: @solid_inverse_surface; color: @solid_inverse_on_surface; border-radius: 999px;
+          padding: 6px 8px 6px 20px; box-shadow: none; }
+.pilula label { color: @solid_inverse_on_surface; font-weight: 500; }
+.pilula button { background-color: @solid_primary; color: @solid_on_primary; border-radius: 999px; border: none;
+                 box-shadow: none; padding: 4px 18px; font-weight: 500; }
+""".replace("RAIOpx", f"{RAIO}px")
+
+
+# Solid: a paleta pastel dos desenhos vira os papéis tonais do esquema (rosa/verde = primária, azul/lilás =
+# terciária, pêssego/amarelo = secundária). Os widget_*.py importam o MESMO dict: mudar aqui muda lá.
+PAPEL_PASTEL = {"rosa": "primary", "verde": "primary", "azul": "tertiary", "lilas": "tertiary",
+                "pessego": "secondary", "amarelo": "secondary"}
+
+
+def cor_solida(nome):
+    return solido.rgb(nome)
+
+
+def aplicar_paleta_solida():
+    for k, papel in PAPEL_PASTEL.items():
+        PASTEL[k] = solido.rgb(papel)
+
 # a paleta pastel, pros desenhos cairo (as mesmas cores das classes CSS acima)
 PASTEL = {"rosa": (0.91, 0.58, 0.56), "azul": (0.65, 0.78, 0.93), "pessego": (0.95, 0.71, 0.56),
           "verde": (0.73, 0.84, 0.63), "lilas": (0.79, 0.65, 0.92), "amarelo": (0.94, 0.83, 0.60)}
+if SOLIDO:
+    aplicar_paleta_solida()
 
 TIPOS = {}        # tipo -> classe do widget (os módulos widget_*.py se registram aqui)
 
@@ -307,7 +379,13 @@ def texto(cr, widget, s, x, y, tamanho=11, peso="normal", alfa=1.0, alinhar="esq
     if layout is None:
         layout = PangoCairo.create_layout(cr)
         fd = widget.get_pango_context().get_font_description().copy()
-        if familia:
+        if SOLIDO:                               # Solid: tudo em Inter (números tabulares), "bold" vira medium
+            fd.set_family(INTER)
+            peso = "medium" if peso == "bold" else peso
+            attrs = Pango.AttrList()
+            attrs.insert(Pango.attr_font_features_new("tnum"))
+            layout.set_attributes(attrs)
+        elif familia:
             fd.set_family(familia)
         fd.set_absolute_size(tamanho * Pango.SCALE)
         fd.set_weight({"normal": Pango.Weight.NORMAL, "bold": Pango.Weight.BOLD, "light": Pango.Weight.LIGHT,
@@ -361,6 +439,11 @@ class Tween:
 _cores = {"quando": 0, "valores": None}
 
 
+def escuro():
+    """Tema escuro agora? (o que o hypr-tema aplicou por último; sem libadwaita no processo)."""
+    return solido.escuro_agora()
+
+
 def cores_tema():
     """Cores do tema lidas do cores.css da waybar (o hypr-tema gera; o Dock faz igual): fundo, fundo_solido,
     texto, destaque — como (r, g, b, a). Relidas quando o arquivo muda."""
@@ -369,10 +452,10 @@ def cores_tema():
     except OSError:
         mtime = 0
     if _cores["valores"] is None or mtime != _cores["quando"]:
-        escuro = Adw.StyleManager.get_default().get_dark()
-        v = {"fundo_solido": (0.118, 0.118, 0.118, 1.0) if escuro else (0.965, 0.965, 0.965, 1.0),
-             "texto": (0.94, 0.94, 0.94, 1.0) if escuro else (0.118, 0.118, 0.118, 1.0),
-             "destaque": (0.94, 0.94, 0.94, 1.0) if escuro else (0.118, 0.118, 0.118, 1.0)}
+        esc = escuro()
+        v = {"fundo_solido": (0.118, 0.118, 0.118, 1.0) if esc else (0.965, 0.965, 0.965, 1.0),
+             "texto": (0.94, 0.94, 0.94, 1.0) if esc else (0.118, 0.118, 0.118, 1.0),
+             "destaque": (0.94, 0.94, 0.94, 1.0) if esc else (0.118, 0.118, 0.118, 1.0)}
         try:
             with open(CORES_BARRA) as f:
                 css = f.read()
@@ -441,7 +524,7 @@ def vidro_textura(w, h, cor_texto_rgba, opacidade=0.62):
     cr = cairo.Context(surf)
     x0, y0, cw, ch = SOMBRA, SOMBRA, w - 2 * SOMBRA, h - 2 * SOMBRA
     r = RAIO
-    escuro = Adw.StyleManager.get_default().get_dark()
+    esc = escuro()
     chato = opacidade >= 0.5
     for i in range(10):                              # sombra: soma ≤ 0,16 (abaixo do ignore_alpha do Hyprland)
         t = i / 10
@@ -451,7 +534,7 @@ def vidro_textura(w, h, cor_texto_rgba, opacidade=0.62):
         cr.fill()
     fundo = cores_tema()["fundo_solido"]
     retangulo_redondo(cr, x0, y0, cw, ch, r)
-    cr.set_source_rgba(*fundo[:3], opacidade if escuro else min(0.96, opacidade + 0.12))
+    cr.set_source_rgba(*fundo[:3], opacidade if esc else min(0.96, opacidade + 0.12))
     cr.fill()
     if not chato:
         cr.save()
@@ -464,7 +547,7 @@ def vidro_textura(w, h, cor_texto_rgba, opacidade=0.62):
         cr.paint()
         base = cairo.LinearGradient(0, y0 + ch * 0.55, 0, y0 + ch)
         base.add_color_stop_rgba(0, 0, 0, 0, 0.0)
-        base.add_color_stop_rgba(1, 0, 0, 0, 0.16 if escuro else 0.08)
+        base.add_color_stop_rgba(1, 0, 0, 0, 0.16 if esc else 0.08)
         cr.set_source(base)
         cr.paint()
         retangulo_redondo(cr, x0 + 1.25, y0 + 1.25, cw - 2.5, ch - 2.5, r - 1.25)
@@ -489,6 +572,11 @@ def painel_cairo(cr, x, y, w, h, r=10, titulo=None, area=None, e=1.0):
     """Moldura de terminal nos desenhos cairo: linha fina de contorno (quase sem preenchimento) e, se houver
     `titulo`, ele fica EMBUTIDO na linha de cima, como numa caixa de TUI (─ cpu ──────). `area` = o widget
     (pra fonte e cor do título)."""
+    if SOLIDO:                                   # Solid: sub-cartão tonal chapado, sem linha nem título
+        retangulo_redondo(cr, x, y, w, h, RAIO_DENTRO * e)
+        cr.set_source_rgb(*solido.rgb("surface_container_high"))
+        cr.fill()
+        return
     if DOTS:                                     # DotStyle: sem linha; um véu claro arredondado e o título em Doto
         retangulo_redondo(cr, x, y, w, h, 14 * e)
         cr.set_source_rgba(*FG_DOTS, 0.045)
@@ -520,7 +608,10 @@ def painel_cairo(cr, x, y, w, h, r=10, titulo=None, area=None, e=1.0):
 
 
 def tracejado(cr, x, y, w, e=1.0, alfa=0.22):
-    """Linha tracejada (- - - -), como os separadores do TerMusic. DotStyle: uma fileira de pontos."""
+    """Linha tracejada (- - - -), como os separadores do TerMusic. DotStyle: uma fileira de pontos.
+    Solid: nada (o espaço separa; sem fios)."""
+    if SOLIDO:
+        return
     if DOTS:
         cr.new_path()
         n = max(2, int(w / (6 * e)))
@@ -551,9 +642,10 @@ class Quadro(Gtk.Overlay):
         self.fundo = Gtk.DrawingArea()
         self.fundo.set_draw_func(self._desenhar)
         self.set_child(self.fundo)
+        topo = 12 if SOLIDO else 15 if titulo else 10           # Solid: o título não vai na borda (não há borda)
         self.conteudo = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=espaco * e,
-                                margin_top=int((15 if titulo else 10) * e), margin_bottom=int(10 * e),
-                                margin_start=int(12 * e), margin_end=int(12 * e))
+                                margin_top=int(topo * e), margin_bottom=int((12 if SOLIDO else 10) * e),
+                                margin_start=int((14 if SOLIDO else 12) * e), margin_end=int((14 if SOLIDO else 12) * e))
         self.add_overlay(self.conteudo)
         self.set_measure_overlay(self.conteudo, True)
 
@@ -561,7 +653,7 @@ class Quadro(Gtk.Overlay):
         self.conteudo.append(w)
 
     def _desenhar(self, area, cr, w, h):
-        topo = 7 * self.e if self.titulo else 0
+        topo = 7 * self.e if self.titulo and not SOLIDO else 0
         painel_cairo(cr, 0, topo, w, h - topo, self.raio * self.e, self.titulo, area, self.e)
 
 
@@ -570,6 +662,9 @@ def anel(cr, cx, cy, r, fracao, cor, espessura=7.0):
     DotStyle: o anel é uma volta de pontos; os da parte cheia acesos na cor."""
     if DOTS:
         arco_pontos(cr, cx, cy, r, -math.pi / 2, 3 * math.pi / 2, fracao, cor, espessura)
+        return
+    if SOLIDO:
+        arco_solido(cr, cx, cy, r, -math.pi / 2, 3 * math.pi / 2, fracao, cor, espessura)
         return
     cr.set_line_width(espessura)
     cr.set_line_cap(1)
@@ -582,6 +677,28 @@ def anel(cr, cx, cy, r, fracao, cor, espessura=7.0):
         cr.new_sub_path()
         cr.arc(cx, cy, r, -math.pi / 2, -math.pi / 2 + 2 * math.pi * f)
         cr.set_source_rgba(*cor[:3], 1.0)
+        cr.stroke()
+
+
+def arco_solido(cr, cx, cy, r, a0, a1, fracao, cor, espessura=7.0):
+    """Solid: o indicador circular do Material 3 — trilho tonal (surface-container-highest) e o arco cheio
+    na cor, pontas redondas, com um respiro entre os dois."""
+    f = max(0.0, min(1.0, fracao))
+    cr.set_line_width(espessura)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    folga = (espessura + 4) / r if 0.005 < f < 0.995 else 0.0      # o respiro (em radianos), dos dois lados
+    a_f = a0 + (a1 - a0) * f
+    inicio_trilho = a_f + folga if f > 0.005 else a0
+    fim_trilho = a1 - (folga if abs(a1 - a0 - 2 * math.pi) < 1e-3 and f > 0.005 else 0.0)
+    if fim_trilho > inicio_trilho:
+        cr.new_sub_path()
+        cr.arc(cx, cy, r, inicio_trilho, fim_trilho)
+        cr.set_source_rgb(*solido.rgb("surface_container_highest"))
+        cr.stroke()
+    if f > 0.005:
+        cr.new_sub_path()
+        cr.arc(cx, cy, r, a0, a_f)
+        cr.set_source_rgb(*cor[:3])
         cr.stroke()
 
 
@@ -598,7 +715,10 @@ def barra_vertical(cr, x, y, w, h, fracao, cor):
             cr.fill()
         return
     retangulo_redondo(cr, x, y, w, h, w / 2)
-    cr.set_source_rgba(*cor[:3], 0.12)
+    if SOLIDO:
+        cr.set_source_rgb(*solido.rgb("surface_container_highest"))
+    else:
+        cr.set_source_rgba(*cor[:3], 0.12)
     cr.fill()
     f = max(0.0, min(1.0, fracao))
     if f > 0.005:
@@ -689,7 +809,13 @@ class Palco(Gtk.Widget):
 
 
 def tile_cairo(cr, x, y, w, h, r=16, destaque=False):
-    """Um bloco sólido (como a classe CSS .tile) desenhado no cairo: fundo sólido do tema + contorno fino."""
+    """Um bloco sólido (como a classe CSS .tile) desenhado no cairo: fundo sólido do tema + contorno fino.
+    Solid: só o bloco tonal (primary-container quando em destaque), sem contorno."""
+    if SOLIDO:
+        retangulo_redondo(cr, x, y, w, h, r)
+        cr.set_source_rgb(*solido.rgb("primary_container" if destaque else "surface_container_high"))
+        cr.fill()
+        return
     c = cores_tema()
     retangulo_redondo(cr, x, y, w, h, r)
     cr.set_source_rgba(*c["fundo_solido"][:3], 1.0)
@@ -701,6 +827,133 @@ def tile_cairo(cr, x, y, w, h, r=16, destaque=False):
         cr.set_source_rgba(*c["texto"][:3], 0.08)
     cr.set_line_width(1)
     cr.stroke()
+
+
+# ---------- Solid: o metaball dos widgets (cairo, na camada do desktop, só enquanto anima) ----------
+
+def ponte_cartoes(cr, a, b, alcance, forca=1.0):
+    """O pescoço líquido entre duas formas que se encaram, a e b = (x0, y0, x1, y1): perto, uma cintura as une
+    e alarga nas bordas (a "concordância" de duas gotas de mercúrio); longe, ou com forca → 0, ela afina e
+    rompe. Funciona na vertical (uma em cima da outra) e, transposta, na horizontal. True se desenhou."""
+    gx = max(b[0] - a[2], a[0] - b[2])
+    gy = max(b[1] - a[3], a[1] - b[3])
+    vertical = gy >= gx
+    if not vertical:                                        # trabalha sempre "uma em cima da outra"
+        a, b = (a[1], a[0], a[3], a[2]), (b[1], b[0], b[3], b[2])
+    if a[1] > b[1]:
+        a, b = b, a
+    g = max(0.0, b[1] - a[3])
+    s_ = (1 - g / alcance) * forca if g < alcance else 0.0
+    lo, hi = max(a[0], b[0]), min(a[2], b[2])
+    if s_ <= 0.03 or hi - lo < 6:
+        return False
+    cx, meia = (lo + hi) / 2, min((hi - lo) / 2, 70.0)
+    nb = meia * (0.45 + 0.4 * s_)                           # meia largura onde encosta nas formas
+    nm = max(0.0, nb * s_ ** 1.2 * 0.75 - 0.6)              # a cintura: afina até romper
+    if nm <= 0.5:
+        return False
+    abre = min(10.0 + g * 0.3, meia - nb)                   # a borda alarga (concordância), sem passar da face
+    ya, yb, ym = a[3] - 1.5, b[1] + 1.5, (a[3] + b[1]) / 2
+    q = max(g, 4.0) * 0.3
+    cr.save()
+    if not vertical:
+        cr.transform(cairo.Matrix(0, 1, 1, 0, 0, 0))        # (x, y) -> (y, x)
+    cr.move_to(cx - nb - abre, ya)
+    cr.curve_to(cx - nb, ya, cx - nm, ym - q, cx - nm, ym)
+    cr.curve_to(cx - nm, ym + q, cx - nb, yb, cx - nb - abre, yb)
+    cr.line_to(cx + nb + abre, yb)
+    cr.curve_to(cx + nb, yb, cx + nm, ym + q, cx + nm, ym)
+    cr.curve_to(cx + nm, ym - q, cx + nb, ya, cx + nb + abre, ya)
+    cr.close_path()
+    cr.fill()
+    cr.restore()
+    return True
+
+
+def devolver_memoria():
+    """Devolve ao sistema o heap que sobrou livre (as superfícies cairo de uma animação são grandes e o malloc
+    as guarda pra reusar: sem isto o processo fica uns 20 MB mais gordo depois de qualquer animação)."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+    return GLib.SOURCE_REMOVE
+
+
+def _ret(x, y, w, h):
+    return (x, y, x + w, y + h)
+
+
+class Gota:
+    """Uma forma do metaball dos widgets: centro e meio-tamanho em MOLAS criticamente amortecidas (sem pulo,
+    sem passar do alvo: a forma nunca sai da caixa entre o começo e o fim). O tamanho é mais lento que a
+    posição, então a gota estica enquanto viaja. `ancora` = o cartão de onde ela escorre (ou pra onde volta),
+    preso por um pescoço; `vizinhos` = cartões que se fundem com ela no meio do caminho (mudar de tamanho)."""
+
+    def __init__(self, de, para, ancora=None, vizinhos=(), fim=None, atraso=0.0, dono=None):
+        (x0, y0, x1, y1), (a0, b0, a1, b1) = de, para
+        de_c = ((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2)
+        para_c = ((a0 + a1) / 2, (b0 + b1) / 2, (a1 - a0) / 2, (b1 - b0) / 2)
+        self.molas = [solido.Mola(v, w) for v, w in zip(de_c, (17.0, 17.0, 13.0, 13.0))]
+        for m, alvo in zip(self.molas, para_c):
+            m.alvo = alvo
+        self.d0 = max(1.0, sum(abs(a - b) for a, b in zip(de_c, para_c)))
+        self.ancora, self.vizinhos, self.fim, self.atraso, self.dono = ancora, list(vizinhos), fim, atraso, dono
+        # a tela do desktop só repinta esta caixa: começo + fim + a folga onde os pescoços cabem (o pescoço
+        # fica no vão entre as formas; o resto do vizinho é ele mesmo, por cima)
+        pad = 44 if self.vizinhos else 26 if ancora else 4
+        self.vizinhos = [v for v in self.vizinhos if any(
+            max(v[0] - r[2], r[0] - v[2], v[1] - r[3], r[1] - v[3]) < 40 for r in (de, para))]
+        self.caixa = (min(x0, a0) - pad, min(y0, b0) - pad, max(x1, a1) + pad, max(y1, b1) + pad)
+
+    def passo(self, dt):
+        if self.atraso > 0:
+            self.atraso -= dt
+            return True
+        mexe = any([m.passo(dt) for m in self.molas])
+        if mexe and sum(abs(m.x - m.alvo) for m in self.molas) < 0.6:     # a cauda da mola: meio pixel, encerra
+            for m in self.molas:
+                m.x, m.v = m.alvo, 0.0
+            return False
+        return mexe
+
+    @property
+    def progresso(self):
+        return 1 - min(1.0, sum(abs(m.x - m.alvo) for m in self.molas) / self.d0)
+
+    def ret(self):
+        cx, cy, mw, mh = (m.x for m in self.molas)
+        return (cx - mw, cy - mh, cx + mw, cy + mh)
+
+    def desenhar(self, cr):
+        x0, y0, x1, y1 = r = self.ret()
+        w, h = x1 - x0, y1 - y0
+        if w < 0.5 or h < 0.5:
+            return
+        retangulo_redondo(cr, x0, y0, w, h, min(w / 2, h / 2, RAIO))
+        cr.fill()
+        if self.ancora:                                   # o pescoço até o cartão de onde escorre (rompe sozinho)
+            ponte_cartoes(cr, self.ancora, r, 72.0)
+        if self.vizinhos:                                 # funde com os vizinhos só no meio do movimento
+            env = math.sin(math.pi * self.progresso)
+            for v in self.vizinhos:
+                ponte_cartoes(cr, v, r, 40.0, env)
+
+
+def ponto_de_saida(ancora, alvo, r=10):
+    """Onde a gota nasce dentro do cartão vizinho: na face que encara o alvo, centrada no que eles têm em
+    comum (escondida embaixo do cartão, então ela parece SAIR da borda)."""
+    ax0, ay0, ax1, ay1 = ancora
+    bx0, by0, bx1, by1 = alvo
+    gx, gy = max(bx0 - ax1, ax0 - bx1), max(by0 - ay1, ay0 - by1)
+    if gy >= gx:
+        x = min(max((max(ax0, bx0) + min(ax1, bx1)) / 2, ax0 + r), ax1 - r)
+        y = ay1 - r - 2 if by0 >= ay1 else ay0 + r + 2
+    else:
+        y = min(max((max(ay0, by0) + min(ay1, by1)) / 2, ay0 + r), ay1 - r)
+        x = ax1 - r - 2 if bx0 >= ax1 else ax0 + r + 2
+    return (x - r, y - r, x + r, y + r)
 
 
 # ---------- a base de todo widget ----------
@@ -724,7 +977,9 @@ class Widget(Gtk.Window):
         self.tweens = []
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.BOTTOM)
-        Camada.set_namespace(self, "aero-widget")
+        # Solid: outro namespace — sem o desfoque nem o popin do Hyprland pros "aero-widget" (o cartão é
+        # opaco e quem anima é o metaball daqui; o solid-visual.conf põe no_anim nele)
+        Camada.set_namespace(self, "aero-solid-widget" if SOLIDO else "aero-widget")
         Camada.set_anchor(self, Camada.Edge.TOP, True)
         Camada.set_anchor(self, Camada.Edge.LEFT, True)
         Camada.set_exclusive_zone(self, -1)
@@ -762,13 +1017,96 @@ class Widget(Gtk.Window):
         # região de entrada: definida quando a janela ganha tamanho de verdade (no "map" ainda mede 0)
         self.connect("notify::default-width", lambda *_: self.set_entrada(not self.app.config.d.get("editar")))
         self.cartao.connect("realize", lambda *_: GLib.idle_add(self._entrada_inicial))
+        self.assentado = True             # Solid: False enquanto o metaball ainda está formando o cartão
+        self.periodicas = []              # o que a_cada() chama: roda de novo ao reaparecer (área de trabalho)
         self.montar()
+        if self.anima_solido:
+            self.assentado = False
+            self.moldura.set_opacity(0.0)               # a forma vem do metaball (desktop); o conteúdo no fim
         self.present()
+        if self.anima_solido:
+            GLib.idle_add(self._entrar)
         GLib.timeout_add(80, self._pintar_fundo)
         GLib.timeout_add(350, self._caber_na_tela)
 
+    # ---- Solid: entrar, sair e mudar de tamanho pelo metaball ----
+    @property
+    def anima_solido(self):
+        return SOLIDO and not self.menos_movimento and getattr(self.app, "desktop", None) is not None
+
+    def _entrar(self, ancora="auto"):
+        """O cartão escorre do vizinho mais perto (pescoço que rompe) ou, sem vizinho, nasce de uma gota."""
+        if not self.get_visible():
+            self.revelar(instantaneo=True)
+            return GLib.SOURCE_REMOVE
+        x, y, w, h = self.retangulo()
+        alvo = _ret(x, y, w, h)
+        viz = self.app.desktop.vizinho(self) if ancora == "auto" else ancora
+        de = ponto_de_saida(viz, alvo) if viz else (x + w / 2 - 8, y + h / 2 - 8, x + w / 2 + 8, y + h / 2 + 8)
+        self.app.desktop.brotar(Gota(de, alvo, ancora=viz, fim=self._ao_formar, dono=self,
+                                     atraso=self.app.desktop.fila_de_entrada()))
+        return GLib.SOURCE_REMOVE
+
+    def _ao_formar(self, gota):
+        gota.solta = False                     # a gota fica embaixo até o conteúdo terminar de aparecer
+        self.revelar(lambda: setattr(gota, "solta", True))
+
+    def revelar(self, depois=None, instantaneo=False):
+        self.assentado = True
+        if instantaneo or self.menos_movimento:
+            self.moldura.set_opacity(1.0)
+            if depois:
+                depois()
+            return
+        self.animar(170, self.moldura.set_opacity, "out", depois)
+
+    def mudar_tamanho(self, antes):
+        """Solid, opções mudaram o tamanho: a forma vai do retângulo antigo ao novo (fundindo com os vizinhos
+        no meio do caminho) e o conteúdo novo aparece quando ela assenta."""
+        nat = self.get_preferred_size()[1]          # o tamanho NOVO (a janela ainda pode estar no antigo)
+        x, y, w, h = self.registro["x"], self.registro["y"], nat.width - 2 * SOMBRA, nat.height - 2 * SOMBRA
+        if not self.anima_solido or antes == (x, y, w, h) or not self.get_visible():
+            self.revelar(lambda: self.app.desktop.soltar(self) if self.app.desktop else None)
+            return
+        self.assentado = False
+        self.moldura.set_opacity(0.0)
+        viz = [_ret(*o.retangulo()) for o in self.app.widgets if o is not self and o.get_visible() and o.assentado]
+        self.app.desktop.brotar(Gota(_ret(*antes), _ret(x, y, w, h), vizinhos=viz, fim=self._ao_formar, dono=self))
+
+    def sair(self):
+        """Solid: o cartão some (fechado, escondido, outra área): a forma encolhe pra dentro do vizinho mais
+        perto (absorvida) ou vira uma gota que some. O cartão de verdade já saiu da tela."""
+        if not self.anima_solido or not self.assentado:
+            return
+        x, y, w, h = self.retangulo()
+        de = _ret(x, y, w, h)
+        viz = self.app.desktop.vizinho(self)
+        para = ponto_de_saida(viz, de, 6) if viz else (x + w / 2, y + h / 2, x + w / 2, y + h / 2)
+        self.app.desktop.brotar(Gota(de, para, ancora=viz))
+
+    def mostrar(self, visivel):
+        """Área de trabalho mudou: some/aparece pelo metaball; ao aparecer, os dados são renovados na hora."""
+        if visivel == self.get_visible():
+            return
+        if not visivel:
+            self.sair()
+            self.set_visible(False)
+            return
+        if self.anima_solido:
+            self.assentado = False
+            self.moldura.set_opacity(0.0)
+        self.set_visible(True)
+        GLib.timeout_add(80, self._pintar_fundo)       # escondido ao abrir = sem tamanho = sem textura ainda
+        for f in self.periodicas:
+            f()
+        if self.anima_solido:
+            GLib.idle_add(self._entrar, None)
+
     def _pintar_fundo(self):
-        """Pinta o vidro do cartão numa textura do tamanho atual (uma vez; de novo só se o tamanho ou o tema mudar)."""
+        """Pinta o vidro do cartão numa textura do tamanho atual (uma vez; de novo só se o tamanho ou o tema mudar).
+        Solid: não há textura (o cartão é o fundo CSS do .cartao)."""
+        if SOLIDO:
+            return GLib.SOURCE_REMOVE
         w, h = self.moldura.get_width(), self.moldura.get_height()      # = a janela: cartão + 2×SOMBRA
         if w < 4 or h < 4 or (w, h) == self._fundo_tam:
             return GLib.SOURCE_REMOVE
@@ -800,6 +1138,22 @@ class Widget(Gtk.Window):
     def atualizar_opcoes(self, opcoes):
         """Opções mudaram no Settings. Padrão: remonta o conteúdo."""
         self.opcoes = dict(self.opcoes_padrao) | dict(opcoes or {})
+        antes = self.retangulo()
+        if self.anima_solido and self.get_visible():
+            # Solid: a janela sai da tela (a forma fica parada embaixo, igualzinha) e volta já no tamanho novo,
+            # transparente. Mudar o tamanho de uma camada visível congela o quadro velho até o Hyprland
+            # configurar a nova (quase 1 s): o conteúdo velho ficaria por cima da animação.
+            r = _ret(*antes)
+            self.app.desktop.brotar(Gota(r, r, fim=lambda g: setattr(g, "solta", False), dono=self))
+            self.set_visible(False)
+            self.moldura.set_opacity(0.0)
+            self._remontar(antes)
+            self.set_visible(True)
+            GLib.idle_add(self._entrada_inicial)
+            return
+        self._remontar(antes)
+
+    def _remontar(self, antes):
         self.parar()
         while (f := self.cartao.get_first_child()) is not None:
             self.cartao.remove(f)
@@ -811,11 +1165,16 @@ class Widget(Gtk.Window):
         self._fundo_tam = None
         self.montar()
         GLib.timeout_add(80, self._pintar_fundo)
+        if self.anima_solido:          # o tamanho novo só existe depois de medido
+            GLib.timeout_add(60, lambda: (self.mudar_tamanho(antes), False)[1])
 
     def parar(self):
+        ctx = GLib.MainContext.default()
         for t in self.temporizadores:
-            GLib.source_remove(t)
+            if ctx.find_source_by_id(t) is not None:     # um timeout de uma vez só já pode ter acabado
+                GLib.source_remove(t)
         self.temporizadores.clear()
+        self.periodicas.clear()
         for tw in self.tweens:
             tw.cancelar()
         self.tweens.clear()
@@ -835,10 +1194,13 @@ class Widget(Gtk.Window):
 
     # utilidades:
     def a_cada(self, segundos, funcao):
-        """Chama funcao() a cada N segundos (guardado pra parar junto com o widget)."""
+        """Chama funcao() a cada N segundos (guardado pra parar junto com o widget). Widget escondido (outra
+        área de trabalho) não trabalha: ao reaparecer, mostrar() chama de novo na hora."""
         def tick():
-            funcao()
+            if self.get_visible():
+                funcao()
             return GLib.SOURCE_CONTINUE
+        self.periodicas.append(funcao)
         self.temporizadores.append(GLib.timeout_add_seconds(segundos, tick))
 
     def area(self, w, h, desenhar, **kw):
@@ -900,14 +1262,18 @@ class Widget(Gtk.Window):
         for a in self.areas:
             a.queue_draw()
 
-    def fechar(self):
+    def fechar(self, animar=True):
+        if animar:
+            self.sair()
+        if getattr(self.app, "desktop", None) is not None:
+            self.app.desktop.soltar(self)
         self.parar()
         self.palco.limpar()
         self.destroy()
 
     @property
     def escuro(self):
-        return Adw.StyleManager.get_default().get_dark()
+        return escuro()
 
     @property
     def menos_movimento(self):
@@ -944,8 +1310,16 @@ class Desktop(Gtk.Window):
         pronto.connect("clicked", lambda *_: self.app.editar(False))
         self.pilula.append(pronto)
         self.pilula.set_visible(False)
+        # Solid: a tela do metaball — só do tamanho do que está animando e só visível enquanto anima
+        self.liq = Gtk.DrawingArea(halign=Gtk.Align.START, valign=Gtk.Align.START, can_target=False, visible=False)
+        self.liq.set_draw_func(self._desenhar_liq)
+        sobre.add_overlay(self.liq)
         sobre.add_overlay(self.pilula)
         self.set_child(sobre)
+        self.gotas = []
+        self._caixa = (0, 0, 0, 0)
+        self._tique = None
+        self._t = None
 
         direito = Gtk.GestureClick(button=3)
         direito.connect("pressed", self.ao_direito)
@@ -959,6 +1333,81 @@ class Desktop(Gtk.Window):
         arraste.connect("drag-end", self.ao_soltar)
         self.fundo.add_controller(arraste)
         self.present()
+
+    # ---- Solid: o metaball (Gota) de quem entra, sai ou muda de tamanho ----
+    def vizinho(self, w, alcance=220):
+        """O cartão assentado mais perto de w (borda a borda), se estiver a menos de `alcance` px."""
+        x, y, ww, wh = w.retangulo()
+        melhor, dist = None, alcance
+        for o in self.app.widgets:
+            if o is w or not o.get_visible() or not o.assentado:
+                continue
+            ox, oy, ow, oh = o.retangulo()
+            d = math.hypot(max(ox - (x + ww), x - (ox + ow), 0), max(oy - (y + wh), y - (oy + oh), 0))
+            if d < dist:
+                melhor, dist = _ret(ox, oy, ow, oh), d
+        return melhor
+
+    def fila_de_entrada(self):
+        """Quem entra junto (ao abrir, ao trocar de área) entra em cascata: 70 ms depois do anterior."""
+        return 0.07 * sum(1 for g in self.gotas if g.dono is not None and g.atraso > 0)
+
+    def brotar(self, gota):
+        self.gotas = [g for g in self.gotas if gota.dono is None or g.dono is not gota.dono]
+        gota.chamou, gota.solta = False, True
+        self.gotas.append(gota)
+        self._ajustar()
+        if self._tique is None:
+            self._t = None
+            self._tique = self.fundo.add_tick_callback(self._quadro)
+
+    def soltar(self, w):
+        """O widget w fechou: as gotas que esperavam por ele (o conteúdo aparecer) deixam de esperar."""
+        for g in self.gotas:
+            if g.dono is w:
+                g.dono, g.solta = None, True
+
+    def _ajustar(self):
+        if not self.gotas:
+            self.liq.set_visible(False)
+            return
+        x0 = max(0, int(min(g.caixa[0] for g in self.gotas)))
+        y0 = max(0, int(min(g.caixa[1] for g in self.gotas)))
+        x1 = int(max(g.caixa[2] for g in self.gotas)) + 1
+        y1 = int(max(g.caixa[3] for g in self.gotas)) + 1
+        self._caixa = (x0, y0, x1, y1)
+        self.liq.set_margin_start(x0)
+        self.liq.set_margin_top(y0)
+        self.liq.set_size_request(max(1, x1 - x0), max(1, y1 - y0))
+        self.liq.set_visible(True)
+
+    def _quadro(self, _w, relogio):
+        agora = relogio.get_frame_time() / 1e6
+        dt = 1 / 60 if self._t is None else max(0.001, min(0.05, agora - self._t))
+        self._t = agora
+        mudou = False
+        for g in list(self.gotas):
+            if not g.passo(dt) and not g.chamou:
+                g.chamou = True
+                if g.fim:
+                    g.fim(g)
+            if g.chamou and g.solta:
+                self.gotas.remove(g)
+                mudou = True
+        if mudou:
+            self._ajustar()
+        self.liq.queue_draw()
+        if not self.gotas:
+            self._tique = None
+            GLib.timeout_add(400, devolver_memoria)          # depois do último quadro sair da tela
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _desenhar_liq(self, _a, cr, _w, _h):
+        cr.translate(-self._caixa[0], -self._caixa[1])
+        cr.set_source_rgb(*solido.rgb("surface_container"))
+        for g in self.gotas:
+            g.desenhar(cr)
 
     def modo(self, editando):
         self.editando = editando
@@ -1023,6 +1472,9 @@ class Desktop(Gtk.Window):
         cr.rectangle(0, 0, w, h)
         cr.fill()
         cor = cor_texto(area)
+        if SOLIDO:
+            self._desenhar_arrumar_solido(area, cr)
+            return
         for wd in self.app.widgets:
             if not wd.get_visible():
                 continue
@@ -1052,9 +1504,36 @@ class Desktop(Gtk.Window):
             PangoCairo.show_layout(cr, layout)
 
 
+    def _desenhar_arrumar_solido(self, area, cr):
+        """Solid, modo arrumar: sem molduras tracejadas — o nome de cada um numa pílula da primária e, enquanto
+        um é arrastado, ele se FUNDE com os vizinhos que chegam perto (o pescoço do metaball)."""
+        visiveis = [wd for wd in self.app.widgets if wd.get_visible()]
+        if self.arrastando:
+            arr = _ret(*self.arrastando[0].retangulo())
+            cr.set_source_rgb(*solido.rgb("surface_container"))
+            for wd in visiveis:
+                if wd is not self.arrastando[0]:
+                    ponte_cartoes(cr, arr, _ret(*wd.retangulo()), 48.0)
+        for wd in visiveis:
+            x, y, ww, wh = wd.retangulo()
+            layout = PangoCairo.create_layout(cr)
+            fd = Pango.FontDescription.from_string(f"{INTER} Medium 12")
+            layout.set_font_description(fd)
+            layout.set_text(wd.nome, -1)
+            _, log = layout.get_pixel_extents()
+            alt = log.height + 10
+            ey = y - alt - 6 if y - alt - 6 >= self.app.monitor["reservado"][1] + 4 else y + wh + 6
+            retangulo_redondo(cr, x, ey, log.width + 24, alt, alt / 2)
+            cr.set_source_rgb(*solido.rgb("primary"))
+            cr.fill()
+            cr.set_source_rgb(*solido.rgb("on_primary"))
+            cr.move_to(x + 12, ey + 5)
+            PangoCairo.show_layout(cr, layout)
+
+
 # ---------- o aplicativo ----------
 
-class App(Adw.Application):
+class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="com.aero.Widgets", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.pronto = False
@@ -1076,9 +1555,20 @@ class App(Adw.Application):
             if i + 1 < len(args):
                 self.adicionar(args[i + 1])
         if "--recarregar" in args:
+            if _visual() != VISUAL:          # trocou o visual (aero-visual): o processo renasce no visual novo
+                GLib.idle_add(self.renascer)
+                return 0
             self.config.ler()
             self.aplicar_config(tudo=True)
         return 0
+
+    def renascer(self):
+        """Troca de visual: DOTS/SOLIDO/RAIO/SOMBRA são lidos ao iniciar, então o processo se substitui por um
+        novo (mesmo PID; o lançador nem percebe)."""
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # argv[0] "python3", como o lançador abre (o "widgets --reiniciar" e o vigia procuram por essa linha)
+        os.execv(sys.executable, ["python3", os.path.abspath(sys.argv[0])] + sys.argv[1:])
 
     def iniciar(self):
         self.pronto = True
@@ -1087,6 +1577,11 @@ class App(Adw.Application):
         provedor.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if SOLIDO:
+            self.css_solido = Gtk.CssProvider()
+            self.css_solido.load_from_string(css_solido())
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css_solido,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
         self.monitor = monitor_focado()
         self.area = hypr_json("activeworkspace", {}).get("id")
         self.config = Config()
@@ -1097,12 +1592,21 @@ class App(Adw.Application):
         self.vigia = Gio.File.new_for_path(CONFIG).monitor_file(Gio.FileMonitorFlags.NONE, None)
         self.vigia.connect("changed", self.ao_mudar_arquivo)
         self._debounce = None
-        Adw.StyleManager.get_default().connect("notify::dark", lambda *_: [w.ao_tema() for w in self.widgets])
+        # claro/escuro e paleta: o hypr-tema reescreve ~/.cache/hypr-tema/cores a cada troca (inotify, parado = 0)
+        self.vigia_paleta = solido.vigiar(self.ao_mudar_paleta)
         self.vigia_cores = Gio.File.new_for_path(CORES_BARRA).monitor_file(Gio.FileMonitorFlags.NONE, None)
         self.vigia_cores.connect("changed", lambda *_: GLib.timeout_add(300, lambda: ([w.ao_tema() for w in self.widgets], False)[1]))
         GLib.timeout_add_seconds(20, self.vigiar_hyprland)
+        GLib.timeout_add_seconds(4, devolver_memoria)        # o que montar os widgets deixou de sobra
         threading.Thread(target=self.ouvir_areas, daemon=True).start()
         self.aplicar_wallpaper()
+
+    def ao_mudar_paleta(self):
+        if SOLIDO:
+            aplicar_paleta_solida()
+            self.css_solido.load_from_string(css_solido())
+        for w in self.widgets:
+            w.ao_tema()
 
     # ---- por área de trabalho: cada widget pode ter "areas": [1, 3]; sem a chave = todas ----
     def visivel_aqui(self, reg):
@@ -1134,7 +1638,7 @@ class App(Adw.Application):
         if area != self.area:
             self.area = area
             for w in self.widgets:
-                w.set_visible(self.visivel_aqui(w.registro))
+                w.mostrar(self.visivel_aqui(w.registro))
             self.aplicar_wallpaper()
             self.desktop.fundo.queue_draw()
         return GLib.SOURCE_REMOVE
@@ -1174,7 +1678,7 @@ class App(Adw.Application):
         """Compara a configuração com o que está na tela: cria, fecha, move, atualiza opções."""
         if self.widgets and (tudo or any(w.e != float(self.config.d.get("escala", "1")) for w in self.widgets)):
             for w in self.widgets:
-                w.fechar()
+                w.fechar(animar=False)
             self.widgets = []
         atuais = {w.registro["id"]: w for w in self.widgets}
         vistos = set()
@@ -1197,7 +1701,7 @@ class App(Adw.Application):
                 if (dict(w.opcoes_padrao) | dict(reg.get("opcoes") or {})) != w.opcoes:
                     w.atualizar_opcoes(reg.get("opcoes"))
             if w.get_visible() != self.visivel_aqui(reg):
-                w.set_visible(self.visivel_aqui(reg))
+                w.mostrar(self.visivel_aqui(reg))
         for wid, w in atuais.items():
             if wid not in vistos:
                 w.fechar()

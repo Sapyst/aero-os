@@ -7,7 +7,8 @@ Clicar na coluna "cpu%" ou "mem" ordena por ela (e fica gravado, igual à opçã
 import os
 import time
 
-from widgets import DOTS, LARGURA_ESTREITA, PASTEL, Widget, cor_texto, painel_cairo, registrar, texto
+import solido
+from widgets import DOTS, LARGURA_ESTREITA, PASTEL, SOLIDO, Widget, cor_texto, painel_cairo, registrar, retangulo_redondo, texto
 
 MONO_FAM = "Adwaita Mono"
 CLK = os.sysconf("SC_CLK_TCK")
@@ -172,6 +173,16 @@ class Processos(Widget):
                     cr.new_sub_path()
                     cr.arc(x0 + bw * k / (n - 1), y + 15.25 * e, 1.05 * e, 0, 6.2832)
                     cr.set_source_rgba(*(c if k < acesos else cor[:3]), 0.9 if k < acesos else 0.1)
+                    cr.fill()
+                y += 18 * e
+                continue
+            if SOLIDO:                             # Solid: trilho tonal e barra da primária, em pílula
+                retangulo_redondo(cr, x0, y + 14 * e, bw, 3 * e, 1.5 * e)
+                cr.set_source_rgb(*solido.rgb("surface_container_highest"))
+                cr.fill()
+                if frac > 0.01:
+                    retangulo_redondo(cr, x0, y + 14 * e, max(3 * e, bw * min(1.0, frac)), 3 * e, 1.5 * e)
+                    cr.set_source_rgb(*solido.rgb("primary" if i < 3 else "tertiary"))
                     cr.fill()
                 y += 18 * e
                 continue

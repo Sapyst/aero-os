@@ -18,7 +18,6 @@ import math
 import os
 import time
 import urllib.parse
-import urllib.request
 
 PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
 CACHE = os.path.expanduser("~/.cache/aero-shell/clima.json")
@@ -60,7 +59,23 @@ def limpo(texto):
     return "".join(c for c in texto if c not in '"$`\\\n\r\u2028\u2029\x85' and c >= " ")
 
 
+BAIXAR_FORA = False      # True: baixa num curl à parte (os widgets: sem ssl/http no processo, ~8 MB a menos)
+
+
 def baixar(url, tempo=6):
+    if BAIXAR_FORA:
+        import shutil
+        import subprocess
+        if shutil.which("curl"):
+            try:
+                r = subprocess.run(["curl", "-fsSL", "--max-time", str(tempo), "-A", "aero-shell", url],
+                                   capture_output=True, timeout=tempo + 2)
+            except subprocess.SubprocessError as erro:
+                raise OSError(str(erro)) from erro
+            if r.returncode != 0:
+                raise OSError(f"curl {r.returncode}")
+            return json.loads(r.stdout.decode())
+    import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": "aero-shell"})
     with urllib.request.urlopen(req, timeout=tempo) as r:
         return json.loads(r.read().decode())

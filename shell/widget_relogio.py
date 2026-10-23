@@ -3,7 +3,7 @@ destaque, os minutos mais apagados) e a data em números embaixo; outro sub-cart
 Acorda 1x por minuto (ou por segundo, com os segundos ligados). Tamanho fixo."""
 import time
 
-from gi.repository import GLib, Gtk
+from gi.repository import GLib, Gtk, Pango
 
 from widgets import LARGURA_LARGA, Quadro, Widget, registrar
 
@@ -23,8 +23,9 @@ class Relogio(Widget):
         painel = Quadro("clock", e, espaco=0)
         painel.set_size_request(int(236 * e), -1)
         linha = Gtk.Box(spacing=8 * e, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, vexpand=True)
-        self.horas = self.rotulo("", "hora")
-        self.minutos = self.rotulo("", "hora hora-dim")
+        # sem reticências: a hora cabe sempre (com elas, o Doto do DotStyle virava "1… 1…")
+        self.horas = self.rotulo("", "hora", ellipsize=Pango.EllipsizeMode.NONE)
+        self.minutos = self.rotulo("", "hora hora-dim", ellipsize=Pango.EllipsizeMode.NONE)
         linha.append(self.horas)
         linha.append(self.minutos)
         if self.opcoes["segundos"] or self.opcoes["formato"] == "12h":

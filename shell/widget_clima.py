@@ -11,9 +11,10 @@ import cairo
 from gi.repository import Gio, GLib
 
 import clima
-from widgets import LARGURA_LARGA, PASTEL, Widget, cor_texto, painel_cairo, registrar, texto, tracejado
+from widgets import LARGURA_LARGA, PASTEL, SOLIDO, Widget, cor_texto, painel_cairo, registrar, texto, tracejado
 
 FRIO, QUENTE = PASTEL["azul"], PASTEL["pessego"]
+clima.BAIXAR_FORA = True       # a previsão vem por um curl à parte: nada de ssl/http dentro do daemon dos widgets
 MONO_FAM = "JetBrainsMono Nerd Font"
 
 
@@ -127,14 +128,25 @@ class Clima(Widget):
             self._texto_cor(cr, area, f"{d['max']}°", cx - 2 * e, y0 + 62 * e, 13 * e, PASTEL["pessego"], 1.0, "direita")
             self._texto_cor(cr, area, f"{d['min']}°", cx + 2 * e, y0 + 64 * e, 11 * e, PASTEL["azul"], 0.9, "esquerda")
             bx, bw, by, bh = x + 12 * e, tw - 24 * e, y0 + 84 * e, 3 * e
-            cr.rectangle(bx, by, bw, bh)
-            cr.set_source_rgba(*cor[:3], 0.10)
-            cr.fill()
+            if not SOLIDO:
+                cr.rectangle(bx, by, bw, bh)
+                cr.set_source_rgba(*cor[:3], 0.10)
+                cr.fill()
             f0, f1 = (d["min"] - wmin) / faixa, (d["max"] - wmin) / faixa
+            frio, quente = (PASTEL["azul"], PASTEL["rosa"]) if SOLIDO else (FRIO, QUENTE)
             grad = cairo.LinearGradient(bx, 0, bx + bw, 0)
-            grad.add_color_stop_rgb(0, *FRIO)
-            grad.add_color_stop_rgb(1, *QUENTE)
-            cr.rectangle(bx + bw * f0, by, max(bh, bw * (f1 - f0)), bh)
+            grad.add_color_stop_rgb(0, *frio)
+            grad.add_color_stop_rgb(1, *quente)
+            if SOLIDO:                             # Solid: pílulas (trilho tonal + faixa da semana)
+                from widgets import retangulo_redondo
+                import solido
+                bh = 4 * e
+                retangulo_redondo(cr, bx, by, bw, bh, bh / 2)
+                cr.set_source_rgb(*solido.rgb("surface_container_highest"))
+                cr.fill()
+                retangulo_redondo(cr, bx + bw * f0, by, max(bh, bw * (f1 - f0)), bh, bh / 2)
+            else:
+                cr.rectangle(bx + bw * f0, by, max(bh, bw * (f1 - f0)), bh)
             cr.set_source(grad)
             cr.fill()
             chuva = d.get("chance_chuva")

@@ -10,7 +10,7 @@ import subprocess
 
 from gi.repository import GdkPixbuf, Gtk, Pango
 
-from widgets import LARGURA_ESTREITA, Quadro, Widget, hypr, hypr_json, registrar
+from widgets import LARGURA_ESTREITA, SOLIDO, Quadro, Widget, hypr, hypr_json, registrar
 
 # As deusas: estátuas de fotos de uso livre (domínio público, CC0 ou CC BY), em ASCII
 # (tools/make-goddesses.py; créditos no README).
@@ -116,13 +116,15 @@ class Sistema(Widget):
         host = ler("/etc/hostname") or os.uname().nodename
         if self.opcoes.get("privado"):          # prints e lives: nada do usuário nem do nome do PC
             usuario, host = "user", "aero"
-        # linha de prompt, como no terminal: usuario@host ~ ❯ fetch
+        # linha de prompt, como no terminal: usuario@host ~ ❯ fetch. Solid: só "usuario @ host", em Inter
         prompt = Gtk.Box(spacing=0)
-        for s_, cls in ((usuario, "prompt verde"), ("@", "prompt apagado"), (host, "prompt azul"), ("  ~ ", "prompt apagado"),
-                        ("❯ ", "prompt rosa"), ("fetch --goddess", "prompt")):
+        partes = (((usuario, "titulo-s rosa"), ("@", "titulo-s dim"), (host, "titulo-s")) if SOLIDO else
+                  ((usuario, "prompt verde"), ("@", "prompt apagado"), (host, "prompt azul"), ("  ~ ", "prompt apagado"),
+                   ("❯ ", "prompt rosa"), ("fetch --goddess", "prompt")))
+        for s_, cls in partes:
             prompt.append(self.rotulo(s_, cls))
         self.cartao.append(prompt)
-        corpo = Gtk.Box(spacing=10 * e)
+        corpo = Gtk.Box(spacing=10 * e, vexpand=SOLIDO)
         deusa = deusa_do_dia() if self.opcoes.get("deusa", True) else None
         if deusa:
             coluna = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3 * e, valign=Gtk.Align.CENTER)
@@ -144,7 +146,7 @@ class Sistema(Widget):
             corpo.append(coluna)
         quadro = Quadro("system", e, espaco=0)
         quadro.set_hexpand(True)
-        quadro.set_valign(Gtk.Align.CENTER)
+        quadro.set_valign(Gtk.Align.FILL if SOLIDO else Gtk.Align.CENTER)
         osr = next((l.split("=", 1)[1].strip('"') for l in ler("/etc/os-release").splitlines()
                     if l.startswith("PRETTY_NAME=")), "Linux")
         linhas = [("os", osr, "rosa"), ("kernel", os.uname().release, "azul"), ("up", tempo_ligado(), "pessego")]
@@ -155,20 +157,24 @@ class Sistema(Widget):
         for i, g in enumerate(gpus()):
             linhas.append(("gpu" if i == 0 else "", g, "pessego"))
         linhas.append(("mem", memoria(), "verde"))
-        grade = Gtk.Grid(column_spacing=8 * e, row_spacing=1 * e)
+        grade = Gtk.Grid(column_spacing=8 * e, row_spacing=(2 if SOLIDO else 1) * e, valign=Gtk.Align.CENTER, vexpand=True)
         self.valores = {}
         for i, (chave, valor, cor) in enumerate(linhas):
-            k = self.rotulo(chave, f"mono negrito pequeno {cor}", xalign=0, ellipsize=Pango.EllipsizeMode.NONE)
+            k = self.rotulo(chave, "chave-s pequeno" if SOLIDO else f"mono negrito pequeno {cor}", xalign=0,
+                            ellipsize=Pango.EllipsizeMode.NONE)
             k.set_width_chars(6)
-            ponto = self.rotulo("•", "mono apagado pequeno")
             v = self.rotulo(valor, "mono pequeno")
             grade.attach(k, 0, i, 1, 1)
-            grade.attach(ponto, 1, i, 1, 1)
+            if not SOLIDO:                     # Solid: chave e valor bastam (sem o "•" de terminal)
+                grade.attach(self.rotulo("•", "mono apagado pequeno"), 1, i, 1, 1)
             grade.attach(v, 2, i, 1, 1)
             self.valores[chave] = v
         quadro.append(grade)
         corpo.append(quadro)
         self.cartao.append(corpo)
+        self.a_cada(60, self.atualizar)
+        if SOLIDO:                             # Solid: sem o rodapé de terminal (e sem o cursor piscando 1x/s)
+            return
         rodape = Gtk.Box(spacing=0, valign=Gtk.Align.END, vexpand=True)
         rodape.append(self.rotulo("❯ ", "prompt rosa"))
         self.cursor = self.rotulo("_", "cursor")
@@ -176,7 +182,6 @@ class Sistema(Widget):
         self.cartao.append(rodape)
         if not self.menos_movimento:
             self.a_cada(1, self.piscar)        # o cursor pisca 1x por segundo (só um rótulo muda)
-        self.a_cada(60, self.atualizar)
 
     def piscar(self):
         self.cursor.set_opacity(0.0 if self.cursor.get_opacity() > 0.5 else 1.0)
