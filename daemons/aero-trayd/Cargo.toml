@@ -1,0 +1,24 @@
+[package]
+name = "aero-trayd"
+version = "0.1.0"
+edition = "2021"
+description = "Daemon da bandeja do sistema (StatusNotifierWatcher + camada Wayland + dbusmenu) do Aero OS"
+
+[dependencies]
+ab_glyph = "0.2"
+libc = "0.2"
+png = "0.18"
+resvg = { version = "0.45", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+zbus = "5"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

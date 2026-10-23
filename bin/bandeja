@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
-# Bandeja do sistema (ícones dos apps), com clique duplo = abrir. Código: ~/.local/share/aero-shell/bandeja.py
+# Bandeja do sistema (ícones dos apps), com clique duplo = abrir.
+# Usa o daemon nativo em Rust (aero-trayd) com reserva automática para ~/.local/share/aero-shell/bandeja.py
+if [ -x "$HOME/.local/bin/aero-trayd" ]; then
+    exec "$HOME/.local/bin/aero-trayd" "$@"
+fi
 LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 "$HOME/.local/share/aero-shell/bandeja.py" "$@"
