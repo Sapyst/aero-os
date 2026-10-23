@@ -14,6 +14,10 @@ Por que é uma JANELA e não uma "camada" (layer-shell) como a barra:
   estivesse certa; em janelas funciona. Então o menu é uma janela flutuante sem barra de título,
   posicionada logo abaixo da barra pelas regras do hyprland.conf (doc 16).
 - Fica carregado em segundo plano (--daemon); rodar `supermenu` de novo abre/fecha.
+
+No visual Solid (solido.py): superfícies tonais chapadas, chips e cartões em pílula, sem contornos, e o menu
+NASCE da ilha do relógio da AeroBar num metaball (solido.brotar: a gota escorre e vira o painel), voltando
+pra ela ao fechar. A GLArea do metaball só existe durante a animação.
 """
 import math
 import os
@@ -32,6 +36,27 @@ from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import apps  # noqa: E402
 import clima  # noqa: E402
+import solido  # noqa: E402
+
+CSS_SOLIDO = """
+window.solid .conteudo { background-color: @solid_surface_container; color: @solid_on_surface; border: none;
+  border-radius: %(r)dpx; }
+window.solid .caixa-imagem searchentry { border-radius: 999px; border: none; background: @solid_surface_container_highest;
+  color: @solid_on_surface; }
+window.solid .caixa-imagem searchentry text { color: @solid_on_surface; }
+window.solid .caixa-imagem searchentry image { color: @solid_on_surface_variant; }
+window.solid .previsao { border: none; border-radius: %(r2)dpx; background: alpha(black, 0.30); }
+window.solid .modo { border: none; border-radius: 999px; background: alpha(black, 0.32); }
+window.solid .modo:checked { background: @solid_primary; color: @solid_on_primary; }
+window.solid .chip { border-radius: 999px; background: @solid_surface_container_high; padding: 8px 14px; }
+window.solid .chip:checked { background: @solid_secondary_container; color: @solid_on_secondary_container; }
+window.solid flowboxchild.cartao { border-radius: %(r2)dpx; background: @solid_surface_container_high; }
+window.solid flowboxchild.cartao:hover { background: mix(@solid_surface_container_high, @solid_on_surface, 0.08); }
+window.solid flowboxchild.cartao:selected { background: @solid_primary_container; color: @solid_on_primary_container; }
+window.solid .titulo-secao { font-weight: 500; }
+window.solid .rodape { border-top: none; }
+window.solid .rodape button { border-radius: 999px; }
+"""
 
 LARGURA, ALTURA = 1080, 700     # tamanho do painel
 LARGURA_CAIXA = 380             # a CAIXA DA IMAGEM à esquerda (wallpaper + busca + clima + seções)
@@ -101,7 +126,18 @@ class SuperMenu(Gtk.ApplicationWindow):
         Camada.set_anchor(self, Camada.Edge.TOP, True)      # sem esquerda/direita = centralizado
         Camada.set_margin(self, Camada.Edge.TOP, 12)        # o gap (a camada já começa abaixo da barra)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
-        self.set_child(self.montar_conteudo())
+        self.solido = visual_atual() == "Solid"
+        self.anim_s = None
+        if self.solido:              # Solid: encosta na ilha do relógio e o painel nasce dela (metaball)
+            self.add_css_class("solid")
+            self.cartao_s = self.montar_conteudo()
+            self.cartao_s.set_margin_top(12)
+            self.raiz_s = Gtk.Overlay()
+            self.raiz_s.set_child(self.cartao_s)
+            self.set_child(self.raiz_s)
+            Camada.set_margin(self, Camada.Edge.TOP, 0)
+        else:
+            self.set_child(self.montar_conteudo())
         # Perdeu o foco (clicou fora, trocou de janela) = fecha.
         # Mas o menu de botão direito (popover) tira o foco por um instante: com ele aberto não fecha,
         # e a checagem espera um pouquinho pra ignorar essas trocas rápidas de foco.
@@ -597,7 +633,7 @@ class SuperMenu(Gtk.ApplicationWindow):
     # Mostrar/esconder a janela; o deslizar de cima pra baixo é a animação de janela do Hyprland.
 
     def alternar(self):
-        if self.get_visible():
+        if self.get_visible() and not getattr(self, "fechando", False):
             self.fechar()
         else:
             self.abrir()
@@ -614,14 +650,50 @@ class SuperMenu(Gtk.ApplicationWindow):
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.EXCLUSIVE)   # digitar já vai pra busca
         self.present()
         self.busca.grab_focus()
+        if self.solido:
+            self.fechando = False
+            self.brotar(True)
+
+    def brotar(self, abrindo, depois=None):
+        """Solid: o painel nasce da ilha do relógio (ou volta pra ela). solido.brotar = o código comum."""
+        if self.anim_s is not None:
+            self.anim_s.parar()
+        largura = self.get_width() or LARGURA
+        x_rel = solido.barra().get("icones", {}).get("clock")
+        try:
+            mon = Gdk.Display.get_default().get_monitor_at_surface(self.get_surface())
+            tela = mon.get_geometry().width
+        except (AttributeError, TypeError):
+            tela = 2560
+        ix = (x_rel - (tela - largura) / 2) if x_rel is not None else largura / 2
+        ix = min(max(20.0, ix), largura - 20.0)
+
+        def retangulos():
+            ok, b = self.cartao_s.compute_bounds(self.raiz_s)
+            return [(b.get_x(), b.get_y(), b.get_width(), b.get_height())] if ok and b.get_width() > 4 else []
+
+        def fim():
+            self.anim_s = None
+            if depois:
+                depois()
+        self.anim_s = solido.brotar(self.raiz_s, retangulos, self.cartao_s, ix, abrindo, fim,
+                                    dur=0.5 if abrindo else 0.26, k=30.0)
 
     def fechar(self):
         self.animar_clima(False)
         if self.popover is not None:
             self.popover.popdown()
-        if self.get_visible():
-            self.set_visible(False)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
+        if self.get_visible() and self.solido:
+            self.fechando = True
+
+            def sumiu():
+                self.fechando = False
+                self.set_visible(False)
+                self.cartao_s.set_opacity(1.0)
+            self.brotar(False, sumiu)
+        elif self.get_visible():
+            self.set_visible(False)
 
     def clique_fora(self):
         """Clique em qualquer lugar com o menu aberto: fecha se foi FORA dele (e sem menu de contexto)."""
@@ -665,6 +737,14 @@ class App(Adw.Application):
             # dos cantos redondos, doc 37).
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+            if visual_atual() == "Solid":
+                solido.aplicar_css()
+                prov_s = Gtk.CssProvider()
+                r = solido.raio()
+                prov_s.load_from_string(CSS_SOLIDO % {"r": r, "r2": max(12, r - 8)})
+                Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov_s,
+                                                          Gtk.STYLE_PROVIDER_PRIORITY_USER + 2)
+                self.vigia_cores = solido.vigiar()
             self.janela = SuperMenu(self)
             self.hold()       # continua rodando mesmo com a janela escondida
         args = linha.get_arguments()

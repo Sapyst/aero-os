@@ -10,6 +10,7 @@ solido.py — o visual "Solid": formas chapadas e sólidas no estilo do Pixel (M
   aplicar_css()      carrega o css_shell() no display (uma vez por processo)
   vigiar(f)          a paleta mudou (wallpaper novo, claro/escuro): relê, recarrega o CSS e chama f()
   metaball(...)      uma animação de metaball chapado (liquido.CampoSolido) que só existe enquanto anima
+  brotar(...)        o painel que nasce de um ponto da barra e volta pra ele (usa o metaball)
   suave/ease         curvas de animação (smoothstep; "emphasized decelerate" do Material)
   Mola               mola criticamente amortecida (tamanhos/posições que mudam: sem tween linear, sem pulo)
   pescoco/ponte      o pescoço líquido em cairo (borda -> gota; pílula <-> pílula) pra quem não usa GL
@@ -371,6 +372,35 @@ def ponte(cr, xa, xb, y0, h, alcance):
     cr.close_path()
     cr.fill()
     return True
+
+
+def brotar(raiz, retangulos, conteudo, ix, abrindo, depois=None, oy=-2.0, dur=None, cor=None, k=26.0):
+    """O jeito comum de um painel NASCER de um ponto da barra (e voltar pra ele), usado por Hestia, Hermes,
+    Kairos, OSD...: uma gota presa em (ix, oy) — a ilha/ícone — estica e vira os retângulos do painel
+    (retangulos() -> [(x, y, w, h)] nas coordenadas de `raiz`, um Gtk.Overlay), com pescoço líquido; o
+    `conteudo` aparece no fim. Fechando, o contrário. Devolve o objeto da animação (.parar())."""
+    r = raio()
+    conteudo.set_opacity(0.0 if abrindo else 1.0)
+    lado = 1.0 if oy <= 0 else -1.0
+
+    def quadro(t):
+        conteudo.set_opacity(suave(0.7, 1.0, t) if abrindo else 1 - suave(0.0, 0.25, t))
+        caixas = []
+        for i, (x, y, w, h) in enumerate(retangulos()[:3]):
+            local = max(0.0, min(1.0, (t - i * 0.12) / (1 - i * 0.12))) if abrindo else t
+            e = 1 - (1 - local) ** 3 if abrindo else 1 - local * local * (3 - 2 * local)
+            cx, cy = ix + (x + w / 2 - ix) * e, oy + 8 * lado + (y + h / 2 - oy - 8 * lado) * e
+            mw, mh = 9 + (w / 2 - 9) * e, 9 + (h / 2 - 9) * e
+            caixas.append((cx, cy, mw, mh, min(mw, mh, 9 + (r - 9) * e)))
+        e0 = 1 - (1 - t) ** 3 if abrindo else 1 - t
+        gotas = [(ix, oy, 12 * (1 - e0) + 3)] if e0 < 0.95 else []        # a gota presa na ilha
+        return gotas, caixas
+
+    def fim():
+        conteudo.set_opacity(1.0 if abrindo else 0.0)
+        if depois:
+            depois()
+    return metaball(raiz, dur or (0.48 if abrindo else 0.26), quadro, cor or rgb("surface_container"), fim, k=k)
 
 
 def metaball(overlay, dur, quadro, cor, fim=None, k=22.0, abaixo_de=None):

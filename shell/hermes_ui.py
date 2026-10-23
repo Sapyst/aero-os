@@ -569,38 +569,23 @@ class Cartoes(Gtk.Window):
         return min(max(14.0, sino["x"] - x_janela), larg - 14.0)
 
     def _metaball(self, cartao, entrando, depois=None):
+        """O cartão cai do sino (solido.brotar, o mesmo código das janelinhas da barra)."""
         anterior = getattr(cartao, "_anim_s", None)
         if anterior is not None:
             anterior.parar()
-        ix, r = self._x_do_sino(), solido.raio()
-        cartao.set_opacity(0.0 if entrando else 1.0)
-        de_cima = not self.de_baixo
 
-        def quadro(t):
+        def retangulos():
             ok, b = cartao.compute_bounds(self.raiz_s)
-            if not ok or b.get_width() < 4:
-                return [], []
-            x, y, w, h = b.get_x(), b.get_y(), b.get_width(), b.get_height()
-            if entrando:
-                e = solido.enfatizado(t)
-                cartao.set_opacity(solido.suave(0.7, 1.0, t))
-            else:
-                e = 1 - t * t * (3 - 2 * t)
-                cartao.set_opacity(1 - solido.suave(0.0, 0.3, t))
-            oy = -2.0 if de_cima else (self.get_height() or (y + h)) + 2
-            cx, cy = ix + (x + w / 2 - ix) * e, oy + (y + h / 2 - oy) * e
-            mw, mh = 10 + (w / 2 - 10) * e, 10 + (h / 2 - 10) * e
-            gotas = [(ix, oy, 12 * (1 - e) + 2)] if e < 0.9 else []      # a gota ainda presa no sino
-            return gotas, [(cx, cy, mw, mh, min(mw, mh, 10 + (r - 10) * e))]
+            return [(b.get_x(), b.get_y(), b.get_width(), b.get_height())] if ok and b.get_width() > 4 else []
 
         def fim():
             cartao._anim_s = None
-            cartao.set_opacity(1.0 if entrando else 0.0)
             if depois:
                 depois()
-        cartao._anim_s = solido.metaball(self.raiz_s, 0.46 if entrando else 0.26, quadro,
-                                         solido.rgb("error_container" if cartao.has_css_class("critica")
-                                                    else "surface_container_high"), fim, k=24.0)
+        oy = -2.0 if not self.de_baixo else (self.get_height() or 200) + 2.0
+        cor = solido.rgb("error_container" if cartao.has_css_class("critica") else "surface_container_high")
+        cartao._anim_s = solido.brotar(self.raiz_s, retangulos, cartao, self._x_do_sino(), entrando, fim, oy=oy,
+                                       dur=0.46 if entrando else 0.26, cor=cor, k=24.0)
 
     def tirar(self, id_):
         w = self.widgets.pop(id_, None)

@@ -505,33 +505,13 @@ class Janelinha(Gtk.Window):
         if getattr(self, "_anim_s", None) is not None:
             self._anim_s.parar()
             self._anim_s = None
-        ix = self._ponto_do_icone()
-        r = solido.raio()
-        self.cartao.set_opacity(0.0 if abrindo else 1.0)
-
-        def quadro(t):
-            if abrindo:
-                self.cartao.set_opacity(solido.suave(0.7, 1.0, t))
-            else:
-                self.cartao.set_opacity(1 - solido.suave(0.0, 0.25, t))
-            caixas = []
-            for i, (x, y, w, h) in enumerate(self._cartoes_solidos()):
-                local = max(0.0, min(1.0, (t - i * 0.12) / (1 - i * 0.12))) if abrindo else t
-                e = 1 - (1 - local) ** 3 if abrindo else 1 - local * local * (3 - 2 * local)
-                cx, cy = ix + (x + w / 2 - ix) * e, 6 + (y + h / 2 - 6) * e
-                mw, mh = 9 + (w / 2 - 9) * e, 9 + (h / 2 - 9) * e
-                caixas.append((cx, cy, mw, mh, min(mw, mh, 9 + (r - 9) * e)))
-            e0 = 1 - (1 - t) ** 3 if abrindo else 1 - t
-            gotas = [(ix, -2.0, 12 * (1 - e0) + 3)] if e0 < 0.95 else []     # a gota presa na borda (o ícone)
-            return gotas, caixas[:4]
 
         def fim():
             self._anim_s = None
-            self.cartao.set_opacity(1.0 if abrindo else 0.0)
             if depois:
                 depois()
-        self._anim_s = solido.metaball(self.raiz_s, 0.48 if abrindo else 0.26, quadro,
-                                       solido.rgb("surface_container"), fim, k=26.0)
+        self._anim_s = solido.brotar(self.raiz_s, self._cartoes_solidos, self.cartao, self._ponto_do_icone(),
+                                     abrindo, fim)
 
     def fechar(self):
         if self.has_css_class("solid") and self.get_visible() and getattr(self, "raiz_s", None) is not None \
