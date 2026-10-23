@@ -175,18 +175,233 @@ class Indice:
 
 class Arquivo:
     __slots__ = ("path", "nome", "tipo", "mtime", "tam", "r", "x", "y", "cx", "cy", "alvo_x", "alvo_y", "vx", "vy",
-                 "escala", "visivel", "lente", "ox", "oy", "atraso", "nasce", "filhos", "sup", "pedido")
+                 "escala", "visivel", "lente", "ox", "oy", "atraso", "nasce", "filhos", "sup", "pedido",
+                 "grupo", "variantes", "pontos", "rank")
 
-    def __init__(self, path, eh_dir, mtime, tam):
+    def __init__(self, path, eh_dir, mtime, tam, grupo=0):
         self.path, self.nome = path, os.path.basename(path) or path
-        self.tipo = tipo_de(self.nome, eh_dir)
+        self.grupo = grupo                         # > 0: a folder standing for that many results inside it
+        self.tipo = "grupo" if grupo else tipo_de(self.nome, eh_dir)
         self.mtime, self.tam = mtime, tam
-        self.r = 30
+        self.r, self.rank, self.variantes = 30, 0, 0
         self.x = self.y = self.cx = self.cy = self.alvo_x = self.alvo_y = 0.0
         self.vx = self.vy = self.ox = self.oy = self.lente = 0.0
         self.escala, self.visivel, self.atraso = 1.0, 1.0, 0.0
         self.nasce = time.monotonic()
-        self.filhos, self.sup, self.pedido = None, None, False
+        self.filhos = grupo or None
+        self.sup, self.pedido, self.pontos = None, False, None
+
+
+# ---------- the heavy part (search, layout, filler), done in a thread: typing never stutters ----------
+
+SETOR = {"grupo": 180, "dir": 180, "other": -132, "arc": -132, "img": -55, "doc": 0, "code": 58, "aud": 122, "vid": 122}
+NOME_SETOR = {180: "FOLDERS", -132: "OTHER", -55: "IMAGES", 0: "DOCS", 58: "CODE", 122: "MEDIA"}
+SX, SY = 1.45, 0.82              # the orbit is an ellipse: screens are wide
+ANEIS = (75, 205, 320)           # ring distances past the empty middle (best results on the first ring)
+
+
+def raio_rank(k):
+    return RAIOS[0] if k == 0 else RAIOS[1] if k < 5 else RAIOS[2] if k < 16 else RAIOS[3] if k < 30 else RAIOS[4]
+
+
+def nivel(k):
+    return 0 if k < 5 else 1 if k < 16 else 2
+
+
+def buscar(p, itens):
+    """[(path, eh_dir, mtime, tam, grupo, variantes, tipo)], best first. With nothing typed: the folder,
+    newest first. Typing: the index scored. Same-name files (venus.png, venus.txt) collapse into one
+    bubble with a +N badge, and a folder holding 5+ results becomes one bubble that stands for them."""
+    agora = time.time()
+    anel = p["anel"]
+    lo, hi = idade_fracao(anel[0] / ANEL_N), idade_fracao(anel[1] / ANEL_N)
+
+    def passa(eh_dir, nome, mtime):
+        if p["filtro"] and tipo_de(nome, eh_dir) != p["filtro"]:
+            return False
+        idade = agora - mtime
+        return not ((anel[0] > 0 and idade > lo) or (anel[1] < ANEL_N and idade < hi))
+
+    q = p["consulta"].strip().casefold()
+    cands = []
+    if not q:
+        try:
+            with os.scandir(p["pasta"]) as it:
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    try:
+                        eh_dir, st = e.is_dir(), e.stat()
+                    except OSError:
+                        continue
+                    if passa(eh_dir, e.name, st.st_mtime):
+                        cands.append((st.st_mtime, e.path, eh_dir, st.st_mtime, st.st_size))
+        except OSError:
+            pass
+    else:
+        base = p["pasta"].rstrip("/") + "/"
+        for path, nome_cf, eh_dir, mtime, tam in itens:
+            if not path.startswith(base):
+                continue
+            rel = path[len(base):]
+            nota = pontuar(q, nome_cf, rel.casefold())
+            if nota <= 0 or not passa(eh_dir, nome_cf, mtime):
+                continue
+            nota += 2 * math.exp(-(agora - mtime) / (30 * 86400)) - 0.15 * rel.count("/")
+            cands.append((nota, path, eh_dir, mtime, tam))
+    cands.sort(key=lambda t: -t[0])
+    unicos, vistos = [], {}
+    for _n, path, eh_dir, mtime, tam in cands[:400]:
+        nome = os.path.basename(path)
+        chave = None if eh_dir else (os.path.dirname(path), nome.split(".")[0].casefold())
+        if chave is not None and chave in vistos:
+            unicos[vistos[chave]][5] += 1
+            continue
+        if chave is not None:
+            vistos[chave] = len(unicos)
+        unicos.append([path, eh_dir, mtime, tam, 0, 0, tipo_de(nome, eh_dir)])
+    if q:
+        conta = {}
+        for u in unicos[:200]:
+            d = os.path.dirname(u[0])
+            conta[d] = conta.get(d, 0) + 1
+        grandes = {d for d, n in conta.items() if n >= 5 and d != p["pasta"].rstrip("/")}
+        saida, feitas = [], set()
+        for u in unicos:
+            d = os.path.dirname(u[0])
+            if d in grandes:
+                if d not in feitas:
+                    feitas.add(d)
+                    try:
+                        mt = os.stat(d).st_mtime
+                    except OSError:
+                        mt = u[2]
+                    saida.append([d, True, mt, 0, conta[d], 0, "grupo"])
+                continue
+            saida.append(u)
+        unicos = saida
+    return unicos[:MAX_BOLHAS]
+
+
+CENTROS = {}                     # slice centre of each kind in the last layout (for the slice names)
+
+
+def orbitar(itens, w, h):
+    """Rings by rank (the best right next to the search), a slice of the orbit per kind (images up-right,
+    docs right, code down-right, media down-left, folders left), then relaxation so nothing overlaps.
+    Returns [(x, y, r)] around (0, 0)."""
+    n = len(itens)
+    raios = [raio_rank(k) for k in range(n)]
+    R = [BURACO + a for a in ANEIS]
+    # each kind's slice grows with how much it has (a folder full of folders uses the whole orbit),
+    # keeping the order around the circle: folders, other, images, docs, code, media
+    ordem = [180, -132, -55, 0, 58, 122]
+    peso = {g: 0.0 for g in ordem}
+    for k, it in enumerate(itens):
+        peso[SETOR[it[6]]] += 2 * raios[k] + 18
+    total = sum(peso.values()) or 1.0
+    centro, vaos, inicio = {}, {}, 180 - 180 * peso[180] / total
+    for g in ordem:
+        vaos[g] = 360 * peso[g] / total
+        centro[g] = inicio + vaos[g] / 2
+        inicio += vaos[g]
+    fatias = {}
+    for k, it in enumerate(itens):
+        fatias.setdefault((nivel(k), SETOR[it[6]]), []).append(k)
+    alvo = [(0.0, 0.0)] * n
+    for (nv, g), ks in fatias.items():
+        ang = centro[g]
+        mais = menos = 0.0
+        # a roomy slice spreads its ring along the whole arc (no lopsided pile); a crowded one packs tight
+        folga = max(1.0, math.radians(vaos[g]) * 0.92 / (sum((2 * raios[k] + 18) / R[nv] for k in ks) or 1))
+        for j, k in enumerate(ks):
+            passo = (2 * raios[k] + 18) / R[nv] * folga
+            if j == 0:
+                off, mais, menos = 0.0, passo / 2, passo / 2
+            elif j % 2:
+                off, mais = mais + passo / 2, mais + passo
+            else:
+                off, menos = -(menos + passo / 2), menos + passo
+            a = math.radians(ang) + off
+            alvo[k] = (R[nv] * math.cos(a) * SX, R[nv] * math.sin(a) * SY)
+    CENTROS.clear()
+    CENTROS.update({g: c for g, c in centro.items() if peso[g] > 0})
+    pos = [list(a) for a in alvo]
+    lx, ly = w / 2 - 60, h / 2 - 115
+    hx, hy = BURACO * 1.55, BURACO * 0.72
+    for _ in range(60):
+        for i in range(n):
+            pi, ri = pos[i], raios[i]
+            pi[0] += (alvo[i][0] - pi[0]) * 0.05
+            pi[1] += (alvo[i][1] - pi[1]) * 0.05
+            e = math.hypot(pi[0] / (hx + ri), pi[1] / (hy + ri))
+            if 1e-6 < e < 1:
+                pi[0] /= e
+                pi[1] /= e
+            pi[0] = max(-lx + ri, min(lx - ri, pi[0]))
+            pi[1] = max(-ly + ri, min(ly - ri, pi[1]))
+        for i in range(n):
+            pi, ri = pos[i], raios[i]
+            for j in range(i + 1, n):
+                pj = pos[j]
+                lim = ri + raios[j] + 10
+                dx, dy = pj[0] - pi[0], pj[1] - pi[1]
+                if dx > lim or dx < -lim or dy > lim or dy < -lim:
+                    continue
+                d = math.hypot(dx, dy)
+                if d >= lim:
+                    continue
+                if d < 0.01:
+                    dx, dy, d = 1.0, 0.0, 1.0
+                s = (lim - d) / 2 / d
+                pi[0] -= dx * s
+                pi[1] -= dy * s
+                pj[0] += dx * s
+                pj[1] += dy * s
+    return [(pos[k][0], pos[k][1], raios[k]) for k in range(n)]
+
+
+def semear(xyr, voo):
+    """The halftone filler around the new layout (the same physics as the start menu's, nuvem.py).
+    Nearest bubbles looked up in a coarse grid, so it is ~10x cheaper than checking all of them.
+    e[9] is each dot's delay; voo=True: dots fly in from far away (opening), else they just fade in."""
+    passo, alc, cel = 16, 150, 160
+    if not xyr:
+        return []
+    baldes = {}
+    for i, (x, y, r) in enumerate(xyr):
+        for cx in range(int((x - r - alc) // cel), int((x + r + alc) // cel) + 1):
+            for cy in range(int((y - r - alc) // cel), int((y + r + alc) // cel) + 1):
+                baldes.setdefault((cx, cy), []).append(i)
+    x0 = min(x - r for x, y, r in xyr) - alc
+    x1 = max(x + r for x, y, r in xyr) + alc
+    y0 = min(y - r for x, y, r in xyr) - alc
+    y1 = max(y + r for x, y, r in xyr) + alc
+    rnd = random.Random(len(xyr))
+    lim = max(x1 - x0, y1 - y0) / 2 or 1
+    pontos, y, linha = [], y0, 0
+    while y <= y1:
+        x = x0 + (passo / 2 if linha % 2 else 0)
+        while x <= x1:
+            cand = baldes.get((int(x // cel), int(y // cel)))
+            if cand:
+                dists = sorted((math.hypot(x - xyr[i][0], y - xyr[i][1]) - xyr[i][2], i) for i in cand)
+                borda = dists[0][0]
+                if 5 < borda < alc and math.hypot(x / 1.55, y / 0.72) > BURACO * 0.9:
+                    t = borda / alc
+                    if t < 0.35 or rnd.random() > (t - 0.35) * 1.2:
+                        if voo:
+                            ang, longe = rnd.uniform(0, 2 * math.pi), rnd.uniform(180, 420)
+                            sx, sy = x + math.cos(ang) * longe, y + math.sin(ang) * longe
+                            atraso = math.hypot(x, y) / lim * 0.35 + rnd.uniform(0, 0.06)
+                        else:
+                            sx, sy, atraso = x, y, rnd.uniform(0, 0.18)
+                        pontos.append([x, y, sx, sy, 0.0, 0.0, 1.0 + 3.8 * (1 - t) ** 1.6,
+                                       0.06 + 0.36 * (1 - t) ** 1.3, [i for _, i in dists[:3]], atraso])
+            x += passo
+        y += passo * 0.87
+        linha += 1
+    return pontos
 
 
 class Orbita(nuvem.Nuvem):
@@ -194,6 +409,18 @@ class Orbita(nuvem.Nuvem):
         super().__init__(app)
         Camada.set_namespace(self, "orbit")
         self.app_orbit = app
+        # the dark veil is a CSS box under the drawing (painted by the GPU, faded with set_opacity), not a
+        # full-screen cairo paint every frame
+        prov = Gtk.CssProvider()
+        prov.load_from_string(".orbit-veu { background-color: rgba(5, 5, 6, 0.84); }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
+        self.veu = Gtk.Box(hexpand=True, vexpand=True, can_target=False)
+        self.veu.add_css_class("orbit-veu")
+        self.set_child(None)
+        raiz = Gtk.Overlay()
+        raiz.set_child(self.veu)
+        raiz.add_overlay(self.area)
+        self.set_child(raiz)
         self.indice = Indice()
         self.pasta = CASA
         self.consulta = ""
@@ -214,78 +441,60 @@ class Orbita(nuvem.Nuvem):
     # ---------- data ----------
 
     def carregar(self):
-        self.atualizar()
+        pass
 
-    def resultados(self):
-        agora = time.time()
-        lo, hi = idade_fracao(self.anel[0] / ANEL_N), idade_fracao(self.anel[1] / ANEL_N)
+    def atualizar(self, imediato=False):
+        """Something changed (text, folder, filters, index ready): the search, the layout and the filler are
+        worked out in a thread (debounced while typing); only the newest answer is applied."""
+        self.geracao = getattr(self, "geracao", 0) + 1
+        if getattr(self, "_agendado", None):
+            GLib.source_remove(self._agendado)
+        g = self.geracao
+        self._agendado = GLib.timeout_add(0 if imediato else 60, lambda: self._disparar(g))
 
-        def passa(eh_dir, nome, mtime):
-            if self.filtro and tipo_de(nome, eh_dir) != self.filtro:
-                return False
-            idade = agora - mtime
-            if self.anel[0] > 0 and idade > lo:
-                return False
-            if self.anel[1] < ANEL_N and idade < hi:
-                return False
-            return True
+    def _disparar(self, g):
+        self._agendado = None
+        p = {"consulta": self.consulta, "pasta": self.pasta, "filtro": self.filtro, "anel": list(self.anel)}
+        w = self.area.get_width() or self.get_default_size()[0] or 1920
+        h = self.area.get_height() or self.get_default_size()[1] or 1080
+        itens, voo = self.indice.itens, getattr(self, "_abrindo", False)
 
-        q = self.consulta.strip().casefold()
-        if not q:
-            achados = []
-            try:
-                with os.scandir(self.pasta) as it:
-                    for e in it:
-                        if e.name.startswith("."):
-                            continue
-                        try:
-                            eh_dir = e.is_dir()
-                            st = e.stat()
-                        except OSError:
-                            continue
-                        if passa(eh_dir, e.name, st.st_mtime):
-                            achados.append((e.path, eh_dir, st.st_mtime, st.st_size))
-            except OSError:
-                pass
-            achados.sort(key=lambda t: -t[2])
-            return achados[:MAX_BOLHAS]
-        base = self.pasta.rstrip("/") + "/"
-        notas = []
-        for path, nome_cf, eh_dir, mtime, tam in self.indice.itens:
-            if not path.startswith(base):
-                continue
-            rel = path[len(base):]
-            p = pontuar(q, nome_cf, rel.casefold())
-            if p <= 0 or not passa(eh_dir, nome_cf, mtime):
-                continue
-            p += 2 * math.exp(-(agora - mtime) / (30 * 86400)) - 0.15 * rel.count("/")
-            notas.append((p, path, eh_dir, mtime, tam))
-        notas.sort(key=lambda t: -t[0])
-        return [(path, eh_dir, mtime, tam) for _p, path, eh_dir, mtime, tam in notas[:MAX_BOLHAS]]
+        def trabalho():
+            res = buscar(p, itens)
+            xyr = orbitar(res, w, h)
+            GLib.idle_add(self._aplicar, g, res, xyr, semear(xyr, voo))
+        threading.Thread(target=trabalho, daemon=True).start()
+        return False
 
-    def atualizar(self):
-        """Results changed (text, folder, filters, index ready): keep the bubbles that stay (they glide to
-        their new place), new ones are born at the centre, and the filler is re-seeded around the layout."""
-        velhas = {b.path: b for b in self.bolhas}
-        novas, agora = [], time.monotonic()
-        for k, (path, eh_dir, mtime, tam) in enumerate(self.resultados()):
-            b = velhas.get(path) or Arquivo(path, eh_dir, mtime, tam)
-            b.r = RAIOS[0] if k == 0 else RAIOS[1] if k < 6 else RAIOS[2] if k < 16 else RAIOS[3] if k < 30 else RAIOS[4]
-            if path not in velhas:
-                b.nasce = agora + min(0.35, k * 0.012)
+    def _aplicar(self, g, res, xyr, sementes):
+        if g != self.geracao:
+            return False
+        velhas = {(b.path, b.grupo > 0): b for b in self.bolhas}
+        agora, novas = time.monotonic(), []
+        abrindo = getattr(self, "_abrindo", False)
+        for k, (path, eh_dir, mtime, tam, grupo, variantes, _tipo) in enumerate(res):
+            chave = (path, grupo > 0)
+            b = velhas.get(chave) or Arquivo(path, eh_dir, mtime, tam, grupo)
+            b.grupo, b.variantes, b.rank = grupo, variantes, k
+            if grupo:
+                b.filhos = grupo
+            b.x, b.y, b.r = xyr[k]
+            b.alvo_x, b.alvo_y = b.x, b.y
+            if chave not in velhas:
+                b.nasce = agora + (0.12 + min(0.4, math.hypot(b.x, b.y) / 1600) if abrindo else min(0.3, k * 0.01))
+                b.cx, b.cy = b.x * 0.3, b.y * 0.3
             novas.append(b)
-        lugares = empacotar([BURACO] + [b.r for b in novas], folga=9.0)[1:]
-        for b, (x, y) in zip(novas, lugares):
-            b.x, b.y, b.alvo_x, b.alvo_y = x, y, x, y
-            if b.path not in velhas:
-                b.cx, b.cy = x * 0.3, y * 0.3
         self.bolhas = novas
         self.sel = 0 if novas else -1
         self.foco = None
-        self.reseed_suave = getattr(self, "enfeites", None) is not None
-        self.enfeites = None
+        t_rel = agora - self.t_abrir
+        for e in sementes:
+            e[9] += t_rel
+        self.enfeites, self._t_fisica = sementes, agora
+        self._abrindo = False
         self.pedir_extras()
         self.animar()
+        return False
 
     def pedir_extras(self):
         """Thumbnails and folder sizes, loaded in a thread and handed back to the drawing."""
@@ -305,34 +514,33 @@ class Orbita(nuvem.Nuvem):
                         n = 0
                     GLib.idle_add(self._extra_pronto, b, n, None)
                 else:
-                    pb = miniatura(b.path, b.tam)
-                    GLib.idle_add(self._extra_pronto, b, None, pb)
+                    GLib.idle_add(self._extra_pronto, b, None, miniatura(b.path, b.tam))
         threading.Thread(target=trabalho, daemon=True).start()
 
     def _extra_pronto(self, b, filhos, pb):
         if filhos is not None:
-            b.filhos = filhos
+            b.filhos, b.pontos = filhos, None
         if pb is not None:
             b.sup = pixbuf_superficie(pb)
         self.area.queue_draw()
         return False
 
     def semear_enfeites(self, w, h):
-        super().semear_enfeites(w, h)
-        if self.reseed_suave:                      # a new layout while open: dots slide over, no fly-in
-            rnd = random.Random(3)
-            for e in self.enfeites:
-                e[2], e[3], e[9] = e[0] + rnd.uniform(-18, 18), e[1] + rnd.uniform(-18, 18), 0.0
-        self.reseed_suave = False
+        self.enfeites, self._t_fisica = [], time.monotonic()     # seeded in the thread (semear)
 
     # ---------- navigation ----------
 
-    def ir_para(self, pasta):
+    def ir_para(self, pasta, manter=False):
+        """Go to a folder. manter=True keeps the search (a group bubble: its results, inside it)."""
         self.pasta = pasta
-        self.consulta = ""
-        self.atualizar()
+        if not manter:
+            self.consulta = ""
+        self.atualizar(imediato=True)
 
     def abrir_item(self, b):
+        if b.tipo == "grupo":
+            self.ir_para(b.path, manter=True)
+            return
         if b.tipo == "dir":
             self.ir_para(b.path)
             return
@@ -369,7 +577,7 @@ class Orbita(nuvem.Nuvem):
                         conteudo = bruto.decode("utf-8", "replace").expandtabs(4).splitlines()[:28]
                 except OSError:
                     pass
-            elif b.tipo == "dir":
+            elif b.tipo in ("dir", "grupo"):
                 try:
                     conteudo = sorted((e.name + ("/" if e.is_dir() else "")) for e in os.scandir(b.path)
                                       if not e.name.startswith("."))[:28]
@@ -384,12 +592,10 @@ class Orbita(nuvem.Nuvem):
         self.ajustar_ao_monitor()
         self.consulta, self.peek, self.foco, self.filtro = "", None, None, None
         self.anel = [0, ANEL_N]
-        self.bolhas = []
+        self.bolhas, self.enfeites = [], []
         self.t_abrir, self.t_fechar = time.monotonic(), None
-        self.atualizar()
-        for b in self.bolhas:
-            b.nasce = self.t_abrir + 0.12 + min(0.4, math.hypot(b.x, b.y) / 1600)
-        self.reseed_suave = False
+        self._abrindo = True
+        self.atualizar(imediato=True)
         self.indice.construir(self._indice_pronto)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.EXCLUSIVE)
         self.present()
@@ -464,9 +670,10 @@ class Orbita(nuvem.Nuvem):
             fundo = min(1.0, (agora - self.t_abrir) / 0.25)
         else:
             fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
-        cr.set_source_rgba(0.02, 0.02, 0.025, 0.55 * fundo)       # darker than the menu: files need contrast
-        cr.paint()
+        if abs(self.veu.get_opacity() - fundo) > 0.01:
+            self.veu.set_opacity(fundo)
         self.desenhar_anel(cr, w, h, fundo)
+        self.desenhar_guias(cr, w, h, fundo)
         if self.bolhas:
             self.desenhar_enfeites(cr, w, h, agora, fundo)
         sobre = self.bolha_em(*self.mouse) if self.mouse else None
@@ -527,37 +734,52 @@ class Orbita(nuvem.Nuvem):
             cr.set_source_rgba(*FG, 0.12 * a)
             cr.set_line_width(1.2)
             cr.stroke()
-            if b.tipo == "dir":
+            if b.tipo in ("dir", "grupo"):
                 self.aglomerado(cr, b, x, y, r, a)
+                if b.tipo == "grupo":
+                    self._texto_cor(cr, str(b.grupo), x, y, f"Doto Black {max(10, int(r * 0.5))}", FG, a)
             else:
                 glifo, cor = self.glifo(b)
                 self._texto_cor(cr, glifo, x, y, f"Doto Black {max(8, int(r * (0.42 if len(glifo) > 2 else 0.6)))}",
                                 cor, a)
-        if b.r >= RAIOS[1] and not focada:                      # names only on the big ones (no pile-up)
+        if b.variantes and r > 14:                              # same name, other formats: +N
+            bx, by = x + r * 0.72, y - r * 0.72
+            cr.new_path()
+            cr.arc(bx, by, 10, 0, 2 * math.pi)
+            cr.set_source_rgba(*FG, 0.92 * a)
+            cr.fill()
+            self._texto_cor(cr, f"+{b.variantes}", bx, by, "Doto Black 9", (0.05, 0.05, 0.05), a)
+        if b.rank < 5 and not focada:                           # names only on the first ring (no pile-up)
             nome = b.nome if len(b.nome) <= 22 else b.nome[:20] + "…"
+            if b.tipo == "grupo":
+                nome = f"{b.grupo} in {nome}"
             self._texto_cor(cr, nome, x, y + r + 14, "Inter 10.5", FG, 0.72 * a)
         elif focada:
             nome = b.nome if len(b.nome) <= 34 else b.nome[:32] + "…"
             self._texto_cor(cr, nome, x, y + r + 16, "Inter Semi-Bold 12.5", FG, a)
-            sub = (f"{b.filhos} ITEMS" if b.tipo == "dir" and b.filhos is not None else
+            sub = (f"{b.grupo} RESULTS · ENTER TO OPEN" if b.tipo == "grupo" else
+                   f"{b.filhos} ITEMS" if b.tipo == "dir" and b.filhos is not None else
                    "FOLDER" if b.tipo == "dir" else tamanho_txt(b.tam)) + " · " + idade_txt(b.mtime)
             self._texto_cor(cr, sub, x, y + r + 34, "Doto Black 10", FG, 0.5 * a)
 
     def aglomerado(self, cr, b, x, y, r, a):
-        """A folder: one dot per item inside (up to 24), scattered like a little cluster."""
+        """A folder: one dot per item inside (up to 24), scattered like a little cluster (made once)."""
         n = 0 if b.filhos is None else min(24, b.filhos)
-        rnd = random.Random(int(hashlib.md5(b.path.encode()).hexdigest()[:8], 16))
         if n == 0:
             cr.arc(x, y, r * 0.12, 0, 2 * math.pi)
             cr.set_source_rgba(*FG, 0.25 * a)
             cr.fill()
             return
-        for _ in range(n):
-            ang = rnd.uniform(0, 2 * math.pi)
-            d = r * 0.6 * math.sqrt(rnd.random())
+        if b.pontos is None:
+            rnd = random.Random(int(hashlib.md5(b.path.encode()).hexdigest()[:8], 16))
+            b.pontos = []
+            for _ in range(n):
+                ang, d = rnd.uniform(0, 2 * math.pi), 0.6 * math.sqrt(rnd.random())
+                b.pontos.append((d * math.cos(ang), d * math.sin(ang), rnd.uniform(0.05, 0.11), rnd.uniform(0.35, 0.92)))
+        for dx, dy, rr, al in b.pontos:
             cr.new_sub_path()
-            cr.arc(x + d * math.cos(ang), y + d * math.sin(ang), rnd.uniform(r * 0.05, r * 0.11), 0, 2 * math.pi)
-            cr.set_source_rgba(*FG, rnd.uniform(0.35, 0.92) * a)
+            cr.arc(x + dx * r, y + dy * r, rr * r, 0, 2 * math.pi)
+            cr.set_source_rgba(*FG, al * a)
             cr.fill()
 
     def glifo(self, b):
@@ -615,6 +837,37 @@ class Orbita(nuvem.Nuvem):
         if aviso and agora - aviso[1] < 1.6:
             info = aviso[0]
         self._texto_cor(cr, info.upper(), cx, cy + tam * 0.5 + 26, "Doto Black 12", FG, 0.42 * fundo)
+
+    def desenhar_guias(self, cr, w, h, fundo):
+        """The rings (faint dotted ellipses) and the name of each slice that has something in it."""
+        cx, cy = self._centro()
+        cr.save()
+        cr.set_dash([0.1, 11])
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_width(2.2)
+        for a in ANEIS:
+            R = BURACO + a
+            cr.save()
+            cr.translate(cx, cy)
+            cr.scale(SX, SY)
+            cr.new_path()
+            cr.arc(0, 0, R, 0, 2 * math.pi)
+            cr.restore()
+            cr.set_source_rgba(*FG, 0.07 * fundo)
+            cr.stroke()
+        cr.restore()
+        if not self.bolhas:
+            return
+        presentes = {SETOR[b.tipo] for b in self.bolhas}
+        if len(presentes) < 2:
+            return                                         # one kind only: no slices to name
+        R = BURACO + ANEIS[-1] + 95
+        for g in presentes:
+            a = math.radians(CENTROS.get(g, g))
+            ang = g
+            x = max(110, min(w - 110, cx + R * math.cos(a) * SX))
+            y = max(150, min(h - 130, cy + R * math.sin(a) * SY))
+            self._texto_cor(cr, NOME_SETOR[ang], x, y, "Doto Black 12", FG, 0.3 * fundo)
 
     def desenhar_anel(self, cr, w, h, fundo):
         lo, hi = self.anel
@@ -770,10 +1023,18 @@ class Orbita(nuvem.Nuvem):
     def _texto_cor(self, cr, s, x, y, fonte, cor, alfa):
         """Centred text (x, y = its centre). Returns the width."""
         cr.new_path()
-        layout = PangoCairo.create_layout(cr)
-        layout.set_font_description(Pango.FontDescription.from_string(fonte))
-        layout.set_text(s, -1)
-        tw, th = layout.get_pixel_size()
+        cache = self.__dict__.setdefault("_layouts", {})
+        item = cache.get((s, fonte))
+        if item is None:                         # shaping text is the expensive part: done once per text
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription.from_string(fonte))
+            layout.set_text(s, -1)
+            if len(cache) > 500:
+                cache.clear()
+            item = cache[(s, fonte)] = (layout, *layout.get_pixel_size())
+        else:
+            PangoCairo.update_layout(cr, item[0])
+        layout, tw, th = item
         cr.move_to(x - tw / 2, y - th / 2)
         cr.set_source_rgba(*cor[:3], alfa)
         PangoCairo.show_layout(cr, layout)
