@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Núcleo do Hermes (org.freedesktop.Notifications + com.aero.Hermes) e dados da Hestia (áudio, Bluetooth, rede).
+# Supervisionado (aero-supervise): roda o daemon nativo em Rust (hermesd); se ele cair 3x em 60 s, ou com
+# hermes=python em ~/.config/aero/daemons.conf, reinicia o som.py usando a reserva interna em Python (hermes.py).
+if [ "$1" = --python ]; then
+    p=$(python3 -c '
+import glob
+for x in glob.glob("/proc/[0-9]*/cmdline"):
+    try:
+        if b"/aero-shell/som.py\x00--daemon" in open(x, "rb").read():
+            print(x.split("/")[2])
+            break
+    except Exception:
+        pass
+' 2>/dev/null)
+    if [ -n "$p" ] && [ "$p" != "$$" ]; then
+        # o som.py antigo precisa soltar o nome do GApplication antes do novo subir (senão o novo só
+        # repassa a linha de comando para ele e sai com status 1)
+        kill "$p" 2>/dev/null || true
+        for _ in $(seq 60); do
+            kill -0 "$p" 2>/dev/null || break
+            sleep 0.05
+        done
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+        sleep 0.1
+    fi
+    exec env LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 "$HOME/.local/share/aero-shell/som.py" --daemon
+fi
+
+exec "$HOME/.local/bin/aero-supervise" hermes Hermes "$HOME/.local/bin/hermesd" \
+    "$HOME/.local/bin/aero-hermes --python"

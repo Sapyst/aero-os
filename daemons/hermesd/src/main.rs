@@ -2395,6 +2395,18 @@ fn main() {
         .at(CAMINHO_NOTIF, srv_ctl)
         .expect("hermesd: falha ao registrar com.aero.Hermes");
 
+    let tinha_dono_py = conn_sessao
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "NameHasOwner",
+            &(NOME_HERMES,),
+        )
+        .ok()
+        .and_then(|m| m.body().deserialize::<bool>().ok())
+        .unwrap_or(false);
+
     conn_sessao
         .request_name_with_flags(
             WellKnownName::from_static_str_unchecked(NOME_NOTIF),
@@ -2408,6 +2420,51 @@ fn main() {
             RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting,
         )
         .expect("hermesd: falha ao assumir com.aero.Hermes");
+
+    let conn_som = conn_sessao.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        if tinha_dono_py {
+            // Se o som.py estava rodando como dono da reserva em Python, encerramos pelo PID exato
+            // para que ele suba de novo como cliente do hermesd.
+            if let Ok(entradas) = fs::read_dir("/proc") {
+                for e in entradas.flatten() {
+                    if let Some(s) = e.file_name().to_str()
+                        && let Ok(pid) = s.parse::<libc::pid_t>()
+                        && pid > 1
+                        && let Ok(cmd) = fs::read(e.path().join("cmdline"))
+                        && cmd.windows(20).any(|w| w == b"/aero-shell/som.py\0-")
+                    {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+        let som_ativo = conn_som
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "NameHasOwner",
+                &("com.aero.Sound",),
+            )
+            .ok()
+            .and_then(|m| m.body().deserialize::<bool>().ok())
+            .unwrap_or(false);
+        if !som_ativo {
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            let som_bin = format!("{home}/.local/bin/som");
+            let _ = Command::new(som_bin)
+                .arg("--daemon")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+    });
 
     let est_timer = Arc::clone(&estado);
     let conn_timer = conn_sessao.clone();

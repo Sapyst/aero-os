@@ -21,6 +21,7 @@ BIN = os.path.expanduser("~/.local/bin")
 SERVICOS = [
     ("clipboard", "Clipboard history", "clipboard --daemon"),
     ("tray", "System tray", "bandeja"),
+    ("hermes", "Notifications & quick center (Hermes)", "aero-hermes"),
     ("session", "Session helpers (battery, refresh rate, icons)", "aero-energia"),
 ]
 OPCOES = [("Native (Rust)", "rust"), ("Classic (Python)", "python")]

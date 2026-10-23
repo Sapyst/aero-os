@@ -9,10 +9,14 @@ export LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so
 DAEMON="^python3 $HOME/.local/share/aero-shell/som.py --daemon"
 
 garantir_hermesd() {
+    local conf="${XDG_CONFIG_HOME:-$HOME/.config}/aero/daemons.conf"
+    local st="${XDG_RUNTIME_DIR:-/tmp}/aero-supervise-hermes.state"
+    grep -q '^python' "$st" 2>/dev/null && return 0
+    [ "$(sed -n 's/^[[:space:]]*hermes[[:space:]]*=[[:space:]]*\([a-z]*\).*/\1/p' "$conf" 2>/dev/null | tail -1)" = python ] && return 0
     [ -x "$HOME/.local/bin/hermesd" ] || return 0
     gdbus call --session --timeout 1 --dest com.aero.Hermes --object-path /org/freedesktop/Notifications \
         --method com.aero.Hermes.LatestId >/dev/null 2>&1 && return 0
-    setsid -f "$HOME/.local/bin/hermesd" >/dev/null 2>&1
+    "$HOME/.local/bin/aero-hermes" >/dev/null 2>&1 &
     for _ in $(seq 20); do
         gdbus call --session --timeout 1 --dest com.aero.Hermes --object-path /org/freedesktop/Notifications \
             --method com.aero.Hermes.LatestId >/dev/null 2>&1 && return 0
