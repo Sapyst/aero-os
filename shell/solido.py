@@ -488,10 +488,10 @@ floating-sheet > sheet, bottom-sheet > sheet {{ background-color: var(--dialog-b
     border-radius: {max(12, r - 6)}px; }}
 .boxed-list > row, list.boxed-list > row {{ border-bottom: 2px solid var(--window-bg-color); }}
 .boxed-list > row:last-child {{ border-bottom: none; }}
-button {{ border-radius: 999px; }}
-button.flat, button.image-button, button.circular {{ border-radius: 999px; }}
+button {{ border-radius: 20px; }}          /* pílula nos botões normais; botões grandes (cartões) ficam arredondados */
+button.image-button, button.circular {{ border-radius: 999px; }}
 button.suggested-action {{ background-color: var(--accent-bg-color); color: var(--accent-fg-color); }}
-entry, spinbutton, dropdown > button, combobox > box > button {{ border-radius: 999px; }}
+entry, spinbutton, dropdown > button, combobox > box > button {{ border-radius: 20px; }}
 entry:focus-within, spinbutton:focus-within {{ box-shadow: 0 0 0 2px var(--accent-color); }}
 switch {{ border-radius: 999px; }}
 switch:checked > slider {{ background-color: var(--accent-fg-color); }}

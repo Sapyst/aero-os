@@ -24,6 +24,24 @@ CSS_VISUAL = """
 .cartao-visual picture { border-radius: 11px; }
 """
 
+def css_solido():
+    """Solid: o cartão escolhido vira uma superfície tonal (secondary container), sem o anel de contorno."""
+    import sys
+    sys.path.insert(0, os.path.expanduser("~/.local/share/aero-shell"))
+    try:
+        import solido
+        e = solido.esquema()
+    except (ImportError, OSError, ValueError, KeyError):
+        return ""
+    r = solido.raio()
+    return f"""
+.cartao-visual {{ border-radius: {r}px; padding: 8px; background: #{e['surface_container']}; box-shadow: none; }}
+.cartao-visual:hover {{ background: #{e['surface_container_high']}; }}
+.cartao-visual:checked {{ background: #{e['secondary_container']}; color: #{e['on_secondary_container']}; box-shadow: none; }}
+.cartao-visual picture {{ border-radius: {max(8, r - 8)}px; }}
+"""
+
+
 VIDRO = {"desligado": "Off", "leve": "Subtle", "media": "Medium", "forte": "Strong"}
 TINT = {"classic": "classic colors", "system": "theme colors", "general": "wallpaper colors",
         "workspaces": "colors per workspace"}
@@ -49,6 +67,8 @@ class SecaoTema(Secao):
         super().__init__(janela)
         conteudo = Adw.PreferencesPage()
         aplicar_css(CSS_VISUAL)
+        if ler_painel().get("VISUAL") == "Solid":
+            aplicar_css(css_solido())
         gv = Adw.PreferencesGroup(title="Visual",
                                   description="The whole look of the system at once. Each visual remembers its own "
                                               "settings, so switching back restores everything.")

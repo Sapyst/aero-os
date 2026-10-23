@@ -255,6 +255,11 @@ aplicar_tema() {
         gsettings set org.gnome.desktop.interface color-scheme prefer-light
         mako=claro
     fi
+    # Solid: a paleta muda com o wallpaper sem mudar o nome do tema, e o GTK só relê o CSS quando o nome
+    # muda. Um "pisca" de nome força a releitura (invisível: acontece debaixo da onda do aero-tema-onda).
+    if [ "${VISUAL:-}" = Solid ] && [ "$(gsettings get org.gnome.desktop.interface gtk-theme)" = "'$nome'" ]; then
+        gsettings set org.gnome.desktop.interface gtk-theme Adwaita
+    fi
     gsettings set org.gnome.desktop.interface gtk-theme "$nome"
     # o mesmo nome nos arquivos que alguns programas leem em vez do gsettings (GTK2, GTK3/4 sem sessão, fastfetch...)
     for v in 3.0 4.0; do
