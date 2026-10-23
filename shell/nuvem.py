@@ -496,7 +496,24 @@ class Nuvem(Gtk.Window):
 
     # ---------- open / close ----------
 
+    def ajustar_ao_monitor(self):
+        """The layer must cover the whole focused monitor (on its own it opened at 1920×1080 on a 2560×1440
+        screen, so the cloud was off-centre)."""
+        import json
+        import subprocess
+        try:
+            r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=2)
+            for m in json.loads(r.stdout or "[]"):
+                if m.get("focused"):
+                    esc = m.get("scale") or 1
+                    self.set_default_size(int(m["width"] / esc), int(m["height"] / esc))
+                    self.set_size_request(int(m["width"] / esc), int(m["height"] / esc))
+                    return
+        except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+            pass
+
     def abrir(self):
+        self.ajustar_ao_monitor()
         self.busca = ""
         self.carregar()
         self.enfeites = None                       # re-seeded around the new layout on the first frame

@@ -5,30 +5,79 @@
    █▀█ █▀▄ █▄▄ █▀█   █▀█ ██▄ █▀▄ █▄█   █▄█ ▄█
 ```
 
-**A hand-shaped Arch Linux + Hyprland desktop.** Glass, terminal aesthetics, tiling by default.
+**A hand-shaped Arch Linux + Hyprland desktop.** Dots, bubbles and halftone light; tiling by default.
 
 <sub>built by someone who is not much of a coder, with prompt engineering and programming logic</sub>
 
 </div>
 
-![Super menu](screenshots/supermenu-focus.png)
+![DotStyle desktop](screenshots/dotstyle-desktop.png)
 
 ## What is in here
 
 | Folder | What it is | Installs to |
 |---|---|---|
-| `shell/` | the desktop shell (Python + GTK4 + layer-shell): dock, Super menu, Alt+Tab, tray, sound/quick center, clipboard history, emoji picker, power menu and the **widgets** | `~/.local/share/aero-shell` |
+| `shell/` | the desktop shell (Python + GTK4 + layer-shell): **AeroBar** (top bar), **Hermes** (notifications), dock, Super menu, Alt+Tab, tray, quick center, clipboard history, emoji picker, power menu, the **widgets** and the visuals (`shell/visuais/`) | `~/.local/share/aero-shell` |
 | `settings/` | the **Settings** app (libadwaita): theme, icons, dock, widgets, workspaces and transitions, display, sound, keyboard, mouse, screen recording, network, bluetooth, power, location, updates | `~/.local/share/aero-settings` |
 | `bin/` | small commands the desktop calls (maximize/minimize to the dock, theme switcher, wallpaper, screenshots, screen recording...) | `~/.local/bin` |
-| `config/` | Hyprland, Waybar, kitty, mako, wofi, GTK overrides | `~/.config` |
+| `config/` | Hyprland, kitty, wofi, GTK overrides (Waybar and mako configs are kept only for the older visuals) | `~/.config` |
 | `file-manager/` | a modified fork of [EZ File Manager](https://github.com/TechyTechster/ez-fm) (MIT), also used as the system **file picker** through xdg-desktop-portal | `~/.local/share/ez-fm` |
 | `music/` | TerMusic / YTMusic: a YouTube Music engine (mpv + ytmusicapi) with a terminal UI and a GTK app | `~/.local/share/ytmotor` |
 | `login/` | the greetd login screen (GTK, runs in its own Hyprland) | `/etc/greetd` |
 | `boot/` | the start-up animation: the Venus de Milo in ASCII (boot splash, login, first second of the desktop) | `/usr/share/aero` |
 | `x9/` | **X9**, the admin activity log app: every sudo, pkexec and su call, who asked and what for | `~/.local/share/x9` |
-| `system/` | root parts: the X9 service, the memory guard, Btrfs snapshots, polkit rules, and hardware snippets used on the original laptop (hybrid AMD + NVIDIA) | `/etc/...`, `/usr/local` |
+| `fonts/doto/` | Doto, the dot-matrix font of DotStyle (OFL) | `~/.local/share/fonts` |
+| `system/` | root parts: the X9 service, the memory guard, Btrfs snapshots, polkit rules, Wi-Fi country (`system/geo`), and hardware snippets used on the original laptop (hybrid AMD + NVIDIA) | `/etc/...`, `/usr/local` |
 
 Code comments are in Portuguese; everything on screen is in English.
+
+## DotStyle, the new default look
+
+Everything is drawn in **dots**: big bright dots where something lives, smaller and fainter ones as you move away,
+until they fade into the wallpaper. Nothing has a hard border; a card's edge dissolves into a halftone field.
+It is now the default visual (**Settings → Theme → DotStyle (Default)**); the older ones are still there
+(**AeroTerm** and **AeroCloud**, formerly AerOS).
+
+![Bubble menu](screenshots/dotstyle-menu.gif)
+
+**Super menu as a bubble cloud.** Apps are round bubbles with their real, colorful icons. Moving the pointer is a
+lens: bubbles near it grow and push their neighbours away so they never overlap. Around and between them a
+**halftone filler** lives with its own physics: dots are pulled back to their place, pushed by the pointer and by
+growing bubbles, and condense into place when the menu opens. Just type to search (`shell/nuvem.py`).
+
+![Menu](screenshots/dotstyle-menu.png)
+
+**AeroBar**, our own top bar (Waybar is gone in DotStyle). No background, no outline, no margins, rounded,
+and very customizable (`~/.config/aero/aerobar.json`): modules, sizes, glow, colors. It reads the wallpaper under
+it and flips to dark or light text by itself (auto-contrast), and its glow leaks softly instead of ending in a box.
+The **UltraSu shield** shows the time left on the admin ticket by color only: green (more than 15 h), blue (7–15 h),
+yellow (3–7 h), red (under 3 h); hover it and the hours drip down in dots. The battery pulses while charging,
+goes yellow on saver and red when critical. The clock opens a calendar that closes when you click anywhere else.
+
+![Calendar](screenshots/dotstyle-calendar.png)
+
+**Hermes**, our own notification daemon (replaces mako; same freedesktop D-Bus spec, so every app just works).
+A notification is born as bubbles that grow into a card, and a **wave** of dots runs across the screen from the
+bell: over everything, even fullscreen games (fainter there), it never dims the screen and it fades out softly.
+History survives restarts, there are Do Not Disturb modes, and **Settings → Notifications** customizes all of it
+(position, size, timeouts, wave strength and speed, per-app rules). `hermesctl` controls it from a terminal.
+
+![Notification wave](screenshots/dotstyle-wave.png)
+![Notification card](screenshots/dotstyle-notification.png)
+
+**The same field everywhere.** `shell/campo.py` wraps any popup in a live halftone field, so the quick center,
+sound, Wi-Fi and Bluetooth drawers, clipboard, emoji picker, power dialog and Alt+Tab all dissolve at the edges,
+pop in with a spring and dissolve outward when closed. Sliders are rows of dots, tooltips are dot bubbles, and the
+dock's icons sit in bubbles with a halo. When nothing moves, nothing is drawn (0% CPU).
+
+![Quick center](screenshots/dotstyle-quick-center.png)
+
+**Light on RAM.** The bar renders with GTK's cairo renderer (about 30 MB instead of 180 MB), animations stop their
+frame clock at rest, and the file manager keeps one warm window for 10 minutes, so Super+E reopens in ~45 ms.
+
+**Wi-Fi that knows where it is.** When you join a *new* network, a one-shot trigger reads the country the access
+points announce (an IP lookup is optional and off by default), sets the Wi-Fi regulatory country, so 6 GHz and the right
+channels show up, and exits. Nothing stays running. **Settings → Network** shows it and lets you pin a country.
 
 ## Tour
 
@@ -43,10 +92,12 @@ Hyprland's own gaps, share the windows' glass and cost almost no CPU when idle. 
 More widgets can be dropped in: any `widget_*.py` next to the others is loaded, and a `widget_*.json` beside it adds
 it to **Settings → Widgets**.
 
-**Super menu**: pinned, recent, categories, search, and the weather on top of the wallpaper.
+**Super menu** (AeroTerm and AeroCloud): pinned, recent, categories, search, and the weather on top of the wallpaper.
 
-**Settings → Theme**: the whole look at once. Two visuals, **AeroTerm** (terminal, OLED black, ASCII and glitch)
-and **AerOS** (light pastel glass, soft corners); each remembers its own settings, so switching back restores everything.
+![Super menu](screenshots/supermenu-focus.png)
+
+**Settings → Theme**: the whole look at once. Three visuals: **DotStyle** (the default, above), **AeroTerm** (terminal, OLED black,
+ASCII and glitch) and **AeroCloud** (light pastel glass, soft corners); each remembers its own settings, so switching back restores everything.
 
 ![Settings: theme](screenshots/settings-theme.png)
 
@@ -111,18 +162,32 @@ are left out on purpose, so your files and X9's log survive a rollback.
 <sub>Screenshots: wallpapers from [ascii-walls](https://github.com/Sapyst/ascii-walls). Process names,
 places and personal items are blurred.</sub>
 
+## What's next
+
+DotStyle is the direction from now on. The plan, roughly in order:
+
+- **AeroBar page in Settings**, so every option of `aerobar.json` has a switch, and the tray following the bar.
+- **System icons redrawn in dots** (Wi-Fi, sound, battery, folders), keeping real app icons colorful.
+- **The bubble menu's filler** re-flowing around the results while you search.
+- **Under 1 GB of RAM** for the whole desktop at idle: merging the shell's small daemons into fewer processes and
+  measuring every new feature against that budget.
+- **The battery charge limiter** for the Aorus laptop (a DKMS driver), shown in the battery menu.
+- **Packaging**: an install script per part and, later, a package repository and an ISO.
+- Hyprland is pinned at 0.56.2 while it is stable here; updates are tested before the pin moves.
+
 ## Principles
 
 - **Tiling first.** Windows tile; only Super+V (or a dialog) floats one. Maximize is Hyprland's own `fullscreen 1`.
-- **Glass, not plastic.** Theme color at ~62% + Hyprland blur, 1px light outline, straight inner lines.
+- **Dots, not lines.** Edges dissolve into halftone; light glows instead of being boxed in.
+- **Glass, not plastic** (AeroTerm/AeroCloud). Theme color at ~62% + Hyprland blur, 1px light outline.
 - **Terminal soul.** Mono type, TUI frames with the title in the border, pastel accents, no emoji in the UI.
 - **Cheap when idle.** Pre-rendered glass, GLib timers instead of per-frame CSS, caches everywhere.
 
 ## Requirements (what the original machine runs)
 
-Arch Linux, Hyprland 0.56, hyprpaper, hypridle/hyprlock, waybar, mako, wofi, kitty, greetd,
+Arch Linux, Hyprland 0.56, hyprpaper, hypridle/hyprlock, wofi, (waybar and mako only for the older visuals), kitty, greetd,
 python-gobject, gtk4, libadwaita, gtk4-layer-shell, python-cairo, grim/slurp, wl-clipboard,
-pipewire/wireplumber, brightnessctl, networkmanager, bluez, electron + nodejs (file manager),
+pipewire/wireplumber, brightnessctl, networkmanager, bluez, iw + wireless-regdb, snapper + snap-pac, electron + nodejs (file manager),
 mpv + yt-dlp + python-ytmusicapi (music), cava (visualizer).
 
 There is no one-click installer on purpose: this is one person's desktop, tuned to one laptop.
@@ -131,6 +196,7 @@ Read [`install.md`](install.md), take what you like, and adapt paths and hardwar
 ## Credits
 
 - [EZ File Manager](https://github.com/TechyTechster/ez-fm) — MIT, © TechyTechster (license kept in `file-manager/LICENSE`)
+- [Doto](https://github.com/oliverlalan/Doto) font — SIL OFL 1.1 (license in `fonts/doto/OFL.txt`)
 - Weather: [Open-Meteo](https://open-meteo.com)
 - Venus de Milo (start-up animation): public-domain photo, Louvre, via Wikimedia Commons
 - Goddesses of the System widget: ASCII from [ascii-walls](https://github.com/Sapyst/ascii-walls), made from photos
@@ -155,4 +221,4 @@ Read [`install.md`](install.md), take what you like, and adapt paths and hardwar
 
 ## License
 
-MIT for everything written here (see `LICENSE`); `file-manager/` keeps its own MIT notice.
+MIT for everything written here (see `LICENSE`); `file-manager/` keeps its own MIT notice and `fonts/doto/` its OFL.
