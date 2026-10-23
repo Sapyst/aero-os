@@ -1762,3 +1762,6 @@ class App(Gtk.Application):
 
 if __name__ == "__main__":
     App().run(sys.argv[:1])
+    # leave without Python's teardown: the video decoder (GStreamer/VA) can crash while being torn down
+    sys.stdout.flush()
+    os._exit(0)
