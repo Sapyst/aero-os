@@ -21,6 +21,12 @@ Como funciona:
 
 Uso: onda_wallpaper.py --velho A --novo B --monitor DP-2 [--ms 1200] [--x X --y Y]
      (X, Y = de onde a onda nasce, em pixels lógicos DO MONITOR; sem eles, o centro)
+
+Modo --revelar (troca de TEMA/cores, quem chama é o aero-tema-onda): --velho é um print da tela de antes.
+  A superfície vai pra camada OVERLAY (por cima de tudo, sem mouse nem teclado) mostrando o print parado,
+  idêntico à tela: escreve "pronto". O tema novo é aplicado POR BAIXO; quando chega "ir" na entrada, a
+  onda abre um buraco no print e o visual novo, ao vivo, aparece por ela. Quando o buraco cobre a tela,
+  o processo termina sozinho (nada fica na tela).
 """
 import argparse
 import ctypes
@@ -49,6 +55,7 @@ MIN_FILTER, MAG_FILTER, WRAP_S, WRAP_T = 0x2801, 0x2800, 0x2802, 0x2803
 LINEAR, CLAMP_TO_EDGE, UNPACK_ALIGNMENT, UNPACK_ROW_LENGTH = 0x2601, 0x812F, 0x0CF5, 0x0CF2
 
 LIMITE_S = 12          # segurança: sem "soltar" até aqui, some sozinho
+LIMITE_REVELAR_S = 20  # --revelar: sem "ir" até aqui, a onda começa sozinha (a troca de visual leva uns segundos)
 FADE_S = 0.22          # o sumiço final (a troca por baixo já aconteceu: é só por garantia)
 CELULA = 22            # espaço entre os pontinhos (o mesmo dot_spacing da onda do Hermes)
 FAIXA = 130            # até onde o spray de pontos vai à frente da borda (px)
@@ -64,6 +71,7 @@ uniform float amp;         // quanto a borda ondula
 uniform float fase;        // segundos: a borda se mexe enquanto avança
 uniform float zoom;        // o novo "desdobra": começa um tiquinho maior e assenta em 1
 uniform float faixa, cel, pontos, geral, semente, final;
+uniform float revela;      // 1 = modo --revelar: dentro da onda não é o "novo", é um buraco (o vivo aparece)
 out vec4 cor;
 
 float h21(vec2 c) { return fract(sin(dot(c, vec2(127.1, 311.7))) * 43758.5453); }
@@ -85,10 +93,35 @@ vec3 tex(sampler2D s, vec2 p) { return texture(s, p / tela).rgb; }
 
 void main() {
   vec2 p = vec2(gl_FragCoord.x, res.y - gl_FragCoord.y) * tela / res;
-  if (final > .5) { cor = vec4(tex(novo, p) * geral, geral); return; }
+  if (final > .5) { cor = revela > .5 ? vec4(0.) : vec4(tex(novo, p) * geral, geral); return; }
   float aa = tela.x / res.x;
   float d = frente(p);
   vec3 col = tex(velho, p);
+  if (revela > .5) {
+    // o print de antes com um buraco que cresce; na borda, só a luz da lente (o vivo aparece por baixo)
+    float al = 1.;
+    if (d > 0.) col *= 1. - .16 * exp(-d / 6.);
+    if (pontos > 0. && d > 0. && d < faixa * 1.6) {
+      float lin = floor(p.y / (cel * .87));
+      vec2 cc = vec2((floor(p.x / cel - mod(lin, 2.) * .5) + .5 + mod(lin, 2.) * .5) * cel, (lin + .5) * cel * .87);
+      float dc = frente(cc) + (h21(cc + semente) - .5) * faixa * .5;
+      if (dc > 0. && dc < faixa) {
+        float q = 1. - dc / faixa;
+        float rad = cel * .44 * pow(q, 1.35);
+        al *= 1. - pontos * pow(q, .6) * (1. - smoothstep(rad - aa, rad + aa, length(p - cc)));
+      }
+    }
+    float dentro = 1. - smoothstep(-aa, aa, d);
+    al *= 1. - dentro;
+    float luz = 0.;
+    if (d < 1.5) {
+      vec2 n = normalize(vec2(frente(p + vec2(1.5, 0.)) - d, frente(p + vec2(0., 1.5)) - d) + 1e-6);
+      float b = smoothstep(-30., 0., d) * dentro;
+      luz = .10 * b * b * b * max(0., dot(n, vec2(-.707, -.707))) + .04 * b * b;
+    }
+    cor = vec4(col * al + vec3(luz), al + luz) * geral;
+    return;
+  }
   // uma sombra bem leve do líquido sobre o velho, logo à frente da borda (dá profundidade)
   if (d > 0.) col *= 1. - .16 * exp(-d / 6.);
   // o spray DotStyle: pontinhos do wallpaper NOVO chegando antes da onda, maiores perto da borda
@@ -165,8 +198,9 @@ class Onda(Gtk.Window):
         self.args, self.imagens, self.laco = args, imagens, laco
         self.add_css_class("onda-wallpaper")
         Camada.init_for_window(self)
-        Camada.set_layer(self, Camada.Layer.BACKGROUND)
-        Camada.set_namespace(self, "aero-wallpaper-wave")
+        self.revelar = args.revelar
+        Camada.set_layer(self, Camada.Layer.OVERLAY if self.revelar else Camada.Layer.BACKGROUND)
+        Camada.set_namespace(self, "aero-theme-wave" if self.revelar else "aero-wallpaper-wave")
         Camada.set_monitor(self, monitor)
         for borda in (Camada.Edge.TOP, Camada.Edge.BOTTOM, Camada.Edge.LEFT, Camada.Edge.RIGHT):
             Camada.set_anchor(self, borda, True)
@@ -181,7 +215,7 @@ class Onda(Gtk.Window):
         self.ok = False
         self.tique = None
         self.t0 = None                     # o relógio começa no 1º quadro de verdade
-        self.estado = "onda"               # onda -> cobriu -> sumindo
+        self.estado = "parado" if self.revelar else "onda"   # (parado ->) onda -> cobriu -> sumindo
         self.t_sumir = None
         self.semente = (time.time() * 7.31) % 6.283
         geo = monitor.get_geometry()
@@ -227,7 +261,7 @@ class Onda(Gtk.Window):
             uni = _gl("glGetUniformLocation", GLint, GLuint, ctypes.c_char_p)
             self.u = {n: uni(self.prog, n.encode()) for n in
                       ("res", "tela", "velho", "novo", "o", "R", "amp", "fase", "zoom", "faixa", "cel", "pontos",
-                       "geral", "semente", "final")}
+                       "geral", "semente", "final", "revela")}
             self.f_use = _gl("glUseProgram", None, GLuint)
             self.f_2f = _gl("glUniform2f", None, GLint, GLfloat, GLfloat)
             self.f_1f = _gl("glUniform1f", None, GLint, GLfloat)
@@ -263,10 +297,22 @@ class Onda(Gtk.Window):
             return
         self.tique = area.add_tick_callback(self._quadro)
 
+    def ir(self):
+        """--revelar: o tema novo já está por baixo; a onda começa (o relógio zera no próximo quadro)."""
+        if self.estado == "parado":
+            self.estado, self.reiniciar = "onda", True      # o relógio zera no próximo quadro
+            if self.ok and self.tique is None:
+                self.tique = self.area.add_tick_callback(self._quadro)
+
     def _quadro(self, area, relogio):
         agora = relogio.get_frame_time() / 1e6
-        if self.t0 is None:
-            self.t0 = agora
+        if self.t0 is None or getattr(self, "reiniciar", False):
+            self.t0, self.reiniciar = agora, False
+        if self.estado == "parado":                  # o print parado: um quadro e pronto
+            self.agora = agora
+            area.queue_render()
+            self.tique = None
+            return GLib.SOURCE_REMOVE
         if self.estado == "sumindo" and self.t_sumir is None:
             self.t_sumir = agora
         self.agora = agora
@@ -285,7 +331,7 @@ class Onda(Gtk.Window):
         if not self.ok or self.t0 is None:
             return True
         el = self.agora - self.t0
-        t = min(1.0, el / self.dur)
+        t = 0.0 if self.estado == "parado" else min(1.0, el / self.dur)
         geral = 1.0
         if self.estado == "sumindo":
             geral = 1 - suave(0, FADE_S, self.agora - self.t_sumir)
@@ -310,7 +356,16 @@ class Onda(Gtk.Window):
         self.f_1f(self.u["geral"], geral)
         self.f_1f(self.u["semente"], self.semente)
         self.f_1f(self.u["final"], 1.0 if t >= 1 else 0.0)
+        self.f_1f(self.u["revela"], 1.0 if self.revelar else 0.0)
         self.f_draw(TRIANGLE_STRIP, 0, 4)
+        if self.estado == "parado" and not getattr(self, "avisou_pronto", False):
+            self.avisou_pronto = True
+            GLib.idle_add(avisar, "pronto")              # o print já está na tela, igual ao que havia
+            return True
+        if self.revelar and t >= 1 and self.estado == "onda":
+            self.estado = "fim"                          # o buraco já cobre tudo: só sair
+            GLib.idle_add(self.laco.quit)
+            return True
         if t >= 1 and self.estado == "onda":
             self.estado = "cobriu"
             GLib.idle_add(avisar, "cobriu")          # o quadro final (só o novo) já foi desenhado
@@ -348,6 +403,7 @@ def main():
     ap.add_argument("--ms", type=int, default=1200)
     ap.add_argument("--x", type=float)
     ap.add_argument("--y", type=float)
+    ap.add_argument("--revelar", action="store_true")
     args = ap.parse_args()
     laco = GLib.MainLoop()
 
@@ -370,11 +426,14 @@ def main():
             imagens[i] = (dados, passo, w, h)
         except GLib.Error as erro:
             erros.append(f"{caminho}: {erro.message}")
-    fios = [threading.Thread(target=carregar, args=(i, c)) for i, c in enumerate((args.velho, args.novo))]
+    fios = [threading.Thread(target=carregar, args=(i, c))
+            for i, c in enumerate((args.velho,) if args.revelar else (args.velho, args.novo))]
     for f in fios:
         f.start()
     for f in fios:
         f.join()
+    if args.revelar and imagens[0]:
+        imagens[1] = imagens[0]                       # o "novo" nem é lido: dentro da onda é buraco
     if erros:
         falhar(laco, "; ".join(erros))
         return 1
@@ -387,13 +446,20 @@ def main():
     # "soltar" (ou o papel-de-parede fechou a conversa) = pode sumir
     def ler(fonte, condicao):
         linha = sys.stdin.readline() if condicao & GLib.IOCondition.IN else ""
+        if args.revelar and linha.strip() == "ir":
+            janela.ir()
+            return GLib.SOURCE_CONTINUE
         if not linha or linha.strip() == "soltar":
-            janela.soltar()
+            janela.ir() if args.revelar else janela.soltar()
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
     GLib.io_add_watch(GLib.IOChannel.unix_new(sys.stdin.fileno()), GLib.PRIORITY_DEFAULT,
                       GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, ler)
-    GLib.timeout_add_seconds(LIMITE_S, lambda: janela.soltar() or False)
+    if args.revelar:                                  # segurança: o print nunca fica congelado na tela
+        GLib.timeout_add_seconds(LIMITE_REVELAR_S, lambda: janela.ir() or False)
+        GLib.timeout_add_seconds(LIMITE_REVELAR_S + 4, lambda: laco.quit() or False)
+    else:
+        GLib.timeout_add_seconds(LIMITE_S, lambda: janela.soltar() or False)
 
     janela.present()
     laco.run()

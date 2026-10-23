@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# aero-tema-onda — a troca de TEMA/cores com a mesma onda da troca de wallpaper.
+# Uso: aero-tema-onda COMANDO [ARGS...]   (o comando é o que troca o visual/as cores; ex: hypr-tema --forcar)
+#
+#   1. tira um print da tela em foco (grim) e o onda_wallpaper.py --revelar mostra esse print parado por
+#      cima de tudo (camada OVERLAY, sem mouse/teclado): a tela fica igual, congelada;
+#   2. roda o COMANDO por baixo (ninguém vê as peças reiniciando nem as cores trocando);
+#   3. manda "ir": a onda abre um buraco no print a partir do mouse e o visual novo aparece por ela.
+# Sem onda (troca instantânea): opção desligada (painel.conf THEME_ANIM=none), janela em TELA CHEIA
+# (jogo, vídeo: nunca desenhamos por cima), sem grim, ou se algo falhar. O comando roda de qualquer jeito.
+# Dentro de uma troca já com onda (AERO_TEMA_ONDA=1 herdado), só roda o comando: nada de onda dentro de onda.
+# painel.conf: THEME_ANIM=wave|none (padrão wave) e THEME_ANIM_MS=1000 (duração).
+PAINEL="$HOME/.config/hypr/painel.conf"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.log"
+[ $# -gt 0 ] || { echo "uso: aero-tema-onda COMANDO [ARGS...]" >&2; exit 2; }
+[ -n "${AERO_TEMA_ONDA:-}" ] && exec "$@"
+export AERO_TEMA_ONDA=1
+
+so_rodar() { "$@"; exit $?; }
+anim="$(sed -n 's/^THEME_ANIM=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
+[ "${anim:-wave}" = wave ] || so_rodar "$@"
+ms="$(sed -n 's/^THEME_ANIM_MS=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
+[[ "$ms" =~ ^[0-9]+$ ]] || ms=1000
+command -v grim >/dev/null && [ -n "${WAYLAND_DISPLAY:-}" ] || so_rodar "$@"
+
+# monitor em foco, tela cheia e mouse (o mesmo jeito do papel-de-parede)
+IFS=$'\t' read -r mon mx my < <(python3 -I - <<'PY' 2>>"$LOG"
+import json, subprocess, sys
+def hypr(*a):
+    return subprocess.run(["hyprctl", *a], capture_output=True, text=True, timeout=2).stdout
+mon = next((m for m in json.loads(hypr("monitors", "-j") or "[]") if m.get("focused")), None)
+if not mon:
+    sys.exit()
+janela = json.loads(hypr("activewindow", "-j") or "{}")
+area = next((w for w in json.loads(hypr("workspaces", "-j") or "[]")
+             if w.get("id") == (mon.get("activeWorkspace") or {}).get("id")), {})
+if int(janela.get("fullscreen", 0) or 0) > 0 or area.get("hasfullscreen"):
+    sys.exit()                                        # tela cheia: nada por cima, nunca
+cur = json.loads(hypr("cursorpos", "-j") or "{}")
+esc = mon.get("scale") or 1
+w, h = mon["width"] / esc, mon["height"] / esc
+x, y = cur.get("x", 0) - mon["x"], cur.get("y", 0) - mon["y"]
+if not (0 <= x <= w and 0 <= y <= h):
+    x, y = w / 2, h / 2
+print(mon["name"], round(x), round(y), sep="\t")
+PY
+)
+[ -n "${mon:-}" ] || so_rodar "$@"
+
+exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.lock"
+flock -w 5 8 || so_rodar "$@"
+print="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.ppm"
+grim -o "$mon" -t ppm "$print" 2>>"$LOG" || so_rodar "$@"
+
+# GDK_DISABLE=vulkan + GSK_RENDERER=gl: só OpenGL (não acorda a NVIDIA; ver papel-de-parede)
+coproc ONDA { GDK_DISABLE=vulkan GSK_RENDERER=gl LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 \
+    "$HOME/.local/share/aero-shell/onda_wallpaper.py" --revelar --velho "$print" --novo "$print" \
+    --monitor "$mon" --x "$mx" --y "$my" --ms "$ms" 2>>"$LOG"; }
+pid_onda=$ONDA_PID
+exec {LE}<&"${ONDA[0]}" {ESCREVE}>&"${ONDA[1]}"
+linha=""
+read -r -t 4 linha <&"$LE" || linha=""
+rm -f "$print"
+if [ "$linha" != pronto ]; then
+    echo "$(date +%T) onda não rolou (${linha:-sem resposta}): troca instantânea" >> "$LOG"
+    kill "$pid_onda" 2>/dev/null
+    so_rodar "$@"
+fi
+"$@"
+r=$?
+sleep 0.35                     # os apps e as peças do shell terminam de redesenhar com o visual novo
+{ echo ir >&"$ESCREVE"; } 2>/dev/null
+wait "$pid_onda" 2>/dev/null
+exit $r

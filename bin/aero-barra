@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The top bar for the current visual: DotStyle uses AeroBar (drawn in dots), the others use Waybar.
+# The top bar for the current visual: DotStyle (drawn in dots) and Solid (flat Material) use AeroBar, the others use Waybar.
 # Called at login (hyprland.conf exec-once) and by aero-visual when the visual changes.
 visual=$(grep -m1 '^VISUAL=' "$HOME/.config/hypr/painel.conf" 2>/dev/null | cut -d= -f2 | tr -d '"')
 pid_aerobar=$(cat "${XDG_RUNTIME_DIR:-/tmp}/aerobar.pid" 2>/dev/null)
-if [ "$visual" = DotStyle ]; then
+if [ "$visual" = DotStyle ] || [ "$visual" = Solid ]; then
     pkill -x waybar
     [ -n "$pid_aerobar" ] && kill -0 "$pid_aerobar" 2>/dev/null && exit 0
     exec "$HOME/.local/bin/aerobar"

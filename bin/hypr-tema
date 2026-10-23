@@ -134,6 +134,10 @@ EOF
             ":root { --accent-bg-color: #$DEST; --accent-color: #$DEST; --accent-fg-color: #$DEST_FG; }" \
             > "$HOME/.config/gtk-4.0/cores-tema.css"
     fi
+    # 3a) Visual Solid: por cima, o Material dos apps GTK4 (superfícies tonais, sem contornos, pílulas)
+    if [ "${VISUAL:-}" = Solid ]; then
+        python3 -I "$SOLIDO" gtk "$tema" >> "$HOME/.config/gtk-4.0/cores-tema.css" 2>/dev/null
+    fi
     # 3b) Apps GTK3 (Thunar, pavucontrol...): mesmas cores, pelo jeito antigo do GTK3 (@define-color)
     gerar_gtk3 "$tema" "$rgbs"
     [ "$tema" = escuro ] && textoh="rgba(ffffffdd)" || textoh="rgba(1e1e1edd)"
@@ -282,6 +286,21 @@ aplicar_filtro() {
     echo "$temp" > "$ESTADO/filtro"
 }
 
+SOLIDO="$HOME/.local/share/aero-shell/solido.py"
+solido_cores() {   # COR_ESCURA/COR_CLARA = surface de cada modo, destaque = primary (só na memória)
+    local k v
+    while IFS='=' read -r k v; do
+        [[ $v =~ ^[0-9a-f]{6}$ ]] || continue
+        case "$k" in SOLID_SURFACE) COR_ESCURA=$v ;; SOLID_PRIMARY) DEST_ESCURO=$v ;; esac
+    done < <(python3 -I "$SOLIDO" vars escuro 2>/dev/null)
+    while IFS='=' read -r k v; do
+        [[ $v =~ ^[0-9a-f]{6}$ ]] || continue
+        case "$k" in SOLID_SURFACE) COR_CLARA=$v ;; SOLID_PRIMARY) DEST_CLARO=$v ;; esac
+    done < <(python3 -I "$SOLIDO" vars claro 2>/dev/null)
+    COR_ALFA=1.0; BAR_ALPHA=1.0; COR_SINC=1
+    if [ "$tema" = escuro ]; then COR_DESTAQUE=${DEST_ESCURO:-$COR_DESTAQUE}; else COR_DESTAQUE=${DEST_CLARO:-$COR_DESTAQUE}; fi
+}
+
 aplicar() {
     # Valores padrão; o painel.conf sobrescreve
     TEMA_MODO=auto; TEMA_CLARO=07:00; TEMA_ESCURO=18:00
@@ -306,8 +325,18 @@ aplicar() {
         *) dentro "$agora" "$(minutos "$FILTRO_INICIO")" "$(minutos "$FILTRO_FIM")" && filtro=$FILTRO_TEMP || filtro=0 ;;
     esac
 
+    # Visual Solid: as cores saem da PALETA TONAL (solido.py, a partir da cor do wallpaper): superfícies
+    # sólidas (sem vidro: alfa 1) e destaque = a primária do esquema.
+    if [ "${VISUAL:-}" = Solid ]; then solido_cores; fi
+
     if [ "$1" = --forcar ] || [ "$tema" != "$(cat "$ESTADO/tema" 2>/dev/null)" ] ||
        [ "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" != "$(cat "$ESTADO/cores" 2>/dev/null)" ]; then
+        # a troca de cores com a onda (aero-tema-onda): roda este mesmo script por baixo de um print que
+        # se desfaz numa onda. No login (--loop) e dentro de uma troca que já tem onda, troca direto.
+        if [ -z "${AERO_TEMA_ONDA:-}" ] && [ -z "${SEM_ONDA:-}" ] && [ -x "$HOME/.local/bin/aero-tema-onda" ]; then
+            "$HOME/.local/bin/aero-tema-onda" "$0" --forcar
+            return
+        fi
         aplicar_tema "$tema"
     fi
     if [ "$1" = --forcar ] || [ "$filtro" != "$(cat "$ESTADO/filtro" 2>/dev/null)" ]; then aplicar_filtro "$filtro"; fi
@@ -330,7 +359,7 @@ hyprland_vivo() {
 }
 
 if [ "$1" = --loop ]; then
-    aplicar --forcar
+    SEM_ONDA=1 aplicar --forcar        # no login: sem onda (a tela ainda está nascendo)
     # A cada minuto, ANTES de aplicar: se o meu Hyprland morreu (travou e você entrou de novo), saio.
     # Sem isso, esta cópia "fantasma" rodava para sempre ao lado da cópia da sessão nova, e podia
     # anotar no ~/.cache/hypr-tema uma troca (filtro, tema) que nunca chegou à sessão nova.

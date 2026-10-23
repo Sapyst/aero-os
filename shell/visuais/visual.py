@@ -4,7 +4,10 @@ visual.py — os "visuais" do sistema (Settings → Theme → Overview → Visua
 
   AeroTerm  o visual de sempre: terminal, OLED, ASCII, glitch
   AerOS     claro, vidro pastel, cantos macios, movimento fluido (no Settings aparece como "AeroCloud")
-  DotStyle  pontos: preto OLED, tudo em matriz de pontos, um único acento vermelho
+  DotStyle  pontos: preto OLED, tudo em matriz de pontos, um único acento vermelho (no Settings aparece como
+            "Dot (incomplete)": guardado, mas incompleto)
+  Solid     o padrão: formas chapadas e sólidas no estilo do Pixel (Material You): superfícies tonais da cor
+            do wallpaper (shell/solido.py), sem contornos, sem vidro, cantos no raio do sistema, metaball
 
 Cada visual é um PERFIL em ~/.config/aero-shell/visuais/<Nome>/: ao sair de um, tudo o que define a
 aparência é salvo nele; ao entrar, é restaurado. Assim voltar ao AeroTerm devolve exatamente o que era,
@@ -30,7 +33,7 @@ WAYBAR = os.path.join(H, ".config/waybar")
 WIDGETS = os.path.join(H, ".config/aero-shell/widgets.json")
 HYPRPAPER = os.path.join(H, ".config/hypr/hyprpaper.conf")
 BIN = os.path.join(H, ".local/bin")
-VISUAIS = ["AeroTerm", "AerOS", "DotStyle"]
+VISUAIS = ["AeroTerm", "AerOS", "DotStyle", "Solid"]
 
 CHAVES = """TEMA_MODO TEMA_CLARO TEMA_ESCURO COR_CLARA COR_ESCURA COR_ALFA COR_SINC ESMAECER COR_CLARA_MANUAL
 COR_ESCURA_MANUAL WALL_CORES COR_DESTAQUE WALL_SATURACAO WALL_BRILHO WALL_CONTRASTE ICONES_ASCII ICONES_BASE
@@ -48,6 +51,14 @@ DOTSTYLE = {"TEMA_MODO": "escuro", "COR_ESCURA": "0b0b0c", "COR_ALFA": "0.86", "
             "COR_DESTAQUE": "ecebe8", "ICONES_ASCII": "0", "TRANS_EFFECT": "dots", "TRANS_TINT": "none", "ESMAECER": "0.0", "ANIM": "1",
             "ANIM_VEL": "normal"}
 DOTSTYLE_WALL = os.path.join(H, "Pictures/Wallpapers/dotstyle-venus.png")
+
+# o Solid na primeira vez: parte do AeroTerm (ícones, dock...) e troca o que é dele. As cores de verdade
+# saem da paleta tonal (o hypr-tema chama o solido.py): aqui só o que liga isso — cores do wallpaper,
+# tudo sólido (alfa 1, sem vidro), sem efeito de transição de área.
+SOLID = {"TEMA_MODO": "escuro", "COR_SINC": "1", "COR_ALFA": "1.0", "BAR_ALPHA": "1.0", "WALL_CORES": "1",
+         "ICONES_ASCII": "0", "VIDRO": "desligado", "TRANS_EFFECT": "none", "TRANS_TINT": "none",
+         "ESMAECER": "0.0", "ANIM": "1", "ANIM_VEL": "normal"}
+SOLID_WALL = os.path.join(H, "Pictures/Wallpapers/solid-shapes.png")
 
 
 def waybar_dotstyle(config_base):
@@ -158,6 +169,20 @@ def restaurar(nome):
         open(VISUAL_CONF, "w").write(open(os.path.join(AQUI, "dotstyle-visual.conf")).read())
         open(os.path.join(WAYBAR, "config.jsonc"), "w").write(waybar_dotstyle(os.path.join(base, "waybar-config.jsonc")))
         shutil.copy2(os.path.join(AQUI, "dotstyle-style.css"), os.path.join(WAYBAR, "style.css"))
+    elif novo and nome == "Solid":
+        pai = json.load(open(os.path.join(base, "estado.json"))) if os.path.exists(os.path.join(base, "estado.json")) \
+            else {"painel": {}, "widgets": {}}
+        if not os.path.exists(SOLID_WALL):
+            os.makedirs(os.path.dirname(SOLID_WALL), exist_ok=True)
+            subprocess.run(["python3", "-I", os.path.join(os.path.dirname(AQUI), "solido.py"), "wallpaper", SOLID_WALL],
+                           capture_output=True)
+        estado = {"painel": dict(pai.get("painel", {}), **SOLID),
+                  "wallpaper": SOLID_WALL if os.path.exists(SOLID_WALL) else None,
+                  "widgets": dict(pai.get("widgets") or {}, vidro="0", por_area={})}
+        open(VISUAL_CONF, "w").write(open(os.path.join(AQUI, "solid-visual.conf")).read())
+        if os.path.exists(os.path.join(base, "waybar-config.jsonc")):
+            shutil.copy2(os.path.join(base, "waybar-config.jsonc"), os.path.join(WAYBAR, "config.jsonc"))
+            shutil.copy2(os.path.join(base, "waybar-style.css"), os.path.join(WAYBAR, "style.css"))
     elif novo and nome == "AerOS":
         estado = {"painel": dict(AEROS), "wallpaper": AEROS_WALL if os.path.exists(AEROS_WALL) else None,
                   "widgets": {"vidro": "0.45", "por_area": {}}}
@@ -243,7 +268,7 @@ def recarregar_shell():
     Os widgets relêem sozinhos (vigiam o widgets.json); aqui só recebem o --recarregar."""
     import signal
     rodar = lambda *c: subprocess.run(list(c), capture_output=True)  # noqa: E731
-    # a barra do visual: AeroBar no DotStyle, Waybar nos outros (aero-barra decide e fecha a outra)
+    # a barra do visual: AeroBar no DotStyle e no Solid, Waybar nos outros (aero-barra decide e fecha a outra)
     pid_aerobar = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aerobar.pid")
     if os.path.exists(pid_aerobar):
         try:
@@ -289,6 +314,11 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--recarregar":
         recarregar_shell()
     elif len(sys.argv) > 1:
+        # a troca inteira por baixo da onda (aero-tema-onda): print parado por cima, troca, onda revela
+        onda = os.path.join(BIN, "aero-tema-onda")
+        if not os.environ.get("AERO_TEMA_ONDA") and os.access(onda, os.X_OK) and sys.argv[1] in VISUAIS \
+                and sys.argv[1] != atual():
+            os.execv(onda, [onda, sys.executable, "-I", os.path.abspath(__file__), sys.argv[1]])
         trocar(sys.argv[1])
     else:
         print(atual())

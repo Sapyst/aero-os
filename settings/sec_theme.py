@@ -9,11 +9,12 @@ import json
 import os
 import subprocess
 
-from comum import Adw, GLib, Gtk, Secao, aplicar_css, em_segundo_plano, ler_painel, pagina
+from comum import Adw, GLib, Gtk, Secao, aplicar_css, atualizar_painel, em_segundo_plano, ler_painel, pagina
 
-# (internal name, name on screen, description). "AerOS" is shown as AeroCloud: the profile keeps its old
-# name so the settings saved inside it are not lost.
-VISUAIS = [("DotStyle", "DotStyle", "Dots, OLED black, one red accent"),
+# (internal name, name on screen, description). "AerOS" is shown as AeroCloud and "DotStyle" as
+# "Dot (incomplete)": the profiles keep their old names so the settings saved inside them are not lost.
+VISUAIS = [("Solid", "Solid", "Flat solid shapes, colors from the wallpaper, liquid motion"),
+           ("DotStyle", "Dot (incomplete)", "Dots, OLED black, one red accent. Not finished"),
            ("AeroTerm", "AeroTerm", "Terminal, OLED black, ASCII and glitch"),
            ("AerOS", "AeroCloud", "Light pastel glass, soft corners, fluid motion")]
 PASTA_VISUAIS = os.path.expanduser("~/.local/share/aero-shell/visuais")
@@ -51,7 +52,8 @@ class SecaoTema(Secao):
         gv = Adw.PreferencesGroup(title="Visual",
                                   description="The whole look of the system at once. Each visual remembers its own "
                                               "settings, so switching back restores everything.")
-        caixa = Gtk.Box(spacing=12, homogeneous=True)
+        caixa = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
+                            max_children_per_line=4, column_spacing=12, row_spacing=12)
         self.cartoes = {}
         primeiro = None
         for nome, rotulo, desc in VISUAIS:
@@ -73,6 +75,13 @@ class SecaoTema(Secao):
             self.cartoes[nome] = b
         self.carregando_visual = False
         gv.add(caixa)
+        # a troca de visual e de cores (wallpaper novo, claro/escuro, destaque) com a onda da troca de wallpaper
+        self.onda = Adw.ComboRow(title="Theme change animation", use_markup=False,
+                                 subtitle="Wave unfolds the new look over the old one. Never over a fullscreen game",
+                                 model=Gtk.StringList.new(["Wave", "None"]))
+        self.onda.connect("notify::selected", lambda *_: self.carregando_visual or
+                          atualizar_painel(THEME_ANIM="wave" if self.onda.get_selected() == 0 else "none"))
+        gv.add(self.onda)
         conteudo.add(gv)
         g = Adw.PreferencesGroup(title="Global theme",
                                  description="The default for every workspace. Workspaces can change parts of it.")
@@ -108,6 +117,7 @@ class SecaoTema(Secao):
         p = ler_painel()
         self.carregando_visual = True
         self.cartoes.get(p.get("VISUAL", "AeroTerm"), self.cartoes["AeroTerm"]).set_active(True)
+        self.onda.set_selected(1 if p.get("THEME_ANIM") == "none" else 0)
         self.carregando_visual = False
         escuro = "dark" in subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
                                           capture_output=True, text=True).stdout

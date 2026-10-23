@@ -92,6 +92,62 @@ def aeroterm():
     s.write_to_png(os.path.join(AQUI, "previa-AeroTerm.png"))
 
 
+def solid():
+    """Solid: formas chapadas, superfícies tonais (a paleta do solido.py), barra e dock em pílula, sem contornos."""
+    import sys
+    sys.path.insert(0, os.path.dirname(AQUI))
+    import solido
+    e = solido.esquema(True, {"COR_DESTAQUE": "2f8f9a"})
+    c = lambda k: solido.de_hexa(e[k])  # noqa: E731
+    s = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
+    cr = cairo.Context(s)
+    cr.set_source_rgb(*solido.tom(205, 30, 22))           # o wallpaper do Solid, em miniatura
+    cr.paint()
+    for fx, fy, fr, t, cc in ((0.82, 0.18, 0.55, 40, 34), (0.12, 0.92, 0.62, 30, 46), (0.62, 1.05, 0.42, 48, 30)):
+        cr.set_source_rgb(*solido.tom(205 + (t - 50) * 0.4, cc, t))
+        cr.arc(fx * W, fy * H, fr * H, 0, 2 * math.pi)
+        cr.fill()
+    arredondado(cr, 6, 4, W - 12, 12, 6)                  # barra: pílula sólida
+    cr.set_source_rgb(*c("surface_container"))
+    cr.fill()
+    arredondado(cr, W / 2 - 14, 6, 28, 8, 4)              # relógio
+    cr.set_source_rgb(*c("primary_container"))
+    cr.fill()
+    arredondado(cr, 104, 34, 176, 112, 14)                # janela: superfície tonal
+    cr.set_source_rgb(*c("surface"))
+    cr.fill()
+    arredondado(cr, 112, 44, 160, 14, 7)
+    cr.set_source_rgb(*c("surface_container_high"))
+    cr.fill()
+    for j in range(3):
+        arredondado(cr, 112, 66 + j * 22, 160, 18, 9)
+        cr.set_source_rgb(*c("surface_container"))
+        cr.fill()
+        arredondado(cr, 250, 70 + j * 22, 16, 10, 5)      # interruptores em pílula
+        cr.set_source_rgb(*c("primary" if j != 1 else "surface_container_highest"))
+        cr.fill()
+    arredondado(cr, W - 96, 34, 84, 70, 14)               # quick settings: blocos em pílula
+    cr.set_source_rgb(*c("surface_container"))
+    cr.fill()
+    for i in range(4):
+        arredondado(cr, W - 90 + (i % 2) * 40, 40 + (i // 2) * 20, 36, 16, 8)
+        cr.set_source_rgb(*c("primary" if i in (0, 3) else "surface_container_highest"))
+        cr.fill()
+    arredondado(cr, W / 2 - 58, H - 26, 116, 20, 10)       # dock
+    cr.set_source_rgb(*c("surface_container"))
+    cr.fill()
+    for i, k in enumerate(("primary", "tertiary", "secondary", "primary_container", "tertiary_container")):
+        cr.arc(W / 2 - 40 + i * 20, H - 16, 6.5, 0, 2 * math.pi)
+        cr.set_source_rgb(*c(k))
+        cr.fill()
+    s.write_to_png(os.path.join(AQUI, "previa-Solid.png"))
+
+
 if __name__ == "__main__":
-    aeros()
-    aeroterm()
+    import sys as _sys
+    if "solid" in _sys.argv[1:]:
+        solid()
+    else:
+        aeros()
+        aeroterm()
+        solid()
