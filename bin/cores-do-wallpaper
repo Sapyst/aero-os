@@ -21,6 +21,9 @@ Como escolhemos as cores:
      uma bem escura (12%) pro escuro. Tem que ser clara/escura assim porque o texto do sistema é
      sempre preto no tema claro e branco no escuro (o hypr-tema não muda a cor do texto).
      Wallpaper em preto e branco = cores neutras (cinzas).
+  4) a mesma matiz, viva e de luminosidade média, vira a COR DE DESTAQUE (COR_DESTAQUE_WALL): seleção do
+     menu, interruptores, esfera, sliders... Wallpaper sem cor = "mono". A cor que você escolheu nas
+     bolinhas (COR_DESTAQUE) fica guardada e volta quando a opção desliga (o hypr-tema escolhe qual usar).
   A transparência (COR_ALFA, 0.80) não muda.
 """
 import colorsys
@@ -86,7 +89,7 @@ def hexa(r, g, b):
 
 
 def calcular(arquivo):
-    """Devolve (cor_clara, cor_escura) em hexadecimal, sem o #."""
+    """Devolve (cor_clara, cor_escura, destaque) em hexadecimal sem o #; destaque = "mono" se não há cor."""
     pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(arquivo, 64, 64, True)
     dados, canais, passo = pb.get_pixels(), pb.get_n_channels(), pb.get_rowstride()
     # 36 "gavetas" de matiz (10° cada): somamos o "peso de cor" de cada pixel na gaveta dele
@@ -118,7 +121,9 @@ def calcular(arquivo):
         s = sat_soma[k] / gavetas[k]
     clara = colorsys.hls_to_rgb(h, 0.94, min(s, 0.6) * 0.55)    # pastel bem clarinho
     escura = colorsys.hls_to_rgb(h, 0.12, min(s, 0.6) * 0.45)   # quase preto, puxado pra cor
-    return hexa(*clara), hexa(*escura)
+    # destaque: a cor do wallpaper "de verdade" — viva (saturada) e média, legível no claro e no escuro
+    destaque = "mono" if s == 0 else hexa(*colorsys.hls_to_rgb(h, 0.60, max(0.45, min(0.85, s * 1.15))))
+    return hexa(*clara), hexa(*escura), destaque
 
 
 def aplicar_tema():
@@ -138,9 +143,9 @@ def main():
         atualizar_painel(WALL_CORES="1")
         arquivo = wallpaper_atual()
         if arquivo and os.path.isfile(arquivo):
-            clara, escura = calcular(arquivo)
-            atualizar_painel(COR_CLARA=clara, COR_ESCURA=escura)
-            print("cores do wallpaper:", clara, escura)
+            clara, escura, destaque = calcular(arquivo)
+            atualizar_painel(COR_CLARA=clara, COR_ESCURA=escura, COR_DESTAQUE_WALL=destaque)
+            print("cores do wallpaper:", clara, escura, "destaque", destaque)
         aplicar_tema()
     elif acao == "--desligar":
         atualizar_painel(WALL_CORES="0",
@@ -150,9 +155,9 @@ def main():
     elif acao == "--aplicar" and len(sys.argv) > 2:
         if painel.get("WALL_CORES") != "1":
             return                                   # opção desligada: não mexe em nada
-        clara, escura = calcular(sys.argv[2])
-        atualizar_painel(COR_CLARA=clara, COR_ESCURA=escura)
-        print("cores do wallpaper:", clara, escura)
+        clara, escura, destaque = calcular(sys.argv[2])
+        atualizar_painel(COR_CLARA=clara, COR_ESCURA=escura, COR_DESTAQUE_WALL=destaque)
+        print("cores do wallpaper:", clara, escura, "destaque", destaque)
         aplicar_tema()
     else:
         print(__doc__)

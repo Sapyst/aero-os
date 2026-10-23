@@ -83,7 +83,10 @@ gerar_cores() {
         if [ "$tema" = escuro ]; then DEST=f0f0f0; DEST_FG=1e1e1e; HALO="rgba(0,0,0,0.55)"
         else DEST=1e1e1e; DEST_FG=f6f6f6; HALO="rgba(255,255,255,0.80)"; fi
     else
-        DEST=$COR_DESTAQUE; DEST_FG=ffffff; HALO="rgba(0,0,0,0)"
+        DEST=$COR_DESTAQUE; HALO="rgba(0,0,0,0)"
+        # texto por cima do destaque: escuro se a cor é clara (amarelo, pastel...), branco se é escura
+        if [ $(( 299 * 16#${DEST:0:2} + 587 * 16#${DEST:2:2} + 114 * 16#${DEST:4:2} )) -gt 165000 ]; then
+            DEST_FG=1e1e1e; else DEST_FG=ffffff; fi
     fi
     echo "$DEST" > "$ESTADO/destaque"          # o print-area lê daqui a cor da linha de seleção
 
@@ -267,9 +270,13 @@ aplicar_filtro() {
     local temp=$1
     # hyprsunset é o filtro de luz azul do Hyprland; precisa estar rodando pra receber comandos
     pgrep -x hyprsunset >/dev/null || { hyprctl dispatch exec hyprsunset >/dev/null; sleep 1; }
+    # hyprsunset 0.4: "identity" sem valor só PERGUNTA (e responde ok) — desligar virou "identity true".
+    # Desligar também volta pra 6500 K (neutro), então funciona em qualquer versão.
     if [ "$temp" = 0 ]; then
-        hyprctl hyprsunset identity >/dev/null          # cores normais
+        hyprctl hyprsunset identity true >/dev/null     # cores normais
+        hyprctl hyprsunset temperature 6500 >/dev/null
     else
+        hyprctl hyprsunset identity false >/dev/null
         hyprctl hyprsunset temperature "$temp" >/dev/null  # menos azul (K = kelvin; menor = mais quente)
     fi
     echo "$temp" > "$ESTADO/filtro"
@@ -282,6 +289,9 @@ aplicar() {
     COR_CLARA=f6f6f6; COR_ESCURA=1e1e1e; COR_ALFA=0.80; COR_SINC=1; COR_DESTAQUE=3584e4
     BAR_ALPHA=0.45     # taskbar only: see-through enough for Hyprland's blur behind it to show
     . "$HOME/.local/share/aero-shell/painel.sh" && ler_painel   # lê sem executar (painel.sh)
+    # Cores do wallpaper ligadas: o DESTAQUE também vem dele (cores-do-wallpaper grava COR_DESTAQUE_WALL);
+    # a escolha das bolinhas (COR_DESTAQUE) fica intacta no painel.conf e volta quando desligar.
+    if [ "${WALL_CORES:-0}" = 1 ] && [ -n "${COR_DESTAQUE_WALL:-}" ]; then COR_DESTAQUE=$COR_DESTAQUE_WALL; fi
 
     local agora tema filtro
     agora=$(minutos "$(date +%H:%M)")
