@@ -21,7 +21,9 @@ Como funciona:
 Uso: widgets [--daemon] | --editar | --adicionar TIPO | --recarregar     (lançador: ~/.local/bin/widgets)
 """
 import json
+import math
 import os
+import random
 import re
 import socket
 import subprocess
@@ -45,8 +47,25 @@ from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 CONFIG = os.path.expanduser("~/.config/aero-shell/widgets.json")
 HYPR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr",
                     os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""))
-RAIO = 14                 # cantos do cartão (= o arredondamento das janelas); molduras internas usam 10
-SOMBRA = 14               # margem do cartão dentro da janela: é onde a sombra é desenhada
+def _visual():
+    try:
+        for linha in open(os.path.expanduser("~/.config/hypr/painel.conf")):
+            if linha.startswith("VISUAL="):
+                return linha.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
+# DotStyle: cartão escuro com a borda que se desfaz num halo de pontos (halftone), molduras sem linha,
+# anéis e barras feitos de pontos, títulos em Doto. Lido uma vez: trocar de visual reinicia os widgets.
+DOTS = _visual() == "DotStyle"
+FG_DOTS = (0.925, 0.92, 0.91)
+FUNDO_DOTS = (0.043, 0.043, 0.047)
+VERMELHO_DOTS = (1.0, 0.231, 0.188)
+DOTO = "Doto"
+RAIO = 26 if DOTS else 14  # cantos do cartão (= o arredondamento das janelas); molduras internas usam 10
+SOMBRA = 34 if DOTS else 14   # margem do cartão dentro da janela: é onde a sombra é desenhada
 LARGURA_ESTREITA = 320    # largura padrão do conteúdo da coluna estreita (System, Resources, Processes)
 LARGURA_LARGA = 518       # ...e da coluna larga (Clock, Weather)
 CORES_BARRA = os.path.expanduser("~/.config/waybar/cores.css")   # cores do tema (o hypr-tema gera)
@@ -68,9 +87,9 @@ CSS = """
 window.aero-desktop, window.aero-widget { background: transparent; }
 /* Cartão: superfície SÓLIDA escura e chata (estilo dashboard eww), cantos 18, sombra leve — pintada uma vez
    numa textura (vidro_textura). Dentro, sub-cartões um pouco mais claros (.painel). Conteúdo num Palco fixo. */
-.cartao { margin: 14px; padding: 14px; background: transparent; }
+.cartao { margin: SOMBRApx; padding: 14px; background: transparent; }
 .cartao label { color: var(--window-fg-color, @window_fg_color); }
-.brilho { margin: 14px; border-radius: 14px; background-color: alpha(currentColor, 0); transition: background-color 300ms ease; }
+.brilho { margin: SOMBRApx; border-radius: RAIOpx; background-color: alpha(currentColor, 0); transition: background-color 300ms ease; }
 .moldura:hover .brilho { background-color: alpha(currentColor, 0.02); }
 /* terminal simulado: molduras de linha fina (como as caixas do TerMusic), quase sem preenchimento */
 .painel { background-color: alpha(currentColor, 0.025); border-radius: 0; padding: 10px 12px;
@@ -93,7 +112,18 @@ window.aero-desktop, window.aero-widget { background: transparent; }
 .pilula { background-color: var(--popover-bg-color, @popover_bg_color); border-radius: 99px; padding: 6px 10px 6px 16px;
           box-shadow: 0 6px 24px rgba(0,0,0,0.25), inset 0 0 0 1px alpha(currentColor, 0.12); }
 .pilula label { font-weight: 600; }
-""".replace("MONO;", MONO + ";")
+""".replace("MONO;", MONO + ";").replace("SOMBRApx", f"{SOMBRA}px").replace("RAIOpx", f"{RAIO}px")
+
+CSS_DOTS = """
+window.aero-widget { color: #ecebe8; }
+.cartao label { color: #ecebe8; }
+.hora { font-family: "Doto"; font-weight: 900; font-size: 48px; letter-spacing: 0.04em; }
+.hora-dim { opacity: 0.45; }
+.chave { font-family: "Doto"; font-weight: 900; font-size: 11px; opacity: 0.55; }
+.moldura:hover .brilho { background-color: alpha(#ecebe8, 0.03); }
+"""
+if DOTS:
+    CSS += CSS_DOTS
 
 # a paleta pastel, pros desenhos cairo (as mesmas cores das classes CSS acima)
 PASTEL = {"rosa": (0.91, 0.58, 0.56), "azul": (0.65, 0.78, 0.93), "pessego": (0.95, 0.71, 0.56),
@@ -358,6 +388,50 @@ def cores_tema():
     return _cores["valores"]
 
 
+def _dist_ret(px, py, x, y, w, h, r):
+    """Distância com sinal de um ponto a um retângulo arredondado (negativa dentro)."""
+    cx, cy = x + w / 2, y + h / 2
+    qx, qy = abs(px - cx) - (w / 2 - r), abs(py - cy) - (h / 2 - r)
+    return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
+
+
+def dots_textura(w, h, opacidade=0.62):
+    """DotStyle: o cartão escuro e, em volta, o halftone — pontos grandes e claros colados na borda, menores
+    e mais apagados pra fora, até sumirem. Pintado uma vez numa textura (custo zero parado)."""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    cr = cairo.Context(surf)
+    x0, y0, cw, ch = SOMBRA, SOMBRA, w - 2 * SOMBRA, h - 2 * SOMBRA
+    retangulo_redondo(cr, x0, y0, cw, ch, RAIO)
+    cr.set_source_rgba(*FUNDO_DOTS, max(0.72, min(0.95, opacidade + 0.24)))
+    cr.fill()
+    rnd = random.Random(w * 7919 + h)
+    passo, alc = 8.5, SOMBRA - 3
+    grupos = {}
+    y, linha = passo / 2, 0
+    while y < h:
+        x = passo / 2 + (passo / 2 if linha % 2 else 0)
+        while x < w:
+            d = _dist_ret(x, y, x0, y0, cw, ch, RAIO)
+            if 2.5 < d < alc:
+                t = d / alc
+                if t < 0.3 or rnd.random() > (t - 0.3) * 1.3:
+                    a = round((0.05 + 0.30 * (1 - t) ** 1.4) * 20) / 20
+                    grupos.setdefault(a, []).append((x, y, 0.6 + 2.5 * (1 - t) ** 1.5))
+            x += passo
+        y += passo * 0.87
+        linha += 1
+    for a, pts in grupos.items():
+        cr.new_path()
+        for x, y, r in pts:
+            cr.new_sub_path()
+            cr.arc(x, y, r, 0, 2 * math.pi)
+        cr.set_source_rgba(*FG_DOTS, a)
+        cr.fill()
+    surf.flush()
+    return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                                 GLib.Bytes.new(bytes(surf.get_data())), surf.get_stride())
+
+
 def vidro_textura(w, h, cor_texto_rgba, opacidade=0.62):
     """A superfície do cartão, pintada com cairo numa textura w×h (já contando SOMBRA px em volta).
     O padrão é o vidro das JANELAS do sistema (TerMusic inativo, ez-fm): a cor do tema a ~62 % + o desfoque do
@@ -415,6 +489,16 @@ def painel_cairo(cr, x, y, w, h, r=10, titulo=None, area=None, e=1.0):
     """Moldura de terminal nos desenhos cairo: linha fina de contorno (quase sem preenchimento) e, se houver
     `titulo`, ele fica EMBUTIDO na linha de cima, como numa caixa de TUI (─ cpu ──────). `area` = o widget
     (pra fonte e cor do título)."""
+    if DOTS:                                     # DotStyle: sem linha; um véu claro arredondado e o título em Doto
+        retangulo_redondo(cr, x, y, w, h, 14 * e)
+        cr.set_source_rgba(*FG_DOTS, 0.045)
+        cr.fill()
+        if titulo and area is not None:
+            cr.arc(x + 15 * e, y + 1, 2.4 * e, 0, 2 * math.pi)
+            cr.set_source_rgba(*VERMELHO_DOTS, 0.95)
+            cr.fill()
+            texto(cr, area, titulo.upper(), x + 22 * e, y - 7.5 * e, 11 * e, "bold", 0.62, familia=DOTO)
+        return
     c = cores_tema()["texto"]
     r = 0                                        # molduras internas RETAS (só o cartão de fora é arredondado)
     cr.rectangle(x, y, w, h)
@@ -436,7 +520,16 @@ def painel_cairo(cr, x, y, w, h, r=10, titulo=None, area=None, e=1.0):
 
 
 def tracejado(cr, x, y, w, e=1.0, alfa=0.22):
-    """Linha tracejada (- - - -), como os separadores do TerMusic."""
+    """Linha tracejada (- - - -), como os separadores do TerMusic. DotStyle: uma fileira de pontos."""
+    if DOTS:
+        cr.new_path()
+        n = max(2, int(w / (6 * e)))
+        for i in range(n + 1):
+            cr.new_sub_path()
+            cr.arc(x + w * i / n, y + 0.5, 0.9 * e, 0, 2 * math.pi)
+        cr.set_source_rgba(*FG_DOTS, alfa)
+        cr.fill()
+        return
     c = cores_tema()["texto"]
     cr.save()
     cr.set_source_rgba(*c[:3], alfa)
@@ -473,8 +566,11 @@ class Quadro(Gtk.Overlay):
 
 
 def anel(cr, cx, cy, r, fracao, cor, espessura=7.0):
-    """Anel de progresso (gauge): trilho apagado + arco na cor, começando em cima, no sentido horário."""
-    import math
+    """Anel de progresso (gauge): trilho apagado + arco na cor, começando em cima, no sentido horário.
+    DotStyle: o anel é uma volta de pontos; os da parte cheia acesos na cor."""
+    if DOTS:
+        arco_pontos(cr, cx, cy, r, -math.pi / 2, 3 * math.pi / 2, fracao, cor, espessura)
+        return
     cr.set_line_width(espessura)
     cr.set_line_cap(1)
     cr.new_sub_path()                 # senão o cairo liga o fim do arco anterior ao começo deste
@@ -490,7 +586,17 @@ def anel(cr, cx, cy, r, fracao, cor, espessura=7.0):
 
 
 def barra_vertical(cr, x, y, w, h, fracao, cor):
-    """Barra vertical de pontas redondas: trilho apagado + parte cheia (de baixo pra cima)."""
+    """Barra vertical de pontas redondas: trilho apagado + parte cheia (de baixo pra cima).
+    DotStyle: uma pilha de pontos, acesos de baixo pra cima."""
+    if DOTS:
+        n = max(1, int(h / (w * 1.3)))
+        acesos = round(n * max(0.0, min(1.0, fracao)))
+        for i in range(n):
+            cr.new_sub_path()
+            cr.arc(x + w / 2, y + h - w / 2 - i * (h - w) / max(1, n - 1), w * 0.42, 0, 2 * math.pi)
+            cr.set_source_rgba(*cor[:3], 1.0 if i < acesos else 0.12)
+            cr.fill()
+        return
     retangulo_redondo(cr, x, y, w, h, w / 2)
     cr.set_source_rgba(*cor[:3], 0.12)
     cr.fill()
@@ -499,6 +605,35 @@ def barra_vertical(cr, x, y, w, h, fracao, cor):
         alt = max(w, h * f)
         retangulo_redondo(cr, x, y + h - alt, w, alt, w / 2)
         cr.set_source_rgba(*cor[:3], 1.0)
+        cr.fill()
+
+
+def arco_pontos(cr, cx, cy, r, a0, a1, fracao, cor, espessura=7.0):
+    """DotStyle: um arco (de a0 a a1) feito de pontos; a fração cheia acesa na cor, o resto apagado.
+    O ponto da ponta brilha um pouco mais (é onde o valor está)."""
+    n = max(6, int(abs(a1 - a0) * r / (espessura * 1.05)))
+    f = max(0.0, min(1.0, fracao))
+    acesos = round(n * f)
+    raio = espessura * 0.4
+    apagados, cheios = [], []
+    for i in range(n + (0 if abs(a1 - a0 - 2 * math.pi) < 1e-3 else 1)):
+        a = a0 + (a1 - a0) * i / n
+        (cheios if i < acesos else apagados).append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    for pts, alfa, rr in ((apagados, 0.13, raio * 0.8), (cheios, 1.0, raio)):
+        if pts:
+            cr.new_path()
+            for px, py in pts:
+                cr.new_sub_path()
+                cr.arc(px, py, rr, 0, 2 * math.pi)
+            cr.set_source_rgba(*cor[:3], alfa)
+            cr.fill()
+    if acesos:
+        px, py = cheios[-1]
+        g = cairo.RadialGradient(px, py, 0, px, py, raio * 3.2)
+        g.add_color_stop_rgba(0, *cor[:3], 0.35)
+        g.add_color_stop_rgba(1, *cor[:3], 0.0)
+        cr.set_source(g)
+        cr.arc(px, py, raio * 3.2, 0, 2 * math.pi)
         cr.fill()
 
 
@@ -641,7 +776,8 @@ class Widget(Gtk.Window):
             opacidade = float(self.app.config.d.get("vidro", "0.62"))
         except ValueError:
             opacidade = 0.62
-        self.fundo_pic.set_paintable(vidro_textura(w, h, self.get_color(), opacidade))
+        self.fundo_pic.set_paintable(dots_textura(w, h, opacidade) if DOTS else
+                                     vidro_textura(w, h, self.get_color(), opacidade))
         self._fundo_tam = (w, h)
         return GLib.SOURCE_REMOVE
 

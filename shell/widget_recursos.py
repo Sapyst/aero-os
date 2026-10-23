@@ -7,7 +7,7 @@ import math
 import os
 import time
 
-from widgets import LARGURA_ESTREITA, PASTEL, Widget, anel, cor_texto, painel_cairo, registrar, retangulo_redondo, texto, tracejado
+from widgets import DOTS, LARGURA_ESTREITA, PASTEL, arco_pontos, Widget, anel, cor_texto, painel_cairo, registrar, retangulo_redondo, texto, tracejado
 
 VERMELHO = (0.88, 0.34, 0.31)
 AZUL = (0.45, 0.66, 1.0)
@@ -196,6 +196,9 @@ class Recursos(Widget):
     def medidor(cr, cx, cy, r, fracao, cor, esp):
         """Medidor de 270° (abertura embaixo), pontas redondas: trilho apagado + arco na cor."""
         a0, a1 = math.pi * 0.75, math.pi * 2.25
+        if DOTS:
+            arco_pontos(cr, cx, cy, r, a0, a1, fracao, cor, esp)
+            return
         cr.set_line_width(esp)
         cr.set_line_cap(1)
         cr.new_sub_path()
@@ -217,6 +220,26 @@ class Recursos(Widget):
         passo = w / (HISTORICO - 1)
         x0 = x + w - passo * (len(pontos) - 1)
         P = [(x0 + passo * i, y + h - h * min(1, p / maximo)) for i, p in enumerate(pontos)]
+        if DOTS:                                   # DotStyle: matriz de pontos — a linha acesa, o volume apagado embaixo
+            e = self.e
+            d = 4.2 * e
+            cr.new_path()
+            for px, py in P:
+                cr.new_sub_path()
+                cr.arc(px, py, 1.5 * e, 0, 2 * math.pi)
+            cr.set_source_rgba(*cor[:3], 0.95)
+            cr.fill()
+            if preencher:
+                cr.new_path()
+                for px, py in P[::max(1, round(d / max(passo, 0.1)))]:
+                    yy = py + d
+                    while yy < y + h:
+                        cr.new_sub_path()
+                        cr.arc(px, yy, 0.8 * e, 0, 2 * math.pi)
+                        yy += d
+                cr.set_source_rgba(*cor[:3], 0.22)
+                cr.fill()
+            return
         cr.new_sub_path()
         cr.move_to(*P[0])
         for i in range(len(P) - 1):

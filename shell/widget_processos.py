@@ -7,7 +7,7 @@ Clicar na coluna "cpu%" ou "mem" ordena por ela (e fica gravado, igual à opçã
 import os
 import time
 
-from widgets import LARGURA_ESTREITA, PASTEL, Widget, cor_texto, painel_cairo, registrar, texto
+from widgets import DOTS, LARGURA_ESTREITA, PASTEL, Widget, cor_texto, painel_cairo, registrar, texto
 
 MONO_FAM = "Adwaita Mono"
 CLK = os.sysconf("SC_CLK_TCK")
@@ -165,6 +165,16 @@ class Processos(Widget):
             texto(cr, area, mem_txt(mem), xm, y, 11 * e, "normal", 0.7, "direita", MONO_FAM)
             frac = (cpu if por == "cpu" else mem) / maximo
             bw = (xc - 70 * e) - x0
+            if DOTS:                               # DotStyle: a barra é uma fileira de pontos
+                n = max(4, int(bw / (4.5 * e)))
+                acesos = round(n * min(1.0, frac))
+                for k in range(n):
+                    cr.new_sub_path()
+                    cr.arc(x0 + bw * k / (n - 1), y + 15.25 * e, 1.05 * e, 0, 6.2832)
+                    cr.set_source_rgba(*(c if k < acesos else cor[:3]), 0.9 if k < acesos else 0.1)
+                    cr.fill()
+                y += 18 * e
+                continue
             cr.rectangle(x0, y + 14.5 * e, bw, 1.5 * e)
             cr.set_source_rgba(*cor[:3], 0.08)
             cr.fill()
