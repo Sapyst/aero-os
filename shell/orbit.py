@@ -100,6 +100,16 @@ FICAR_ABERTO = 600               # s: the process quits this long after closing 
 # HOME precisa rodam cada uma na sua thread (Sondas), e a HOME espera no máximo SONDA_PRAZO por elas
 SONDA_PRAZO = 0.3                # s: depois disso a HOME aparece com o que já sabe; o resto chega depois
 SONDA_VALE = 3.0                 # s: uma resposta do disco vale esse tempo (abrir/trocar de modo não repergunta)
+# Uma resposta LENTA (passou do SONDA_PRAZO) vale muito mais: um disco que demora não é cutucado de novo a cada
+# HOME. Ela vale SONDA_LENTA e dobra a cada vez seguida que a pasta demora (30 s, 1 min, 2 min... até
+# SONDA_LENTA_MAX); responder rápido uma vez zera. E enquanto a HOME continua aberta, uma pasta lenta NUNCA é
+# perguntada de novo (só as que responderam rápido). A pasta lenta é lembrada por SONDA_LEMBRA.
+SONDA_LENTA, SONDA_LENTA_MAX, SONDA_LEMBRA = 30.0, 600.0, 1800.0
+REFAZER_ESPERA = 400             # ms: respostas que chegam juntas refazem a HOME UMA vez só (debounce)
+# Listar uma pasta: uma montagem FUSE morta ou um link pra um NFS caído travam o stat() pra sempre. Uma entrada
+# que não responde em PRAZO_ENTRADA aparece OFFLINE e a lista segue; depois de MAX_PRESAS assim, o resto da pasta
+# fica de fora. A pasta em si (o readdir) tem PRAZO_PASTA (um HD dormindo acorda bem antes disso).
+PRAZO_ENTRADA, MAX_PRESAS, PRAZO_PASTA = 1.0, 5, 15.0
 HOME_MAX = 16                    # pastas da HOME "frequent" (fora ~ e D:)
 # a busca numa pasta fora do índice (pendrive, o SYSTEM /): limites pra ela nunca demorar
 VIVO_FUNDO, VIVO_TEMPO, VIVO_ENTRADAS, VIVO_ACHADOS = 4, 0.8, 40_000, 400
@@ -208,8 +218,9 @@ class Indice:
 
         def trabalho():
             itens = ([], array("d"), array("q"), bytearray())
+            monts = visitas.montagens()
             for raiz in RAIZES:
-                self._andar(raiz, itens)
+                self._andar(raiz, itens, monts)
                 n = len(itens[0])
                 # all names, casefolded, in ONE string ("\n" between them) + where each one starts: a search
                 # is then str.find (C speed) instead of a Python loop over 250k files
@@ -224,9 +235,14 @@ class Indice:
             self.rodando, self.quando = False, time.monotonic()
         threading.Thread(target=trabalho, daemon=True).start()
 
-    def _andar(self, raiz, itens):
+    def _andar(self, raiz, itens, monts=()):
+        """dirs: 0 arquivo, 1 pasta, 2 LINK pra uma pasta (a busca resolve pra onde ele aponta: um link pro D:
+        é o D: inteiro, eh_raiz), 3 ponto de montagem de rede/FUSE (ou um link pra dentro de um): entra só pelo
+        nome, sem stat e sem andar por dentro (uma montagem morta travaria o índice inteiro pra sempre), e a
+        busca mostra ele como REMOTE."""
         pilha, t0, prazo = [raiz], time.monotonic(), TEMPO_RAIZ.get(raiz, 5)
         caminhos, mtimes, tams, dirs = itens
+        remotas = {m for _d, m, fs in monts if visitas.remoto(fs)}
         while pilha and len(caminhos) < LIMITE_INDICE and time.monotonic() - t0 < prazo:
             pasta = pilha.pop()
             try:
@@ -235,15 +251,21 @@ class Indice:
                         if e.name.startswith((".", "$")):
                             continue
                         try:
-                            eh_dir = e.is_dir()                 # a link to a folder counts as a folder...
                             link = e.is_symlink()
+                            if e.path in remotas or (link and _alvo_remoto(e.path, monts)):
+                                caminhos.append(e.path)          # (sem stat: mtime/tamanho desconhecidos)
+                                mtimes.append(0.0)
+                                tams.append(0)
+                                dirs.append(3)
+                                continue
+                            eh_dir = e.is_dir()                 # a link to a folder counts as a folder...
                             st = e.stat()
                         except OSError:
                             continue
                         caminhos.append(e.path)
                         mtimes.append(st.st_mtime)
                         tams.append(st.st_size)
-                        dirs.append(1 if eh_dir else 0)
+                        dirs.append((2 if link else 1) if eh_dir else 0)
                         if eh_dir and not link and e.name not in PULAR:     # ...but is not walked into
                             pilha.append(e.path)
             except OSError:
@@ -286,6 +308,114 @@ def nivel(k):
     return 0 if k < 5 else 1 if k < 16 else 2
 
 
+def _alvo_remoto(path, monts):
+    """Esse link aponta pra dentro de um disco de rede/FUSE? Só o readlink (o link mora no disco daqui) e
+    comparação de texto com o /proc/mounts: nunca segue o link (seguir é o stat que pode travar)."""
+    try:
+        alvo = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+    except (OSError, ValueError):
+        return False
+    return visitas.remoto(visitas.montagem_de(alvo, monts)[1])
+
+
+def _com_prazo(prazo, func, *args):
+    """func(*args) numa thread própria, esperando no máximo `prazo` s: (True, resposta) ou (False, None) se não
+    respondeu a tempo (ela continua sozinha, presa ela e não quem chamou). OSError vira resposta None."""
+    caixa = []
+
+    def rodar():
+        try:
+            caixa.append(func(*args))
+        except (OSError, ValueError):
+            caixa.append(None)
+    t = threading.Thread(target=rodar, daemon=True)
+    t.start()
+    t.join(prazo)
+    return (True, caixa[0]) if caixa else (False, None)
+
+
+def _entrada(e, remotas, monts):
+    """(numa thread ajudante de listar(): pode travar, por isso roda com prazo) Uma entrada da pasta:
+    (nome, path, eh_dir, mtime, tam, marca, real), ou None (sumiu no meio, sem permissão...).
+    marca "remoto": ponto de montagem de rede/FUSE/automount (ou um link pra dentro de um), conhecido pelo
+    /proc/mounts: mostrado sem stat NENHUM (mtime/tamanho desconhecidos).
+    real: pra onde um link de pasta aponta (os.path.realpath): um ~/D -> /mnt/d é o disco D: (eh_raiz)."""
+    try:
+        link = e.is_symlink()
+        if e.path in remotas or (link and _alvo_remoto(e.path, monts)):
+            return (e.name, e.path, True, 0.0, 0, "remoto", None)
+        eh_dir, st = e.is_dir(), e.stat()
+        real = os.path.realpath(e.path) if link and eh_dir else None
+    except (OSError, ValueError):
+        return None
+    return (e.name, e.path, eh_dir, st.st_mtime, st.st_size, None, real)
+
+
+def listar(pasta, monts, vivo=None):
+    """As entradas de uma pasta (roda na thread de trabalho) sem que UMA entrada morta trave a lista toda.
+    Quem encosta no disco é uma thread ajudante; esta só espera e vigia. Se a ajudante fica presa numa entrada
+    mais que PRAZO_ENTRADA (o stat de uma montagem FUSE morta nunca volta), essa entrada vira OFFLINE, a presa
+    é abandonada (sozinha, sem segurar nada: a resposta dela, se um dia vier, é jogada fora) e uma ajudante nova
+    continua da entrada seguinte. As montagens de rede/FUSE conhecidas nem são stat'adas (_entrada).
+    vivo() = False: a pasta mudou, ninguém quer mais esta lista: para de esperar na hora.
+    Devolve (entradas, estado): entradas como _entrada(); estado "ok", "incompleta" (MAX_PRESAS entradas
+    travaram: o resto ficou de fora) ou "sem_resposta" (nem a pasta abriu em PRAZO_PASTA)."""
+    remotas = {m for _d, m, fs in monts if visitas.remoto(fs)}
+    trava, acabou = threading.Lock(), threading.Event()
+    st = {"lista": None, "i": 0, "t": _relogio(), "dono": 1}  # dono: só a ajudante com esse número vale
+    res = {}
+
+    def ajudante(dono):
+        if st["lista"] is None:                              # (só a primeira lê a pasta)
+            try:
+                with os.scandir(pasta) as it:
+                    lista = [e for e in it if not e.name.startswith(".")]
+            except OSError:
+                lista = []
+            with trava:
+                if st["dono"] != dono:
+                    return
+                st["lista"], st["t"] = lista, _relogio()
+        lista = st["lista"]
+        i = st["i"]                                          # (quem me criou já deixou o i e o relógio certos)
+        while i < len(lista):
+            r = _entrada(lista[i], remotas, monts)
+            with trava:                                      # uma trava por entrada: a lista normal nem sente
+                if st["dono"] != dono:
+                    return                                   # demorou demais: já virou OFFLINE, não vale mais
+                res[i] = r
+                i = st["i"] = i + 1
+                st["t"] = _relogio()                         # o prazo da próxima entrada começa agora
+        acabou.set()
+
+    threading.Thread(target=ajudante, args=(1,), daemon=True).start()
+    t0, presas, estado = _relogio(), 0, "ok"
+    while not acabou.wait(0.05):                             # (o normal: acaba em ms, sem esperar nada)
+        agora = _relogio()
+        with trava:
+            if vivo is not None and not vivo():
+                break
+            if st["lista"] is None:
+                if agora - t0 > PRAZO_PASTA:
+                    estado = "sem_resposta"
+                    break
+                continue
+            if agora - st["t"] > PRAZO_ENTRADA and st["i"] < len(st["lista"]):   # (< : a última já acabou)
+                i = st["i"]
+                e = st["lista"][i]
+                # só os atributos que o readdir já trouxe (nome, caminho): nada aqui encosta no disco
+                res[i] = (e.name, e.path, True, 0.0, 0, "offline", None)
+                presas += 1
+                if presas >= MAX_PRESAS:
+                    estado = "incompleta"
+                    break
+                st["i"], st["dono"], st["t"] = i + 1, st["dono"] + 1, agora
+                threading.Thread(target=ajudante, args=(st["dono"],), daemon=True).start()
+    with trava:
+        st["dono"] = 0                                       # uma ajudante que ainda roda para na próxima entrada
+        return [res[k] for k in sorted(res) if res[k] is not None], estado
+
+
 def buscar(p, itens):
     """[(path, eh_dir, mtime, tam, grupo, variantes, tipo)], best first. With nothing typed: the folder,
     newest first. Typing: the index scored. Same-name files (venus.png, venus.txt) collapse into one
@@ -310,25 +440,26 @@ def buscar(p, itens):
     # inteiro nunca é copiado como arquivo) e pra HOME / a busca ao vivo (não entrar em disco de rede)
     p["montagens"] = visitas.montagens()
     p.setdefault("saida", {})["montagens"] = visitas.montados(p["montagens"])
+    p["saida"]["lista_montagens"] = p["montagens"]          # (a thread principal acha o disco de uma pasta sem I/O)
+    reais = p["saida"].setdefault("reais", {})              # link de pasta -> pra onde aponta (eh_raiz)
+    marcas, links = {}, set()                               # path -> "remoto"/"offline"; pastas que são link
     if not q and inicio:
         if p["filtro"] in (None, "dir") and tuple(anel) == (0, ANEL_N):
             return itens_inicio(p)                          # a HOME de sempre
         # um tipo/uma idade escolhidos na HOME: o mais novo daquilo em tudo
         cands = recentes(itens, p["filtro"], None if tuple(anel) == (0, ANEL_N) else na_janela)
     elif not q:
-        try:
-            with os.scandir(p["pasta"]) as it:
-                for e in it:
-                    if e.name.startswith("."):
-                        continue
-                    try:
-                        eh_dir, st = e.is_dir(), e.stat()
-                    except OSError:
-                        continue
-                    if passa(eh_dir, e.name, st.st_mtime):
-                        cands.append((st.st_mtime, e.path, eh_dir, st.st_mtime, st.st_size))
-        except OSError:
-            pass
+        # a pasta, com prazo por entrada: uma montagem morta lá dentro vira OFFLINE em vez de travar a vista
+        entradas, estado = listar(p["pasta"], p["montagens"], p.get("vivo"))
+        if estado != "ok":
+            p["saida"]["listagem"] = estado
+        for nome, path, eh_dir, mtime, tam, marca, real in entradas:
+            if real:
+                reais[path] = real
+            if marca:
+                marcas[path] = marca
+            if passa(eh_dir, nome, mtime):
+                cands.append((mtime, path, eh_dir, mtime, tam))
     else:
         # da HOME a busca cobre todas as raízes do índice (~ e D:); de uma pasta, só o que está debaixo dela
         bases = tuple(r + "/" for r in RAIZES) if inicio else (p["pasta"].rstrip("/") + "/",)
@@ -351,13 +482,17 @@ def buscar(p, itens):
             nota = pontuar(q, nome_cf, rel.casefold())
             if nota <= 0 or not passa(eh_dir, nome_cf, mtime):
                 continue
+            if dirs[i] == 2:
+                links.add(path)
+            elif dirs[i] == 3:
+                marcas[path] = "remoto"
             nota += 2 * math.exp(-(agora - mtime) / (30 * 86400)) - 0.15 * rel.count("/")
             cands.append((nota, path, eh_dir, mtime, tam))
         if not inicio and not indexada(p["pasta"]):
             # um pendrive, o SYSTEM (/)...: o índice não tem (ou só tem a parte da ~): procura de verdade aqui
             p["saida"]["nao_indexado"] = True
             ja = {c[1] for c in cands}
-            cands += [c for c in busca_ao_vivo(q, p["pasta"], passa, p["montagens"], p.get("vivo"))
+            cands += [c for c in busca_ao_vivo(q, p["pasta"], passa, p["montagens"], p.get("vivo"), marcas, links)
                       if c[1] not in ja]
     cands.sort(key=lambda t: -t[0])
     unicos, vistos = [], {}
@@ -390,7 +525,24 @@ def buscar(p, itens):
                 continue
             saida.append(u)
         unicos = saida
-    return unicos[:MAX_BOLHAS]
+    final = unicos[:MAX_BOLHAS]
+    # as bolhas de rede/FUSE e as que não responderam levam a marca no "extra" (REMOTE / OFFLINE no foco; nem a
+    # contagem de itens encosta nelas); um link de pasta achado na busca é resolvido aqui, com prazo
+    remotas = {m for _d, m, fs in p["montagens"] if visitas.remoto(fs)}
+    for u in final:
+        marca = marcas.get(u[0]) or ("remoto" if u[0] in remotas else None)
+        if marca is None and u[0] in links and u[0] not in reais:
+            if _alvo_remoto(u[0], p["montagens"]):
+                marca = "remoto"
+            else:
+                respondeu, real = _com_prazo(PRAZO_ENTRADA, os.path.realpath, u[0])
+                if not respondeu:
+                    marca = "offline"
+                elif real:
+                    reais[u[0]] = real
+        if marca:
+            u.append({marca: True})
+    return final
 
 
 def indexada(pasta):
@@ -398,16 +550,21 @@ def indexada(pasta):
     return any(pasta == r or pasta.startswith(r + "/") for r in RAIZES)
 
 
-def busca_ao_vivo(q, pasta, passa, monts, vivo=None):
+def busca_ao_vivo(q, pasta, passa, monts, vivo=None, marcas=None, links=None):
     """Busca de verdade numa pasta que o índice não cobre: anda pelas pastas em largura (as mais rasas
     primeiro), com limites de profundidade, tempo, entradas lidas e achados. Não entra em outro disco montado
     lá dentro (como o find -xdev: nada de /proc, /sys, nem um NFS que pode travar), menos pendrive/HD externo.
+    Um ponto de montagem de rede/FUSE (ou um link pra dentro de um) que bate com o texto entra sem stat
+    (marcas[path] = "remoto"); um link de pasta vai pra `links` (buscar resolve pra onde aponta).
     Roda na thread de trabalho; vivo() = False: o texto mudou, esta busca não vale mais e para.
     Devolve [(nota, path, eh_dir, mtime, tam)], como a busca no índice."""
     agora, t0 = time.time(), _relogio()
+    marcas = {} if marcas is None else marcas
+    links = set() if links is None else links
     inicio = pasta.rstrip("/") or "/"
     base = inicio.rstrip("/") + "/"
     pular = {m for _d, m, fs in monts if m != inicio and (not m.startswith(visitas.REMOVIVEL) or visitas.remoto(fs))}
+    remotas = {m for _d, m, fs in monts if m != inicio and visitas.remoto(fs)}
     fila, fortes, fracos, lidas = deque([(inicio, 0)]), [], [], 0
     while fila and lidas < VIVO_ENTRADAS and len(fortes) < VIVO_ACHADOS and _relogio() - t0 < VIVO_TEMPO:
         if vivo is not None and not vivo():
@@ -420,25 +577,35 @@ def busca_ao_vivo(q, pasta, passa, monts, vivo=None):
                     if e.name.startswith((".", "$")):
                         continue
                     try:
-                        eh_dir, link = e.is_dir(), e.is_symlink()
+                        link = e.is_symlink()
+                        remota = e.path in remotas or (link and _alvo_remoto(e.path, monts))
+                        eh_dir = True if remota else e.is_dir()      # (is_dir segue o link: só se não for remoto)
                     except OSError:
                         continue
-                    if eh_dir and not link and fundo < VIVO_FUNDO and e.name not in PULAR and e.path not in pular:
+                    if eh_dir and not link and not remota and fundo < VIVO_FUNDO and e.name not in PULAR \
+                            and e.path not in pular:
                         fila.append((e.path, fundo + 1))
                     rel = e.path[len(base):]
                     nome_cf = e.name.casefold()
                     nota = pontuar(q, nome_cf, rel.casefold())
                     if nota <= 0 or (nota <= 1.0 and len(fracos) >= 200):
                         continue
-                    try:
-                        st = e.stat()
-                    except OSError:
+                    if remota:
+                        mtime, tam = 0.0, 0                  # sem stat: é o stat que trava num disco de rede morto
+                        marcas[e.path] = "remoto"
+                    else:
+                        try:
+                            st = e.stat()
+                        except OSError:
+                            continue
+                        mtime, tam = st.st_mtime, st.st_size
+                    if not passa(eh_dir, nome_cf, mtime):
                         continue
-                    if not passa(eh_dir, nome_cf, st.st_mtime):
-                        continue
+                    if link and eh_dir and not remota:
+                        links.add(e.path)
                     forte = nota > 1.0                       # 1.0 = só as letras em ordem (erro de digitação)
-                    nota += 2 * math.exp(-(agora - st.st_mtime) / (30 * 86400)) - 0.15 * rel.count("/")
-                    (fortes if forte else fracos).append((nota, e.path, eh_dir, st.st_mtime, st.st_size))
+                    nota += 2 * math.exp(-(agora - mtime) / (30 * 86400)) - 0.15 * rel.count("/")
+                    (fortes if forte else fracos).append((nota, e.path, eh_dir, mtime, tam))
         except OSError:
             continue
     return fortes or fracos
@@ -478,27 +645,49 @@ class Sondas:
     """Perguntas ao disco que podem demorar (stat, statvfs num HD que está acordando, um pendrive morrendo):
     cada uma roda na SUA thread, e quem pergunta espera no máximo `prazo` segundos por todas juntas. A que não
     respondeu a tempo continua sozinha (presa ela, não a HOME), não é disparada de novo enquanto roda, e quando
-    finalmente responde chama `avisar` (a HOME se refaz com o dado de verdade). Respostas valem SONDA_VALE s."""
+    finalmente responde chama `avisar` (a HOME se refaz com o dado de verdade).
+    Quanto vale uma resposta: SONDA_VALE se veio rápida. Se veio LENTA (passou do SONDA_PRAZO), SONDA_LENTA, e
+    o dobro a cada vez seguida que aquela pasta demora (backoff exponencial, até SONDA_LENTA_MAX); e numa mesma
+    `sessao` (a HOME aberta, sem sair dela) uma lenta nunca é perguntada de novo, por mais velha que esteja.
+    Antes, duas pastas que sempre demoram (4 s e 8 s) se perguntavam uma à outra pra sempre: cada resposta
+    refazia a HOME, que achava a OUTRA velha (> 3 s) e perguntava de novo: CHECKING piscando e o disco
+    cutucado sem parar."""
 
     def __init__(self):
         self.trava = threading.Lock()
-        self.tab = {}            # chave -> {"res", "fim" (relógio; None = rodando), "esperam": [pedido], "avisar": set}
+        # chave -> {"res", "ini", "fim" (relógio; None = rodando), "vale" (s), "lenta", "sessao",
+        #           "esperam": [pedido], "avisar": set}
+        self.tab = {}
+        self.lentas = {}         # chave -> (vezes seguidas que demorou, quando foi a última): o backoff
 
-    def perguntar(self, pedidos, prazo, avisar=None):
+    def _podar(self, agora):
+        """Respostas velhas saem (a tabela fica pequena); uma lenta é lembrada por SONDA_LEMBRA."""
+        for k in [k for k, e in self.tab.items() if e["fim"] is not None and
+                  agora - e["fim"] > max(60.0, e["vale"], SONDA_LEMBRA if e["lenta"] else 0.0)]:
+            del self.tab[k]
+        for k in [k for k, (_n, quando) in self.lentas.items() if agora - quando > SONDA_LEMBRA]:
+            del self.lentas[k]
+
+    def perguntar(self, pedidos, prazo, avisar=None, sessao=None):
         """pedidos: {chave: função sem argumentos}. Devolve {chave: resposta} das que responderam (as outras
-        ficam de fora: quem chamou mostra o que já sabe delas)."""
+        ficam de fora: quem chamou mostra o que já sabe delas). sessao: quem pergunta de novo na mesma vista
+        (a HOME refeita porque uma resposta chegou) não cutuca de novo um disco que já se mostrou lento."""
         agora = _relogio()
         pedido = {"faltam": set(), "evento": threading.Event()}
         novas = []
         with self.trava:
-            for k in [k for k, e in self.tab.items() if e["fim"] is not None and agora - e["fim"] > 60]:
-                del self.tab[k]                               # respostas velhas saem: a tabela fica pequena
+            self._podar(agora)
             for chave, func in pedidos.items():
                 e = self.tab.get(chave)
-                if e is not None and e["fim"] is not None and agora - e["fim"] < SONDA_VALE:
-                    continue                                  # resposta fresca: vale
+                if e is not None and e["fim"] is not None and (
+                        agora - e["fim"] < e["vale"] or
+                        (e["lenta"] and sessao is not None and e["sessao"] == sessao)):
+                    if sessao is not None:
+                        e["sessao"] = sessao                  # usada nesta HOME: nesta HOME ela não é cutucada
+                    continue                                  # resposta que ainda vale
                 if e is None or e["fim"] is not None:         # nunca perguntada, ou velha: pergunta de novo
-                    e = self.tab[chave] = {"res": None, "fim": None, "esperam": [], "avisar": set()}
+                    e = self.tab[chave] = {"res": None, "ini": agora, "fim": None, "vale": SONDA_VALE,
+                                           "lenta": False, "sessao": sessao, "esperam": [], "avisar": set()}
                     novas.append((chave, func))
                 e["esperam"].append(pedido)                   # (rodando: só espera pela mesma thread)
                 pedido["faltam"].add(chave)
@@ -521,9 +710,18 @@ class Sondas:
             res = func()
         except Exception:                                     # noqa: BLE001 (uma sonda nunca derruba nada)
             res = None
+        fim = _relogio()
         with self.trava:
             e = self.tab[chave]
-            e["res"], e["fim"] = res, _relogio()
+            lenta = fim - e["ini"] > SONDA_PRAZO
+            if lenta:                                         # demorou: vale mais, e mais ainda se já demorava
+                vezes = self.lentas.get(chave, (0, 0.0))[0] + 1
+                self.lentas[chave] = (vezes, fim)
+                vale = min(SONDA_LENTA_MAX, SONDA_LENTA * 2 ** (vezes - 1))
+            else:                                             # rápida: o disco acordou, volta ao normal
+                self.lentas.pop(chave, None)
+                vale = SONDA_VALE
+            e["res"], e["fim"], e["vale"], e["lenta"] = res, fim, vale, lenta
             for pedido in e["esperam"]:
                 pedido["faltam"].discard(chave)
                 if not pedido["faltam"]:
@@ -538,8 +736,9 @@ SONDAS = Sondas()
 
 def _sonda_pasta(path, montagem, monts):
     """(numa thread de sonda) Essa pasta ainda existe?
-    ("dir", mtime) | ("sumiu",) apagada de verdade: esquece | ("fora",) o disco dela está desligado: não mostra,
-    mas lembra | ("outro",) sem permissão, erro de disco...: não mostra e não esquece."""
+    ("dir", mtime, real) | ("sumiu",) apagada de verdade: esquece | ("fora",) o disco dela está desligado: não
+    mostra, mas lembra | ("outro",) sem permissão, erro de disco...: não mostra e não esquece.
+    real: o caminho com os links resolvidos (uma visita a ~/D -> /mnt/d é o disco D:, eh_raiz)."""
     try:
         st = os.stat(path)
     except (FileNotFoundError, NotADirectoryError):
@@ -548,7 +747,11 @@ def _sonda_pasta(path, montagem, monts):
         return ("outro",)
     if not stat.S_ISDIR(st.st_mode):
         return ("sumiu",)                                     # virou um arquivo: a pasta de antes não existe
-    return ("dir", st.st_mtime)
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        real = path
+    return ("dir", st.st_mtime, real)
 
 
 def _sonda_disco(ponto):
@@ -607,7 +810,9 @@ def itens_inicio(p):
     resposta chega (p["avisar"]); uma pasta num disco de rede/FUSE/automount nem é perguntada ("remoto").
     Cada item leva um 8º campo, o "extra" (raio, anel, nome, rótulo, uso), que orbitar() e desenhar_bolha() leem.
     p["saida"] devolve à thread principal os discos achados (pro caminho e o Backspace), os pontos de montagem,
-    as pastas que sumiram e onde cada pasta foi vista (montagens_vistas)."""
+    as pastas que sumiram, onde cada pasta foi vista (montagens_vistas) e pra onde aponta cada uma que é link
+    (reais). p["sessao"]: a HOME aberta agora (refeita sem sair dela = mesma sessão: disco lento não é
+    perguntado de novo, Sondas)."""
     agora = time.time()
     vis = p.get("visitas") or {}
     notas = {k: visitas.nota(v, agora) for k, v in vis.items()}
@@ -622,6 +827,7 @@ def itens_inicio(p):
     removiveis = {d for d, rem in lista_discos if rem}
     pontos_disco = {d for d, _ in lista_discos} | ligados
     vistas = saida.setdefault("montagens_vistas", {})
+    reais = saida.setdefault("reais", {})                     # pasta que é link -> pra onde aponta
     resp = {}                                                 # (tipo, caminho) -> resposta da sonda
 
     def remota(path):
@@ -642,7 +848,7 @@ def itens_inicio(p):
             pedidos[k] = (functools.partial(_sonda_disco, c) if k[0] == "disco" else
                           functools.partial(_sonda_pasta, c, (vis.get(c) or {}).get("m"), monts))
         if pedidos:
-            resp.update(SONDAS.perguntar(pedidos, SONDA_PRAZO, p.get("avisar")))
+            resp.update(SONDAS.perguntar(pedidos, SONDA_PRAZO, p.get("avisar"), p.get("sessao")))
 
     def estado(path):
         """"ok", "remota"/"lenta" (mostra de memória), ou o que a sonda disse ("sumiu", "fora", "outro")."""
@@ -675,13 +881,22 @@ def itens_inicio(p):
         extra = {"r": r, "nivel": anel, "nome": nome or os.path.basename(path) or NOME_RAIZ.get(path),
                  "n": v.get("n", 0.0), "t": v.get("t", 0.0)}
         if est == "ok":
-            mt = resp[chave(path)][1]
+            r_sonda = resp[chave(path)]
+            mt = r_sonda[1]
+            if len(r_sonda) > 2 and r_sonda[2] and r_sonda[2] != path:
+                reais[path] = r_sonda[2]                      # um link: pra onde ele aponta (eh_raiz)
             m = visitas.montagem_de(path, monts)[0]
             if path in vis and v.get("m") != m:
                 vistas[path] = m                              # onde ela existe (pra não esquecer à toa depois)
         else:
             extra["remoto" if est == "remota" else "lento"] = True
             mt = v.get("t") or agora
+            if est == "remota":
+                # montada agora num disco de rede/FUSE (até um sshfs fora do fstab): o "m" sai do /proc/mounts,
+                # sem stat. Sem ele, depois de desmontar a pasta pareceria apagada e a visita era esquecida
+                m = visitas.montagem_de(path, monts)[0]
+                if path in vis and v.get("m") != m:
+                    vistas[path] = m
         return [path, True, mt, 0, 0, 0, "dir", extra]
 
     itens = []
@@ -904,6 +1119,11 @@ class Orbita(nuvem.Nuvem):
         self.modo = visitas.ler_modo()
         self.discos = []                         # pontos de montagem achados na última HOME (caminho, Backspace)
         self.montagens = set()                   # todos os pontos montados, achados pela thread de trabalho (eh_raiz)
+        self.remotas = set()                     # os de rede/FUSE/automount (até um autofs ainda não montado)
+        self.monts_lista = []                    # o /proc/mounts da última leitura: [(aparelho, ponto, tipo)]
+        self.reais = {}                          # pasta que é link -> pra onde aponta (resolvido nas threads)
+        self._sessao_home = 0                    # +1 a cada vez que se entra na HOME (Sondas: refazer não cutuca)
+        self._refazer_fonte = None               # a HOME refeita uma vez só por leva de respostas (debounce)
         # o modo da HOME é gravado por UMA thread, sempre o último pedido (_gravar_modo)
         self._modo_trava, self._modo_pedido, self._modo_gravando = threading.Lock(), None, False
         self._peek_token = None                  # o PEEK pedido por último (uma resposta velha não entra)
@@ -946,6 +1166,7 @@ class Orbita(nuvem.Nuvem):
              "avisar": self._sonda_chegou}           # um disco lento respondeu depois: refaz a HOME
         if self.pasta == INICIO:
             p["visitas"] = self.visitas.copia()      # uma cópia: a thread lê sem disputar com quem registra
+            p["sessao"] = self._sessao_home
         # the real size; before the first show the area measures 0 and the default size may be -1
         w = next((v for v in (self.area.get_width(), self.get_default_size()[0]) if v > 200), 1920)
         h = next((v for v in (self.area.get_height(), self.get_default_size()[1]) if v > 200), 1080)
@@ -965,8 +1186,18 @@ class Orbita(nuvem.Nuvem):
             self.visitas.esquecer(saida.get("sumidos", ()))
             if saida.get("montagens_vistas"):
                 self.visitas.anotar_montagens(saida["montagens_vistas"])
+            if "lista_montagens" in saida:
+                self.monts_lista = saida["lista_montagens"]
+                self.remotas = {m for _d, m, fs in self.monts_lista if visitas.remoto(fs)}
+            if saida.get("reais"):
+                if len(self.reais) > 5000:
+                    self.reais = {}                  # (só cresce com links vistos: nunca fica enorme)
+                self.reais.update(saida["reais"])
         if g != self.geracao:
             return False
+        if saida and saida.get("listagem"):          # a pasta (ou parte dela) não respondeu a tempo
+            self.aviso = ("FOLDER NOT RESPONDING" if saida["listagem"] == "sem_resposta"
+                          else "SOME ITEMS NOT RESPONDING", time.monotonic())
         # a mesma vista refeita: a seleção do teclado e o foco continuam na mesma bolha (se ela ainda existe)
         manter = bool(saida and saida.get("manter"))
         sel_antes = self.bolhas[self.sel].path if manter and 0 <= self.sel < len(self.bolhas) else None
@@ -1013,9 +1244,16 @@ class Orbita(nuvem.Nuvem):
 
     def _sonda_chegou(self):
         """(numa thread de sonda) um disco que demorou finalmente respondeu: a HOME se refaz com o dado de verdade."""
-        GLib.idle_add(self._refazer_home)
+        GLib.idle_add(self._pedir_refazer)
+
+    def _pedir_refazer(self):
+        """Várias respostas chegando perto uma da outra = a HOME refeita UMA vez (REFAZER_ESPERA depois da 1ª)."""
+        if self._refazer_fonte is None:
+            self._refazer_fonte = GLib.timeout_add(REFAZER_ESPERA, self._refazer_home)
+        return False
 
     def _refazer_home(self):
+        self._refazer_fonte = None
         if self.get_visible() and self.t_fechar is None and self.pasta == INICIO and not self.consulta:
             self.atualizar(manter=True)
         return False
@@ -1024,7 +1262,7 @@ class Orbita(nuvem.Nuvem):
         """Thumbnails and folder sizes, loaded in a thread and handed back to the drawing.
         Uma pasta de disco de rede (remoto) ou que ainda não respondeu (lento) não é aberta pra contar."""
         faltam = [b for b in self.bolhas if not b.pedido and b.tipo in ("img", "dir")
-                  and not (b.extra or {}).get("remoto") and not (b.extra or {}).get("lento")]
+                  and not any((b.extra or {}).get(k) for k in ("remoto", "lento", "offline"))]
         for b in faltam:
             b.pedido = True
         if not faltam:
@@ -1114,6 +1352,8 @@ class Orbita(nuvem.Nuvem):
         """Go to a folder (or INICIO, the virtual home). manter=True keeps the search (a group bubble: its
         results, inside it). Toda pasta mostrada vira uma visita (contada quando você sair dela)."""
         self._sair_da_pasta()
+        if pasta == INICIO and self.pasta != INICIO:
+            self._sessao_home += 1                         # entrou na HOME: uma sessão nova (Sondas)
         self.pasta = pasta
         if pasta != INICIO:
             self._aqui = [pasta, time.monotonic(), False]
@@ -1129,12 +1369,18 @@ class Orbita(nuvem.Nuvem):
         if aqui:
             pasta, t0, abriu = aqui
             ficou = abriu or time.monotonic() - t0 >= visitas.FICOU
-            self.visitas.registrar(pasta, 1.0 if ficou else visitas.PASSOU)
+            self.visitas.registrar(pasta, 1.0 if ficou else visitas.PASSOU, self._montagem_remota(pasta))
+
+    def _montagem_remota(self, pasta):
+        """O ponto de montagem de rede/FUSE onde a pasta está agora, ou None num disco daqui. Do /proc/mounts que a
+        thread de trabalho leu por último: só texto, sem I/O (a visita guarda ele como "m")."""
+        ponto, fs, _dev = visitas.montagem_de(pasta, self.monts_lista)
+        return ponto if visitas.remoto(fs) else None
 
     def _abriu_arquivo(self, path):
         """Um arquivo aberto pelo ORBIT (até de uma busca): a pasta dele é das "suas", ponto na hora."""
         pasta = os.path.dirname(path)
-        self.visitas.registrar(pasta)
+        self.visitas.registrar(pasta, 1.0, self._montagem_remota(pasta))
         if self._aqui is not None and self._aqui[0] == pasta:
             self._aqui[2] = True                          # e a estadia aqui conta inteira
 
@@ -1327,7 +1573,7 @@ class Orbita(nuvem.Nuvem):
                 self.abrir_fora(b)                         # OPEN = its own app; click/Enter = the viewer
         elif nome == "SHOW":
             pasta = b.path if b.tipo == "disco" else os.path.dirname(b.path)    # um disco: ele mesmo
-            self.visitas.registrar(pasta)
+            self.visitas.registrar(pasta, 1.0, self._montagem_remota(pasta))
             self.fechar(lambda: subprocess.Popen(["gio", "open", pasta], stdout=subprocess.DEVNULL,
                                                  stderr=subprocess.DEVNULL, start_new_session=True))
         elif nome == "COPY":
@@ -1380,6 +1626,7 @@ class Orbita(nuvem.Nuvem):
         with self._modo_trava:
             gravando = self._modo_gravando
         self.pasta = INICIO
+        self._sessao_home += 1                             # uma HOME nova (Sondas: só refazê-la não cutuca disco lento)
         if not gravando:
             self.modo = visitas.ler_modo()
         self.consulta, self.peek, self.foco, self.filtro = "", None, None, None
@@ -1694,6 +1941,8 @@ class Orbita(nuvem.Nuvem):
                     partes.append(f"{v} VISIT{'S' if v != 1 else ''} · {idade_txt(e['t'])}")
                 if e.get("remoto"):
                     partes.append("REMOTE")                  # disco de rede/FUSE: mostrado de memória
+                elif e.get("offline"):
+                    partes.append("OFFLINE")                 # não respondeu a tempo (montagem morta?)
                 elif e.get("lento"):
                     partes.append("CHECKING …")              # o disco ainda não respondeu
                 elif b.filhos is not None:
@@ -1907,12 +2156,19 @@ class Orbita(nuvem.Nuvem):
         Vale do jeito que for alcançado: a bolha de disco da HOME, ou o mesmo /mnt/d entrando por / → mnt
         (aí ele é uma pasta "dir" comum). Raiz = qualquer ponto de montagem (os discos da HOME, o D:, os topos,
         e todos os que a thread de trabalho achou no /proc/mounts), e também uma pasta que CONTÉM um deles
-        (/mnt, /home, /run/media/você): copiar ela levaria o disco junto. Só conjuntos em memória: sem I/O."""
-        p = b.path.rstrip("/") or "/"
-        if b.tipo == "disco" or p in (CASA, LIXO, "/", DADOS) or p in self.topos() or p in self.montagens:
+        (/mnt, /home, /run/media/você): copiar ela levaria o disco junto. Só conjuntos em memória: sem I/O.
+        Um LINK vale pelo que ele aponta: ~/D -> /mnt/d é o D: (o realpath é feito nas threads, self.reais)."""
+        if b.tipo == "disco":
             return True
+        p = b.path.rstrip("/") or "/"
+        topos = self.topos()
         dentro = set(self.discos) | set(self.montagens) | {CASA, DADOS}
-        return any(m.startswith(p + "/") for m in dentro)
+        for c in {p, self.reais.get(p, p)}:
+            if c in (CASA, LIXO, "/", DADOS) or c in topos or c in self.montagens or c in self.remotas:
+                return True
+            if any(m.startswith(c + "/") for m in dentro):
+                return True
+        return False
 
     def topos(self):
         """Onde um caminho "começa" visto da HOME: ~, D:, a Lixeira e cada disco montado."""
@@ -2400,7 +2656,13 @@ class Orbita(nuvem.Nuvem):
         self.animar()
 
     def colar_arquivos(self):
-        """Ctrl+V: copies of the files on the clipboard into the current folder (name (copy).ext when taken)."""
+        """Ctrl+V: copies of the files on the clipboard into the current folder (name (copy).ext when taken).
+        Tudo que encosta no disco (existe? é link? é um disco inteiro?) roda na thread da cópia, e:
+        - um LINK é colado como link (apontando pro mesmo lugar), nunca seguido: o copytree segue o link de cima,
+          então um ~/D -> /mnt/d colado virava uma cópia do disco D: inteiro;
+        - um disco inteiro, a ~, ou uma pasta com um disco montado dentro não são colados (o mesmo que o eh_raiz
+          recusa no Ctrl+C, venha de onde vier o que está na área de transferência: Nautilus, terminal...);
+        - uma pasta nunca é colada dentro dela mesma (comparando os caminhos de verdade, sem links)."""
         if self.pasta == INICIO:
             self.aviso = ("OPEN A FOLDER TO PASTE INTO", time.monotonic())
             self.animar()
@@ -2412,8 +2674,6 @@ class Orbita(nuvem.Nuvem):
         fontes = [urllib.parse.unquote(u[7:]) for u in r.stdout.decode(errors="replace").split()
                   if u.startswith("file://")]
         destino = self.pasta
-        # uma pasta nunca é colada dentro dela mesma (o copytree iria se copiando pra sempre)
-        fontes = [f for f in fontes if os.path.exists(f) and not (destino + "/").startswith(f.rstrip("/") + "/")]
         if not fontes:
             self.aviso = ("NOTHING TO PASTE", time.monotonic())
             self.animar()
@@ -2424,26 +2684,54 @@ class Orbita(nuvem.Nuvem):
         def livre(nome):
             base, ext = os.path.splitext(nome)
             alvo, n = os.path.join(destino, nome), 1
-            while os.path.exists(alvo):
+            while os.path.lexists(alvo):
                 alvo = os.path.join(destino, f"{base} (copy{'' if n == 1 else ' ' + str(n)}){ext}")
                 n += 1
             return alvo
 
         def trabalho():
-            feitos = 0
+            pontos = {m for _d, m, _fs in visitas.montagens()}       # todos, até um autofs ainda não montado
+            dentro = pontos | {CASA}
+            dest_real = os.path.realpath(destino)
+            achados, feitos, recusados = 0, 0, 0
             for f in fontes:
+                f = f.rstrip("/") or "/"
                 try:
-                    alvo = livre(os.path.basename(f.rstrip("/")))
-                    if os.path.isdir(f):
-                        shutil.copytree(f, alvo, symlinks=True)
+                    if not os.path.lexists(f):
+                        continue
+                    achados += 1
+                    if os.path.islink(f):
+                        # o link em si (symlinks=True também no topo); um alvo relativo vira absoluto, pra
+                        # continuar apontando pro mesmo lugar de outra pasta
+                        alvo_link = os.readlink(f)
+                        if not os.path.isabs(alvo_link):
+                            alvo_link = os.path.normpath(os.path.join(os.path.dirname(f), alvo_link))
+                        os.symlink(alvo_link, livre(os.path.basename(f)))
+                    elif os.path.isdir(f):
+                        real = os.path.realpath(f)
+                        if real in ("/", CASA) or real in pontos or any(m.startswith(real + "/") for m in dentro):
+                            recusados += 1
+                            continue
+                        if (dest_real + "/").startswith(real + "/"):
+                            achados -= 1                               # dentro dela mesma: nem conta
+                            continue
+                        shutil.copytree(f, livre(os.path.basename(f)), symlinks=True)
                     else:
-                        shutil.copy2(f, alvo)
+                        shutil.copy2(f, livre(os.path.basename(f)))
                     feitos += 1
                 except OSError:
                     continue
+
             def pronto():
-                self.aviso = (f"{feitos} PASTED" if feitos == len(fontes) else f"{feitos}/{len(fontes)} PASTED",
-                              time.monotonic())
+                if not achados:
+                    txt = "NOTHING TO PASTE"
+                elif recusados and not feitos:
+                    txt = "A WHOLE DRIVE OR HOME CAN'T BE PASTED"
+                else:
+                    txt = f"{feitos} PASTED" if feitos == achados else f"{feitos}/{achados} PASTED"
+                    if recusados:
+                        txt += f" · {recusados} DRIVE{'S' if recusados > 1 else ''} SKIPPED"
+                self.aviso = (txt, time.monotonic())
                 if self.pasta == destino:
                     self.atualizar(imediato=True)
                 self.animar()

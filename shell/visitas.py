@@ -13,7 +13,9 @@ visitas.py — o que o ORBIT aprende com o uso, e onde ele abre (usado pelo ORBI
      também é proporcional (o "u"): só passar ganha 1/4 do bônus de uma visita de verdade, então nunca empata
      com ela. (Arquivos antigos sem "u": vale min(1, n).)
    - "m" é o ponto de montagem onde a pasta foi vista existindo (/, /home, /mnt/e...). Se um dia ela some e
-     esse disco não está montado, é só o disco que está desligado: a visita não é esquecida.
+     esse disco não está montado, é só o disco que está desligado: a visita não é esquecida. Num disco de
+     rede/FUSE (sshfs, rclone, NFS, até fora do fstab) o "m" vem direto do /proc/mounts, sem stat nenhum: é
+     anotado na visita (registrar(montagem=...)) e quando a HOME a mostra como REMOTE.
    - Números estragados no arquivo (NaN, infinito, negativo, data no futuro) são jogados fora na leitura: uma
      entrada ruim nunca derruba a HOME nem volta pro disco.
    - Guarda só as MAX (300) melhores. Grava de forma atômica (escreve um .tmp e troca com os.replace: o arquivo
@@ -161,7 +163,9 @@ class Visitas:
         self.dados = ler(self.arq)
         self._fonte = None
 
-    def registrar(self, pasta, peso=1.0):
+    def registrar(self, pasta, peso=1.0, montagem=None):
+        """montagem: o ponto de rede/FUSE onde a pasta está agora (o ORBIT acha pelo /proc/mounts, sem stat).
+        Anotado como "m": depois de desmontado, a visita não é esquecida (_fora_do_ar vê que ele não está montado)."""
         if not vale(pasta):
             return
         agora = time.time()
@@ -171,7 +175,9 @@ class Visitas:
         antes = peso_recente(v) * math.exp(-max(0.0, agora - v.get("t", 0.0)) / RECENTE)
         # um dict NOVO a cada vez: uma thread lendo a cópia antiga nunca vê um valor pela metade
         novo = {"n": min(N_MAX, v.get("n", 0.0) + peso), "t": agora, "u": min(1.0, max(peso, antes))}
-        if "m" in v:
+        if isinstance(montagem, str) and montagem.startswith("/"):
+            novo["m"] = montagem
+        elif "m" in v:
             novo["m"] = v["m"]
         self.dados[pasta] = novo
         if len(self.dados) > MAX * 1.5:                       # poda de vez em quando (não a cada visita)
