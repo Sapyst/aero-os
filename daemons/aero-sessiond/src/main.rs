@@ -1,17 +1,24 @@
 //! `aero-sessiond` — daemon unificado de sessão sem tela do Aero OS.
 //!
-//! Em vez de manter processos Python separados acordando a cada 2–3 segundos em `sleep`,
-//! o `aero-sessiond` concentra os ajudantes de sessão num único binário nativo em Rust,
+//! Absorve três ajudantes residentes que antes rodavam como processos Python separados:
+//! 1. **`bateria`** (`bateria.py` / `aero-energia`): limitador inteligente de carga (`smart`, `fixo`,
+//!    `bypass`, `desligado`, `cheia_uma_vez`), modo de energia automático (`powerprofilesctl`) e
+//!    "salvar o momento" (hibernar/suspender em bateria crítica).
+//! 2. **`taxa`** (`taxa.py` / `aero-hz`): taxa de atualização adaptativa (máxima na tomada e em jogos,
+//!    60 Hz na bateria), falando com o compositor exclusivamente através da trait [`Compositor`].
+//! 3. **`icones`** (`icones.py --watch` / `aero-icones --watch`): troca o tema de ícones por área de
+//!    trabalho (`Aero-ws<N>` vs `Aero`) e dispara `icones.py --retint` quando as cores mudam.
+//!
 //! 100% orientado a eventos (0% de CPU quando parado):
-//! - **Netlink (`NETLINK_KOBJECT_UEVENT`)**: o próprio kernel Linux avisa no instante em que
-//!   o carregador é ligado/desligado ou o nível da bateria muda (`SUBSYSTEM=power_supply`).
-//! - **`inotify`**: o kernel avisa quando `~/.config/aero-shell/energia.json` ou `taxa.json`
-//!   são salvos pelo Settings ou pelos atalhos da barra.
-//! - **Socket do compositor (`trait Compositor`)**: recebe aberturas e fechamentos de janelas
-//!   (para detectar jogos em tempo real) e eventos de monitor/configuração.
+//! - **Netlink (`NETLINK_KOBJECT_UEVENT`)**: eventos `SUBSYSTEM=power_supply` direto do kernel.
+//! - **`inotify`**: mudanças em `~/.config/aero-shell` (`energia.json`, `taxa.json`, `widgets.json`),
+//!   `~/.config/hypr/painel.conf`, `~/.config/dconf/user` e `~/.cache/hypr-tema/tema`.
+//! - **Socket do compositor (`trait Compositor`)**: janelas abertas/fechadas, monitores/reload e
+//!   troca de área de trabalho (`workspacev2`).
 
 mod bateria;
 mod compositor;
+mod icones;
 mod taxa;
 
 use compositor::{Compositor, EventoCompositor, HyprlandCompositor};
@@ -33,6 +40,8 @@ enum EventoSessao {
     ConfigEnergiaMudou,
     /// Arquivo `taxa.json` foi modificado.
     ConfigTaxaMudou,
+    /// Arquivos de paleta/ícones (`painel.conf`, `widgets.json`, esquema claro/escuro) mudaram.
+    FontesIconesMudaram,
     /// Evento vindo do compositor (janela abriu/fechou, monitor/config, workspace).
     Compositor(EventoCompositor),
 }
@@ -80,7 +89,7 @@ fn iniciar_escuta_uevent(tx: Sender<EventoSessao>) {
     });
 }
 
-/// Usa `inotify` do kernel para vigiar `~/.config/aero-shell` (`energia.json` e `taxa.json`).
+/// Usa `inotify` do kernel para vigiar arquivos de configuração e tema sem polling.
 fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
     thread::spawn(move || unsafe {
         let fd = libc::inotify_init1(libc::IN_CLOEXEC);
@@ -89,7 +98,14 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
         }
         let home = env::var("HOME").unwrap_or_else(|_| "/home/sapista".to_string());
         let pasta_aero = format!("{home}/.config/aero-shell");
+        let pasta_hypr = format!("{home}/.config/hypr");
+        let pasta_dconf = format!("{home}/.config/dconf");
+        let pasta_tema = format!("{home}/.cache/hypr-tema");
+
         let _ = fs::create_dir_all(&pasta_aero);
+        let _ = fs::create_dir_all(&pasta_hypr);
+        let _ = fs::create_dir_all(&pasta_dconf);
+        let _ = fs::create_dir_all(&pasta_tema);
 
         let adicionar_watch = |caminho: &str| -> libc::c_int {
             let Ok(cstr) = CString::new(caminho) else {
@@ -103,7 +119,11 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
         };
 
         let wd_aero = adicionar_watch(&pasta_aero);
-        if wd_aero < 0 {
+        let wd_hypr = adicionar_watch(&pasta_hypr);
+        let wd_dconf = adicionar_watch(&pasta_dconf);
+        let wd_tema = adicionar_watch(&pasta_tema);
+
+        if wd_aero < 0 && wd_hypr < 0 {
             libc::close(fd);
             return;
         }
@@ -118,6 +138,7 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
             let total = n as usize;
             let mut viu_energia = false;
             let mut viu_taxa = false;
+            let mut viu_icones = false;
 
             while pos + std::mem::size_of::<libc::inotify_event>() <= total {
                 let ev = &*(buf.as_ptr().add(pos) as *const libc::inotify_event);
@@ -127,10 +148,18 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
                     let bytes = &buf[nome_inicio..nome_inicio + len];
                     let fim = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                     if let Ok(nome) = std::str::from_utf8(&bytes[..fim]) {
-                        match nome {
-                            "energia.json" => viu_energia = true,
-                            "taxa.json" => viu_taxa = true,
-                            _ => {}
+                        if ev.wd == wd_aero {
+                            match nome {
+                                "energia.json" => viu_energia = true,
+                                "taxa.json" => viu_taxa = true,
+                                "widgets.json" => viu_icones = true,
+                                _ => {}
+                            }
+                        } else if (ev.wd == wd_hypr && nome == "painel.conf")
+                            || (ev.wd == wd_dconf && nome == "user")
+                            || (ev.wd == wd_tema && nome == "tema")
+                        {
+                            viu_icones = true;
                         }
                     }
                 }
@@ -142,6 +171,9 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
             }
             if viu_taxa {
                 let _ = tx.send(EventoSessao::ConfigTaxaMudou);
+            }
+            if viu_icones {
+                let _ = tx.send(EventoSessao::FontesIconesMudaram);
             }
         }
         libc::close(fd);
@@ -163,6 +195,7 @@ fn rodar_daemon() {
     let janelas_iniciais = COMPOSITOR.janelas_abertas();
     let mut bat = bateria::EstadoBateria::novo(&janelas_iniciais);
     let mut hz = taxa::EstadoTaxa::novo(&janelas_iniciais);
+    let mut icn = icones::EstadoIcones::novo();
 
     // Primeira aplicação logo ao iniciar
     bat.passo();
@@ -174,7 +207,10 @@ fn rodar_daemon() {
     compositor::iniciar_escuta(&COMPOSITOR, tx, EventoSessao::Compositor);
 
     loop {
-        let prazo = menor_prazo(bat.proximo_prazo(), hz.proximo_prazo());
+        let prazo = menor_prazo(
+            menor_prazo(bat.proximo_prazo(), hz.proximo_prazo()),
+            icn.proximo_prazo(),
+        );
         let ev = match prazo {
             Some(p) => match rx.recv_timeout(p) {
                 Ok(e) => Some(e),
@@ -192,6 +228,7 @@ fn rodar_daemon() {
                 bat.passo();
                 bateria::atualizar_barra();
                 hz.verificar_prazo(&COMPOSITOR);
+                icn.verificar_prazo(&COMPOSITOR);
             }
             Some(EventoSessao::EnergiaMudou) => {
                 bat.passo();
@@ -207,6 +244,10 @@ fn rodar_daemon() {
                 bat.recarregar_padroes_jogo(&janelas);
                 bat.passo();
                 hz.recarregar(&COMPOSITOR, &janelas);
+            }
+            Some(EventoSessao::FontesIconesMudaram) => {
+                icn.invalidar_cache_tema();
+                icn.agendar_conferencia();
             }
             Some(EventoSessao::Compositor(ev_comp)) => match ev_comp {
                 EventoCompositor::JanelaAberta { endereco, classe } => {
@@ -224,8 +265,8 @@ fn rodar_daemon() {
                 EventoCompositor::MonitoresOuConfigMudaram => {
                     hz.agendar_reaplicacao_pos_reload();
                 }
-                EventoCompositor::WorkspaceMudou(_) => {
-                    // Será utilizado no passo 3 (ícones)
+                EventoCompositor::WorkspaceMudou(area) => {
+                    icn.ao_mudar_workspace(area);
                 }
             },
         }

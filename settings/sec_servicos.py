@@ -18,7 +18,11 @@ CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.con
 RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 BIN = os.path.expanduser("~/.local/bin")
 # (chave no daemons.conf, título, lançador que sobe o supervisor se ele não estiver rodando)
-SERVICOS = [("clipboard", "Clipboard history", "clipboard --daemon"), ("tray", "System tray", "bandeja")]
+SERVICOS = [
+    ("clipboard", "Clipboard history", "clipboard --daemon"),
+    ("tray", "System tray", "bandeja"),
+    ("session", "Session helpers (battery, refresh rate, icons)", "aero-energia"),
+]
 OPCOES = [("Native (Rust)", "rust"), ("Classic (Python)", "python")]
 
 
