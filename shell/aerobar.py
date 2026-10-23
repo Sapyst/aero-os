@@ -974,13 +974,17 @@ class Barra(Gtk.Window):
             self.pulso = self.area.add_tick_callback(self._pulso)
         self.redesenhar()
 
-    def _pulso(self, *_):
-        """Only animation of the bar: the charging pulse (a redraw per frame while charging)."""
+    def _pulso(self, _w, relogio):
+        """Only animation of the bar: the charging pulse. No máximo 30 quadros/s: a barra inteira a cada
+        quadro do monitor (165 Hz) comia metade de um núcleo e deixava a gota do hover aos trancos."""
         if not self.carregando:
             self.pulso = None
             self.redesenhar()
             return GLib.SOURCE_REMOVE
-        self.area.queue_draw()
+        agora = relogio.get_frame_time()
+        if agora - getattr(self, "_pulso_t", 0) >= 33000:          # µs
+            self._pulso_t = agora
+            self.area.queue_draw()
         return GLib.SOURCE_CONTINUE
 
     def tique_bateria(self):
