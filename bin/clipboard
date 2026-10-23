@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Histórico da área de transferência (Ctrl+Shift+V). Código: ~/.local/share/aero-shell/clipboard.py (doc 22)
-# Uso: clipboard           abre/fecha a janelinha
-#      clipboard --daemon  só carrega em segundo plano (o Hyprland faz isso ao ligar)
-if [ "$1" != --daemon ]; then
-    # Caminho rápido: pede pelo D-Bus pro programa que já está rodando executar a ação "alternar"
-    gdbus call --session --dest com.aero.Clipboard --object-path /com/aero/Clipboard \
-        --method org.gtk.Actions.Activate alternar '[]' '{}' >/dev/null 2>&1 && exit 0
+# Histórico da área de transferência (Ctrl+Shift+V).
+# Uso: clipboard           abre/fecha a janelinha (~/.local/share/aero-shell/clipboard.py)
+#      clipboard --daemon  inicia o daemon residente em Rust (~/.local/bin/aero-clipd)
+if [ "$1" = --daemon ]; then
+    exec "$HOME/.local/bin/aero-clipd"
 fi
-# Não estava rodando (ou --daemon): inicia o programa
+# Caminho rápido: pede pelo D-Bus pro programa que já está aberto executar a ação "alternar"
+gdbus call --session --dest com.aero.Clipboard --object-path /com/aero/Clipboard \
+    --method org.gtk.Actions.Activate alternar '[]' '{}' >/dev/null 2>&1 && exit 0
+# Abre a janela sob demanda (sai da memória ao fechar)
 exec python3 "$HOME/.local/share/aero-shell/clipboard.py" "$@"

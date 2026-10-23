@@ -276,14 +276,17 @@ class Historico(Gtk.ApplicationWindow):
         with open(caminho, "rb") as f:
             # wl-copy fica rodando em segundo plano "segurando" o conteúdo até a próxima cópia
             subprocess.run(["wl-copy", "--type", item["tipo"]], stdin=f)
-        self.fechar()
+        self.fechar(sair=False)
         anterior = self.anterior
         if anterior:
             hyprctl("dispatch", "focuswindow", f"address:{anterior['address']}")
             atalho = "CTRL SHIFT" if anterior.get("class") in TERMINAIS else "CTRL"
             # espera o foco voltar pro app antes de mandar o "colar"
-            GLib.timeout_add(120, lambda: hyprctl("dispatch", "sendshortcut",
-                                                  f"{atalho}, V, address:{anterior['address']}") and False)
+            GLib.timeout_add(120, lambda: (hyprctl("dispatch", "sendshortcut",
+                                                   f"{atalho}, V, address:{anterior['address']}"),
+                                           self.sair(), False)[2])
+        else:
+            self.sair()
 
     def apagar(self, linha):
         itens = [i for i in self.ler() if i["hash"] != linha.item["hash"]]
@@ -336,6 +339,9 @@ class Historico(Gtk.ApplicationWindow):
             self.fechar()
             return
         ativa = json.loads(hyprctl("activewindow", "-j") or "{}")
+        if int(ativa.get("fullscreen", 0) or 0) > 0:
+            self.sair()
+            return
         self.anterior = ativa if ativa.get("address") else None
         self.busca.set_text("")
         self.montar()
@@ -351,9 +357,17 @@ class Historico(Gtk.ApplicationWindow):
         else:
             self.fechar()
 
-    def fechar(self):
+    def fechar(self, sair=True):
         if self.get_visible():
             self.set_visible(False)
+        if sair:
+            self.sair()
+
+    def sair(self):
+        if not getattr(self, "daemon", False):
+            app = self.get_application()
+            if app:
+                app.quit()
 
 
 class App(Adw.Application):
@@ -364,19 +378,21 @@ class App(Adw.Application):
 
     def do_command_line(self, linha):
         """Roda na instância já aberta: "clipboard" abre/fecha; "--daemon" só carrega."""
+        daemon = "--daemon" in linha.get_arguments()
         if self.janela is None:
             provedor = Gtk.CssProvider()
             provedor.load_from_string(CSS)
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             self.janela = Historico(self)
+            self.janela.daemon = daemon
             self.hold()
             # Ação "alternar" exposta no D-Bus: o lançador chama direto com gdbus (~10 ms),
             # sem precisar iniciar outro Python só pra avisar este programa
             acao = Gio.SimpleAction.new("alternar", None)
             acao.connect("activate", lambda *_: self.janela.alternar())
             self.add_action(acao)
-        if "--daemon" not in linha.get_arguments():
+        if not daemon:
             self.janela.alternar()
         return 0
 
