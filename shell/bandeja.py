@@ -72,8 +72,19 @@ def geometria_da_barra():
                     g[k] = d[k]
         except (OSError, ValueError, AttributeError):
             pass
-        # AeroBar: 6 px inner edge + the quick-center icon (8 + icon + 8) are right of the tray
-        return g["margin_top"] + (g["height"] - 34) // 2, g["margin_sides"] + 6 + 8 + g["icon_size"] + 8
+        # AeroBar: inner edge + the quick-center icon (8 + icon + 8) are right of the tray. Inner edge: 6 px;
+        # Solid: the right island lines up with the windows (general:gaps_out), like aerobar.py medir()
+        borda = 6
+        if solido.ativo():
+            try:
+                d = json.loads(subprocess.run(["hyprctl", "getoption", "general:gaps_out", "-j"], capture_output=True,
+                                              text=True, timeout=2).stdout or "{}")
+                v = [int(float(x)) for x in str(d.get("custom", d.get("int", ""))).split()]
+                gd = v[1] if len(v) > 1 else v[0]
+                borda = max(2, gd - g["margin_sides"]) + 2
+            except (OSError, ValueError, TypeError, IndexError, subprocess.SubprocessError):
+                pass
+        return g["margin_top"] + (g["height"] - 34) // 2, g["margin_sides"] + borda + 8 + g["icon_size"] + 8
     try:
         txt = open(os.path.expanduser("~/.config/waybar/config.jsonc")).read()
     except OSError:
@@ -226,7 +237,7 @@ class Bandeja(Gtk.ApplicationWindow):
             except OSError:
                 return
             for linha in s.makefile("r", encoding="utf-8", errors="replace"):
-                if linha.strip() in ("openlayer>>waybar", "openlayer>>aerobar"):
+                if linha.strip() in ("openlayer>>waybar", "openlayer>>aerobar", "configreloaded>>"):
                     GLib.timeout_add(300, self.reerguer)    # espera a barra terminar de aparecer
 
         threading.Thread(target=ouvir, daemon=True).start()

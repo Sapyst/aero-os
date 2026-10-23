@@ -568,7 +568,7 @@ class Barra(Gtk.Window):
         self.ws_gotas, self.ws_antes = [], None   # Solid: gotas dos workspaces que nascem/somem
         self.gota = GotaSolida() if SOLIDO else Gota()
         if SOLIDO:                                # paleta nova (wallpaper, claro/escuro): só redesenha
-            self._vigia_cores = solido.vigiar(lambda: (self.redesenhar(), self.gota.area.queue_draw()))
+            self._vigia_cores = solido.vigiar(lambda: (self.redesenhar(), self.gota.area.queue_draw()), peca="aerobar")
         self.calendario = CalendarioSolido() if SOLIDO else Calendario()
         # hypr-botoes (the click watcher) sends SIGUSR1 when a click lands outside an open popup:
         # in Hyprland an invisible layer can't catch clicks, so this is how "click outside closes" works
@@ -660,7 +660,10 @@ class Barra(Gtk.Window):
             m.x, m.w = 0, 0
         esq, cen, dir_ = self.visiveis(self.esquerda), self.visiveis(self.centro), self.visiveis(self.direita)
         ce, de = larg(cen), larg(dir_)
-        x = 6
+        # Solid: a borda de fora da 1ª e da última ilha (m.x - 2 / fim + 2) na MESMA linha das janelas, que
+        # ficam a general:gaps_out da borda da tela (ler_gaps); fora do Solid, o recuo de sempre
+        ge, gd = (max(2, g - LADO) + 2 for g in self.gaps) if SOLIDO else (6, 6)
+        x = ge
         for m in esq:
             m.x, m.w = x, self.larg_de(m, cr)
             x += m.w
@@ -668,7 +671,7 @@ class Barra(Gtk.Window):
         for m in cen:
             m.x, m.w = x, self.larg_de(m, cr)
             x += m.w
-        x = w - 6 - de
+        x = w - gd - de
         for m in dir_:
             m.x, m.w = x, self.larg_de(m, cr)
             x += m.w
@@ -838,7 +841,11 @@ class Barra(Gtk.Window):
         if getattr(self, "_dica_id", None):
             GLib.source_remove(self._dica_id)
             self._dica_id = None
-        self.gota.esconder()
+        if SOLIDO and m is not None and m.nome == "clock" and g.get_current_button() == 1:
+            pilula_ = self.gota.sumir_ja()             # a dica vira a gaveta do calendário (metaball)
+            self.calendario.desde = pilula_
+        else:
+            self.gota.esconder()
         if m is not None:
             m.clique(g.get_current_button(), x)
 
@@ -870,6 +877,7 @@ class Barra(Gtk.Window):
     # ---------- data ----------
 
     def iniciar_fontes(self):
+        self.ler_gaps()
         self.ler_workspaces()
         self.ler_idioma()
         self.ler_volume()
@@ -914,6 +922,24 @@ class Barra(Gtk.Window):
                     print(f"aerobar: {f.__name__}: {erro!r}", flush=True)
                 time.sleep(seg)
         threading.Thread(target=laco, daemon=True).start()
+
+    gaps = (12, 12)                                   # general:gaps_out (esquerda, direita), em px lógicos
+
+    def ler_gaps(self):
+        """general:gaps_out do Hyprland ("cima direita baixo esquerda", ou um número só): as ilhas da ponta
+        se alinham com as janelas. Relido a cada configreloaded (mudou no Settings/conf: segue sozinho)."""
+        try:
+            d = json.loads(rodar("hyprctl", "getoption", "general:gaps_out", "-j") or "{}")
+            v = [int(float(x)) for x in str(d.get("custom", d.get("int", ""))).split()]
+        except (ValueError, TypeError):
+            return
+        if not v:
+            return
+        cima, dir_, baixo, esq = (v * 4)[:4] if len(v) == 1 else (v + v[:2])[:4] if len(v) == 2 else \
+            (v[0], v[1], v[2], v[1]) if len(v) == 3 else v[:4]
+        if (esq, dir_) != self.gaps:
+            self.gaps = (esq, dir_)
+            GLib.idle_add(self.redesenhar)
 
     def ler_workspaces(self):
         try:
@@ -960,6 +986,8 @@ class Barra(Gtk.Window):
                             self.ler_workspaces()
                         elif nome == "activelayout":
                             self.ler_idioma()
+                        elif nome == "configreloaded":
+                            self.ler_gaps()
             except OSError:
                 pass
             time.sleep(3)
@@ -1326,16 +1354,27 @@ class Calendario(Gtk.Window):
 
 class CalendarioSolido(Calendario):
     """Solid: o mês em Material — superfície tonal, números em Inter, hoje num círculo da primária. Abre
-    como uma gaveta que ESCORRE da ilha do relógio: o painel nasce grudado na borda da ilha e desce,
-    preso por um pescoço líquido (solido.pescoco, em cairo); fecha se recolhendo pra dentro da ilha."""
+    como uma gaveta que ESCORRE da ilha do relógio: o painel desce até GAP abaixo da ilha, preso a ela por
+    um pescoço sólido contínuo (mesma cor da ilha, cantos côncavos de raio FILETE nas duas pontas);
+    fecha se recolhendo pra dentro da ilha. Se a dica do relógio estava na tela, a gaveta NASCE dela:
+    a pílula vira o começo da gaveta (desde_pilula) e cresce até o mês inteiro.
 
-    GAP = 10                                   # o pescoço: da borda da ilha até o painel
+    A camada começa Y0 px DENTRO da ilha (o pescoço entra um pouco nela: sem fresta de anti-serrilhado)
+    e ignora a zona exclusiva da barra (-1): sem isso o Hyprland a punha ABAIXO da área reservada da barra
+    e sobrava um vão de ~30 px entre a ilha e o pescoço."""
+
+    GAP = 26                                   # da borda de baixo da ilha até o topo do painel (aberto)
+    FILETE = 13                                # raio dos cantos côncavos do pescoço (união suave)
+    PESCOCO = 17                               # meia largura da cintura do pescoço
+    Y0 = 2
     ENTRA, SAI = 0.42, 0.28
 
     def __init__(self):
         super().__init__()
-        self.altura += self.GAP
+        self.altura += self.GAP + self.Y0
         self.area.set_content_height(self.altura)
+        Camada.set_exclusive_zone(self, -1)
+        self.desde = None                          # (largura, altura, topo) da pílula da dica, se nasce dela
         prov = Gtk.CssProvider()                   # a janela não pinta nada: o painel é todo desenhado aqui
         prov.load_from_string(".aerobar-gota { background: none; background-color: transparent; }")
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
@@ -1347,7 +1386,7 @@ class CalendarioSolido(Calendario):
             return
         hoje = time.localtime()
         self.ano, self.mes = hoje.tm_year, hoje.tm_mon
-        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA - 3)      # encosta na borda de baixo da ilha
+        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA - 3 - self.Y0)   # a borda de baixo da ilha
         self.t0, self.saindo = time.monotonic(), False
         self.set_visible(True)
         self.present()
@@ -1365,8 +1404,12 @@ class CalendarioSolido(Calendario):
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
+    def esconder(self):
+        self.desde = None
+        super().esconder()
+
     def _clique(self, _g, _n, x, y):
-        if self.GAP <= y < 50 + self.GAP:
+        if self.GAP + self.Y0 <= y < 50 + self.GAP + self.Y0:
             if x < 60:
                 self.mudar_mes(-1)
             elif x > self.largura - 60:
@@ -1382,18 +1425,21 @@ class CalendarioSolido(Calendario):
             k = min(1.0, t / self.ENTRA)
             e, alfa = 1 - (1 - k) ** 3, solido.suave(0.5, 1.0, k)
         sup = cor_s("surface_container")
-        ph = h - self.GAP
-        pw, phh = 64 + (w - 64) * e, 18 + (ph - 18) * e
-        topo = self.GAP * e
+        y0 = self.Y0                               # a borda de baixo da ilha, nesta camada
+        ph = h - self.GAP - y0
+        w0, h0, t0_ = self.desde or (64, 18, 0)    # começo: a pílula da dica (se estava aberta) ou uma gota
+        pw, phh = w0 + (w - w0) * e, h0 + (ph - h0) * e
+        topo = y0 + t0_ + (self.GAP - t0_) * e
         x0 = (w - pw) / 2
         cr.set_source_rgb(*sup)
         pilula(cr, x0, topo, pw, phh, min(solido.raio(), phh / 2, pw / 2))
         cr.fill()
-        solido.pescoco(cr, w / 2, 0, topo, 34, 42, self.GAP + 6)              # a gaveta continua presa à ilha
+        self._pescoco(cr, w / 2, y0, topo, pw)     # a gaveta continua presa à ilha
+        cr.fill()
         if alfa <= 0.01:
             return
         cr.push_group()
-        cr.translate(0, self.GAP)
+        cr.translate(0, self.GAP + y0)
         on, dim, prim = cor_s("on_surface"), cor_s("on_surface_variant"), cor_s("primary")
         titulo = time.strftime("%B %Y", (self.ano, self.mes, 1, 0, 0, 0, 0, 1, -1))
         tw = texto_s(cr, titulo, 0, 0, 16, on, Pango.Weight.SEMIBOLD, medir=True)
@@ -1425,6 +1471,31 @@ class CalendarioSolido(Calendario):
                 texto_s(cr, num, cx - nw / 2, cy, 14, cor, Pango.Weight.SEMIBOLD if eh_hoje else Pango.Weight.NORMAL)
         cr.pop_group_to_source()
         cr.paint_with_alpha(alfa)
+
+    def _pescoco(self, cr, cx, y_ilha, y_painel, pw):
+        """Um pescoço SÓLIDO só (sem fresta): cintura de meia largura PESCOCO entre a borda de baixo da
+        ilha (y_ilha) e o topo do painel (y_painel), com cantos côncavos de raio FILETE nas duas pontas
+        (o canto vira um quarto de círculo "pra fora": a união suave das duas formas). Vão curto (abrindo):
+        o raio encolhe pra caber. Também entra 2 px na ilha e no painel (sem costura no anti-serrilhado)."""
+        g = y_painel - y_ilha
+        if g <= 0.5:
+            return
+        r = max(0.0, min(self.FILETE, g / 2))
+        nw = max(2.0, min(self.PESCOCO, pw / 2 - r - 2))
+        a, b = y_ilha, y_painel
+        cr.move_to(cx - nw - r, a - 2)
+        cr.line_to(cx - nw - r, a)
+        cr.arc(cx - nw - r, a + r, r, -math.pi / 2, 0)                 # canto côncavo de cima, esquerda
+        cr.line_to(cx - nw, b - r)
+        cr.arc(cx - nw - r, b - r, r, 0, math.pi / 2)                  # de baixo, esquerda
+        cr.line_to(cx - nw - r, b + 2)
+        cr.line_to(cx + nw + r, b + 2)
+        cr.line_to(cx + nw + r, b)
+        cr.arc(cx + nw + r, b - r, r, math.pi / 2, math.pi)            # de baixo, direita
+        cr.line_to(cx + nw, a + r)
+        cr.arc(cx + nw + r, a + r, r, math.pi, 3 * math.pi / 2)        # de cima, direita
+        cr.line_to(cx + nw + r, a - 2)
+        cr.close_path()
 
 
 class Gota(Gtk.Window):
@@ -2087,6 +2158,26 @@ class GotaSolida(Gtk.Window):
             if not self.entrando:
                 return
             self._animar(False)
+
+    def sumir_ja(self):
+        """Some NA HORA (sem animar) e devolve (largura, altura, topo abaixo da ilha) da pílula, se ela
+        estava inteira na tela — quem abre no lugar dela (a gaveta do calendário) nasce desse formato."""
+        forma = None
+        if self.get_visible() and self.texto and self.entrando and self.t >= 1.0:
+            forma = (self.bw, float(self.ALT), float(self.GAP))
+        else:                            # ainda entrando/saindo: só recolhe pra ilha, como sempre
+            self.esconder()
+            return None
+        if self.tique is not None:
+            self.area.remove_tick_callback(self.tique)
+            self.tique = None
+
+        def apagar():                    # 60 ms depois: a gaveta já desenhou o 1º quadro por cima (sem vão)
+            self.texto, self.entrando = "", False
+            self.area.queue_draw()
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add(60, apagar)
+        return forma
 
     def _animar(self, entrando):
         self.entrando, self.t0 = entrando, None
