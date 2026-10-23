@@ -45,7 +45,32 @@ from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 # Reaproveita do Settings os nomes bonitos e a lista de dispositivos (sec_som.py)
 sys.path.insert(0, os.path.expanduser("~/.local/share/aero-settings"))
-from sec_som import listar, nome_bonito, volume_de  # noqa: E402
+from sec_som import listar as _listar_pactl, nome_bonito, volume_de  # noqa: E402
+
+
+def hermes_chamar(metodo, params=None, tipo_retorno=None, timeout_ms=1200):
+    """Chama um método do daemon nativo `hermesd` (`com.aero.Hermes` em `/org/freedesktop/Notifications`).
+    Devolve a tupla desempacotada ou `None` se o `hermesd` não estiver rodando (caindo pro Python)."""
+    try:
+        con = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        res = con.call_sync("com.aero.Hermes", "/org/freedesktop/Notifications", "com.aero.Hermes",
+                            metodo, params, GLib.VariantType.new(tipo_retorno) if tipo_retorno else None,
+                            Gio.DBusCallFlags.NO_AUTO_START, timeout_ms, None)
+        return res.unpack() if res is not None else ()
+    except GLib.Error:
+        return None
+
+
+def listar(tipo):
+    """Lista `sinks` ou `sources` a partir do cache instantâneo do `hermesd` (ou do `pactl` como reserva)."""
+    import json
+    r = hermes_chamar("GetAudio", None, "(s)")
+    if r:
+        try:
+            return json.loads(r[0]).get(tipo, [])
+        except (ValueError, AttributeError):
+            pass
+    return _listar_pactl(tipo)
 
 
 def app_instalado(app):
@@ -601,9 +626,142 @@ class Janelinha(Gtk.Window):
         self.fechar()
 
 
-# ---------- notificações: Hermes (dentro deste processo) ou, se ele não estiver no comando, o mako ----------
-# Nada de chamar o hermesctl daqui: o Hermes mora NESTE processo e a chamada esperaria por ela mesma.
-HERMES = None          # o serviço (hermes.Hermes) quando é ele que recebe as notificações
+# ---------- notificações: hermesd (daemon nativo em Rust), hermes.py (reserva em Python) ou mako ----------
+HERMES = None          # ClienteHermes (conectado ao hermesd) ou hermes.Hermes (reserva Python)
+
+
+class NotificacaoRemota:
+    """Representa uma notificação recebida do `hermesd` via D-Bus, com os mesmos atributos de `hermes.Notificacao`."""
+    __slots__ = ("id", "app", "icone", "titulo", "corpo", "acoes", "urgencia", "categoria", "entrada",
+                 "valor", "imagem", "onda", "criada", "residente", "som")
+
+    def __init__(self, d):
+        self.id = int(d.get("id", 0))
+        self.app = d.get("app", "Unknown")
+        self.icone = d.get("icone", "")
+        self.titulo = d.get("titulo", "")
+        self.corpo = d.get("corpo", "")
+        self.acoes = [(a[0], a[1]) for a in d.get("acoes", []) if isinstance(a, (list, tuple)) and len(a) == 2]
+        self.urgencia = int(d.get("urgencia", 1))
+        self.categoria = d.get("categoria", "")
+        self.entrada = d.get("entrada", "")
+        self.valor = d.get("valor")
+        self.imagem = None
+        self.onda = bool(d.get("onda", True))
+        self.criada = float(d.get("criada", 0.0))
+        self.residente = bool(d.get("residente", False))
+        self.som = d.get("som")
+
+
+class ClienteHermes:
+    """Cliente D-Bus do daemon nativo `hermesd` (`com.aero.Hermes`), compatível 1:1 com `hermes_ui.HermesUI`."""
+
+    def __init__(self, conexao, ao_mudar_audio=None):
+        import json
+        import hermes
+        self.conexao = conexao
+        self.ao_mudar_audio = ao_mudar_audio
+        self.ouvintes = []
+        self.segurar = lambda n: False
+        self.ativas = {}
+        r_cfg = hermes_chamar("GetConfig", None, "(s)")
+        try:
+            self.config = hermes.validar_config(json.loads(r_cfg[0])) if r_cfg else hermes.ler_config()
+        except Exception:
+            self.config = hermes.ler_config()
+        r_mod = hermes_chamar("Modes", None, "(as)")
+        self.modos = set(r_mod[0]) if r_mod else set()
+        r_at = hermes_chamar("GetActive", None, "(s)")
+        if r_at:
+            try:
+                for item in json.loads(r_at[0]):
+                    n = NotificacaoRemota(item)
+                    self.ativas[n.id] = n
+            except Exception:
+                pass
+        self._sub = conexao.signal_subscribe(
+            None, "com.aero.Hermes", None, "/org/freedesktop/Notifications", None,
+            Gio.DBusSignalFlags.NONE, self._ao_sinal, None)
+
+    def ouvir(self, f):
+        self.ouvintes.append(f)
+
+    def _avisar(self, evento, n):
+        for f in list(self.ouvintes):
+            try:
+                f(evento, n)
+            except Exception as erro:
+                print(f"hermes-client: listener failed: {erro!r}", flush=True)
+
+    def _ao_sinal(self, _con, _rem, _cam, _iface, sinal, params, *_):
+        import json
+        if sinal == "AudioChanged":
+            if self.ao_mudar_audio:
+                GLib.idle_add(self.ao_mudar_audio)
+            return
+        if sinal != "NotificationEvent":
+            return
+        try:
+            ev, texto = params.unpack()
+            dados = json.loads(texto) if texto else None
+        except Exception:
+            return
+        if ev in ("show", "update") and isinstance(dados, dict):
+            n = NotificacaoRemota(dados)
+            self.ativas[n.id] = n
+            if self.segurar(n):
+                hermes_chamar("Hold", GLib.Variant("(u)", (n.id,)))
+            self._avisar(ev, n)
+        elif ev == "close" and isinstance(dados, dict):
+            nid = int(dados.get("id", 0))
+            n = self.ativas.pop(nid, None) or NotificacaoRemota(dados)
+            self._avisar("close", n)
+        elif ev == "config":
+            import hermes
+            self.config = hermes.validar_config(dados) if isinstance(dados, dict) else hermes.ler_config()
+            self._avisar("config", None)
+        elif ev == "modes" and isinstance(dados, list):
+            self.modos = set(dados)
+            self._avisar("modes", None)
+
+    def historico_mako(self):
+        import json
+        r = hermes_chamar("History", None, "(s)")
+        if r:
+            try:
+                return json.loads(r[0])
+            except ValueError:
+                pass
+        return []
+
+    @property
+    def historico(self):
+        return self.historico_mako()
+
+    def modo(self, nome, ligado):
+        if ligado:
+            self.modos.add(nome)
+        else:
+            self.modos.discard(nome)
+        hermes_chamar("SetMode", GLib.Variant("(sb)", (nome, bool(ligado))))
+
+    def dispensar_tudo(self):
+        hermes_chamar("DismissAll")
+
+    def fechar(self, id_, *_):
+        hermes_chamar("Dismiss", GLib.Variant("(u)", (int(id_),)))
+
+    def acionar(self, id_, chave="default", token=""):
+        hermes_chamar("InvokeAction", GLib.Variant("(uss)", (int(id_), str(chave), str(token))))
+
+    def armar(self, id_):
+        hermes_chamar("Arm", GLib.Variant("(u)", (int(id_),)))
+
+    def remover_do_historico(self, id_):
+        hermes_chamar("RemoveHistory", GLib.Variant("(u)", (int(id_),)))
+
+    def limpar_historico(self):
+        hermes_chamar("ClearHistory")
 
 
 def visual_atual():
@@ -643,7 +801,7 @@ def notif_dispensar():
     if HERMES is not None:
         GLib.idle_add(lambda: (HERMES.dispensar_tudo(), False)[1])
     else:
-        notif_dispensar()
+        rodar("makoctl", "dismiss", "--all")
 
 
 
@@ -1202,6 +1360,14 @@ class CentralRapida(Janelinha):
 
     @staticmethod
     def wifi():
+        import json
+        r = hermes_chamar("GetHestiaState", None, "(s)")
+        if r:
+            try:
+                w = json.loads(r[0]).get("wifi", [False, ""])
+                return bool(w[0]), str(w[1])
+            except Exception:
+                pass
         ligado = rodar("nmcli", "-t", "-f", "WIFI", "g").strip() == "enabled"
         # "--rescan no": só lê a lista que o NetworkManager já tem. Sem isso, se a lista tem mais de 30 s o nmcli
         # faz uma varredura nova ANTES de responder (~4,6 s aqui) e a Central travava: o clique parecia não abrir,
@@ -1215,6 +1381,14 @@ class CentralRapida(Janelinha):
 
     @staticmethod
     def bluetooth():
+        import json
+        r = hermes_chamar("GetBluetoothDevices", None, "(s)")
+        if r:
+            try:
+                d = json.loads(r[0])
+                return bool(d.get("powered")), list(d.get("connected", []))
+            except Exception:
+                pass
         info = rodar("bluetoothctl", "show")
         ligado = "Powered: yes" in info
         conectados = [l.split(" ", 2)[2] for l in rodar("bluetoothctl", "devices", "Connected").splitlines()
@@ -1433,6 +1607,7 @@ class CentralRapida(Janelinha):
 
     # Bluetooth: aparelhos pareados (clique conecta/desconecta) e os que estão por perto (clique pareia)
     def procurar_bt(self):
+        import json
         import threading
 
         def aparelhos(*filtro):
@@ -1445,6 +1620,16 @@ class CentralRapida(Janelinha):
             return out
 
         def trabalho():
+            r = hermes_chamar("GetBluetoothDevices", None, "(s)")
+            if r:
+                try:
+                    d = json.loads(r[0])
+                    self.aparelhos = list(d.get("paired", []))
+                    self.por_perto = list(d.get("nearby", []))
+                    GLib.idle_add(self.atualizar_sub)
+                    return
+                except Exception:
+                    pass
             conectados = {m for m, _ in aparelhos("Connected")}
             pareados = aparelhos("Paired")
             self.aparelhos = [{"mac": m, "nome": n, "uso": m in conectados} for m, n in pareados]
@@ -1539,11 +1724,22 @@ class CentralRapida(Janelinha):
         return caixa
 
     def procurar_redes(self):
-        """Lista as redes em volta numa thread (o nmcli pode levar 1–2 s procurando)."""
+        """Lista as redes em volta numa thread (via hermesd ou nmcli como reserva)."""
+        import json
         import re
         import threading
 
         def trabalho():
+            r = hermes_chamar("GetWifiNetworks", GLib.Variant("(b)", (True,)), "(s)")
+            if r:
+                try:
+                    d = json.loads(r[0])
+                    self.redes = list(d.get("redes", []))
+                    self.redes_salvas = list(d.get("salvas", []))
+                    GLib.idle_add(self.atualizar_sub)
+                    return
+                except Exception:
+                    pass
             saida = rodar("nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "dev", "wifi", "list", "--rescan", "auto")
             redes = {}
             for linha in saida.splitlines():
@@ -1638,9 +1834,19 @@ class CentralRapida(Janelinha):
     def conectar_rede(self, rede):
         """Rede salva: conecta direto. Aberta: conecta. Nova com senha: abre o campo de senha aqui.
         Empresarial (802.1X, login e certificado): isso precisa da tela completa do Settings."""
+        import json
         import threading
         ssid = rede["ssid"]
-        salvas = rodar("nmcli", "-t", "-f", "NAME", "con", "show").splitlines()
+        salvas = getattr(self, "redes_salvas", None)
+        if salvas is None:
+            r = hermes_chamar("GetWifiNetworks", GLib.Variant("(b)", (False,)), "(s)")
+            if r:
+                try:
+                    salvas = list(json.loads(r[0]).get("salvas", []))
+                except Exception:
+                    salvas = None
+        if salvas is None:
+            salvas = rodar("nmcli", "-t", "-f", "NAME", "con", "show").splitlines()
         if ssid not in salvas and "802.1X" in rede.get("tipo", ""):
             self.abrir_settings("rede")
             return
@@ -1718,9 +1924,35 @@ class CentralRapida(Janelinha):
         GLib.timeout_add(2000, self.montar_seguro)
 
     def coletar(self):
-        """Busca TODAS as informações ao mesmo tempo (cada uma numa thread): ~0,1 s no total, em vez de
-        ~0,7 s uma atrás da outra. Roda em segundo plano; a tela não espera por ela."""
+        """Busca TODAS as informações da Hestia de uma vez no `hermesd` (D-Bus), em paralelo com player e brilho."""
+        import json
         from concurrent.futures import ThreadPoolExecutor
+        r = hermes_chamar("GetHestiaState", None, "(s)")
+        if r:
+            try:
+                d = json.loads(r[0])
+                with ThreadPoolExecutor(2) as ex:
+                    f_pl = ex.submit(self.player)
+                    f_br = ex.submit(self.ler_brilho)
+                    pl, br = f_pl.result(), f_br.result()
+                w = d.get("wifi", [False, ""])
+                bt = d.get("bluetooth", [False, []])
+                if getattr(self, "aparelhos", None) is None and "bt_paired" in d:
+                    self.aparelhos = list(d.get("bt_paired", []))
+                    self.por_perto = list(d.get("bt_nearby", []))
+                return {
+                    "player": pl,
+                    "wifi": (bool(w[0]), str(w[1])),
+                    "bluetooth": (bool(bt[0]), list(bt[1])),
+                    "modos": sorted(d.get("modes", [])),
+                    "filtro": bool(d.get("filter", False)),
+                    "tema": str(d.get("theme", "")),
+                    "sinks": list(d.get("sinks", [])),
+                    "sources": list(d.get("sources", [])),
+                    "brilho": br,
+                }
+            except Exception:
+                pass
         tarefas = {"player": self.player, "wifi": self.wifi, "bluetooth": self.bluetooth,
                    "modos": lambda: sorted(notif_modos()), "filtro": self.filtro_ligado,
                    "tema": lambda: rodar("cat", os.path.expanduser("~/.cache/hypr-tema/tema")).strip(),
@@ -2269,7 +2501,8 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
             acao = Gio.SimpleAction.new(nome, GLib.VariantType.new("s"))
             acao.connect("activate", lambda _a, valor, f=funcao: f(valor.get_string()))
             self.add_action(acao)
-        threading.Thread(target=self.vigiar, daemon=True).start()
+        if not getattr(self, "_usando_hermesd", False):
+            threading.Thread(target=self.vigiar, daemon=True).start()
 
     def lembrar_sino(self):
         # a barra (AeroBar) tira a bolinha vermelha do sino: tudo até a última notificação foi visto
@@ -2311,13 +2544,23 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         threading.Thread(target=trabalho, daemon=True).start()
 
     def iniciar_hermes(self):
-        """Hermes (doc: shell/hermes.py) recebe as notificações se o nome estiver livre. Com o mako
-        rodando, o nome é dele e o Hermes fica quieto (sem janelas, sem custo)."""
+        """Conecta ao hermesd (Rust) via D-Bus quando estiver rodando; senão, usa o hermes.py em Python como reserva."""
+        global HERMES
+        self._usando_hermesd = False
         try:
             import hermes
             import hermes_ui
         except Exception as erro:  # noqa: BLE001 — sem Hermes a central continua igual
             print(f"hermes: not loaded: {erro!r}", flush=True)
+            return
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        if hermes_chamar("LatestId", None, "(u)") is not None:
+            servico = ClienteHermes(bus, ao_mudar_audio=self.atualizar)
+            HERMES = servico
+            self._usando_hermesd = True
+            self.hermes_ui = hermes_ui.HermesUI(servico)
+            servico.ouvir(lambda ev, _n: ev == "modes" and rodar("pkill", "-RTMIN+10", "-x", "waybar"))
+            print("hermes: connected to hermesd (Rust)", flush=True)
             return
         servico = hermes.Hermes()
         servico.carregar_historico()
@@ -2331,7 +2574,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
 
         def perdeu():
             print("hermes: another notification daemon has the name (mako?); staying idle", flush=True)
-        servico.publicar(Gio.bus_get_sync(Gio.BusType.SESSION), ganhou, perdeu)
+        servico.publicar(bus, ganhou, perdeu)
 
     def vigiar(self):
         """pactl subscribe: uma linha por mudança ("Event 'change' on sink #52")."""

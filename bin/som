@@ -1,10 +1,45 @@
 #!/usr/bin/env bash
 # Controle de som da barra + avisos de volume/brilho (OSD). Código: ~/.local/share/aero-shell/som.py (doc 23)
-# Uso: som popup simples|completo    som osd volume|mic|brilho    som --daemon
+# Uso: som popup simples|completo    som osd volume|mic|brilho    som central abrir    som --daemon
+#
+# VIGIA: a central nunca pode ficar morta. Se o programa que já roda não responde ao D-Bus em 2 s
+# (travou) ou sumiu, este lançador anota onde ele travou (kill -USR1 -> ~/.cache/aero-shell/som.log),
+# derruba, sobe um novo pelo Hyprland e repete o pedido. O clique sempre abre a central.
 export LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so
+DAEMON="^python3 $HOME/.local/share/aero-shell/som.py --daemon"
+
+garantir_hermesd() {
+    [ -x "$HOME/.local/bin/hermesd" ] || return 0
+    gdbus call --session --timeout 1 --dest com.aero.Hermes --object-path /org/freedesktop/Notifications \
+        --method com.aero.Hermes.LatestId >/dev/null 2>&1 && return 0
+    setsid -f "$HOME/.local/bin/hermesd" >/dev/null 2>&1
+    for _ in $(seq 20); do
+        gdbus call --session --timeout 1 --dest com.aero.Hermes --object-path /org/freedesktop/Notifications \
+            --method com.aero.Hermes.LatestId >/dev/null 2>&1 && return 0
+        sleep 0.05
+    done
+}
+
+pedir() {
+    gdbus call --session --timeout 2 --dest com.aero.Sound --object-path /com/aero/Sound \
+        --method org.gtk.Actions.Activate "$1" "[<'$2'>]" '{}' >/dev/null 2>&1
+}
+
 if [ "$1" != --daemon ] && [ $# -eq 2 ]; then
-    # Caminho rápido: pede pelo D-Bus pro programa que já está rodando (ação com um texto de parâmetro)
-    gdbus call --session --dest com.aero.Sound --object-path /com/aero/Sound \
-        --method org.gtk.Actions.Activate "$1" "[<'$2'>]" '{}' >/dev/null 2>&1 && exit 0
+    pedir "$1" "$2" && exit 0
+    # não respondeu: travado ou morto
+    if pid=$(pgrep -f "$DAEMON" | head -1) && [ -n "$pid" ]; then
+        kill -USR1 "$pid" 2>/dev/null; sleep 0.3          # grava as pilhas no som.log
+        echo "=== $(date '+%F %T') vigia: central não respondeu, reiniciando (pid $pid)" >> "$HOME/.cache/aero-shell/som.log"
+        pkill -f "$DAEMON"; sleep 0.5; pkill -9 -f "$DAEMON"
+    fi
+    garantir_hermesd
+    hyprctl dispatch exec "$HOME/.local/bin/som --daemon" >/dev/null
+    for _ in $(seq 30); do                                 # até 3 s pro novo subir
+        sleep 0.1
+        pedir "$1" "$2" && exit 0
+    done
+    exit 1
 fi
+[ "$1" = --daemon ] && garantir_hermesd
 exec python3 "$HOME/.local/share/aero-shell/som.py" "$@"
