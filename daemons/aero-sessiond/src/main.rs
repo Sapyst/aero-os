@@ -8,10 +8,11 @@
 //! - **`inotify`**: o kernel avisa quando `~/.config/aero-shell/energia.json` ou `taxa.json`
 //!   são salvos pelo Settings ou pelos atalhos da barra.
 //! - **Socket do compositor (`trait Compositor`)**: recebe aberturas e fechamentos de janelas
-//!   (para detectar jogos em tempo real).
+//!   (para detectar jogos em tempo real) e eventos de monitor/configuração.
 
 mod bateria;
 mod compositor;
+mod taxa;
 
 use compositor::{Compositor, EventoCompositor, HyprlandCompositor};
 use std::env;
@@ -69,7 +70,6 @@ fn iniciar_escuta_uevent(tx: Sender<EventoSessao>) {
                 continue;
             }
             let fatia = &buf[..n as usize];
-            // Os campos uevent vêm separados por '\0'; procuramos SUBSYSTEM=power_supply
             if fatia
                 .split(|&b| b == 0)
                 .any(|campo| campo == b"SUBSYSTEM=power_supply")
@@ -148,23 +148,35 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
     });
 }
 
+fn menor_prazo(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
 fn rodar_daemon() {
     let (tx, rx): (Sender<EventoSessao>, Receiver<EventoSessao>) = mpsc::channel();
 
     let janelas_iniciais = COMPOSITOR.janelas_abertas();
     let mut bat = bateria::EstadoBateria::novo(&janelas_iniciais);
+    let mut hz = taxa::EstadoTaxa::novo(&janelas_iniciais);
 
     // Primeira aplicação logo ao iniciar
     bat.passo();
     bateria::atualizar_barra();
+    hz.aplicar(&COMPOSITOR);
 
     iniciar_escuta_uevent(tx.clone());
     iniciar_escuta_inotify(tx.clone());
     compositor::iniciar_escuta(&COMPOSITOR, tx, EventoSessao::Compositor);
 
     loop {
-        let ev = match bat.proximo_prazo() {
-            Some(prazo) => match rx.recv_timeout(prazo) {
+        let prazo = menor_prazo(bat.proximo_prazo(), hz.proximo_prazo());
+        let ev = match prazo {
+            Some(p) => match rx.recv_timeout(p) {
                 Ok(e) => Some(e),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -177,13 +189,14 @@ fn rodar_daemon() {
 
         match ev {
             None => {
-                // Prazo expirado (15 s de bateria crítica ou 24 h na tomada)
                 bat.passo();
                 bateria::atualizar_barra();
+                hz.verificar_prazo(&COMPOSITOR);
             }
             Some(EventoSessao::EnergiaMudou) => {
                 bat.passo();
                 bateria::atualizar_barra();
+                hz.ao_mudar_energia(&COMPOSITOR);
             }
             Some(EventoSessao::ConfigEnergiaMudou) => {
                 bat.passo();
@@ -193,20 +206,26 @@ fn rodar_daemon() {
                 let janelas = COMPOSITOR.janelas_abertas();
                 bat.recarregar_padroes_jogo(&janelas);
                 bat.passo();
+                hz.recarregar(&COMPOSITOR, &janelas);
             }
             Some(EventoSessao::Compositor(ev_comp)) => match ev_comp {
                 EventoCompositor::JanelaAberta { endereco, classe } => {
                     if bat.ao_abrir_janela(&endereco, &classe) {
                         bat.passo();
                     }
+                    hz.ao_abrir_janela(&COMPOSITOR, &endereco, &classe);
                 }
                 EventoCompositor::JanelaFechada { endereco } => {
                     if bat.ao_fechar_janela(&endereco) {
                         bat.passo();
                     }
+                    hz.ao_fechar_janela(&COMPOSITOR, &endereco);
                 }
-                EventoCompositor::MonitoresOuConfigMudaram | EventoCompositor::WorkspaceMudou(_) => {
-                    // Serão utilizados nos passos 2 (taxa) e 3 (ícones)
+                EventoCompositor::MonitoresOuConfigMudaram => {
+                    hz.agendar_reaplicacao_pos_reload();
+                }
+                EventoCompositor::WorkspaceMudou(_) => {
+                    // Será utilizado no passo 3 (ícones)
                 }
             },
         }
@@ -226,7 +245,9 @@ fn main() {
         "--waybar" => bateria::cmd_waybar(),
         "--alternar" => bateria::cmd_alternar(),
         "--cheia" => bateria::cmd_cheia(),
-        "--status" | "--battery-status" if prog != "aero-hz" => bateria::cmd_status(),
+        "--hz-status" => taxa::cmd_status(&COMPOSITOR),
+        "--status" if prog == "aero-hz" => taxa::cmd_status(&COMPOSITOR),
+        "--status" | "--battery-status" => bateria::cmd_status(),
         _ => rodar_daemon(),
     }
 }
