@@ -30,7 +30,7 @@ OPCOES_TOUCHPAD = [
 ]
 GESTOS = [
     ("GESTO_AREAS", "Swipe 3 fingers sideways", "Switch workspace", "1"),
-    ("GESTO_MENU", "Swipe 3 fingers up", "Open Super Menu", "1"),
+    ("GESTO_MENU", "Swipe 3 fingers up", "Open Kairos", "1"),
     ("GESTO_MINIMIZAR", "Swipe 4 fingers down", "Minimize the window", "1"),
 ]
 

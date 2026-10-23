@@ -61,8 +61,8 @@ class SecaoPadroes(Secao):
             self.categorias[cat] = {"linha": linha, "montada": False, "tipos": {}}
 
         g_orbit = Adw.PreferencesGroup(title="File finder",
-                                       description="ORBIT (Super+Shift+F) learns the folders you visit.")
-        self.orbit_home = Adw.ComboRow(title="ORBIT opens on",
+                                       description="Argus (Super+Shift+F) learns the folders you visit.")
+        self.orbit_home = Adw.ComboRow(title="Argus opens on",
                                        subtitle="Your folders by use, or a hub with every drive and place",
                                        model=Gtk.StringList.new([t for t, _ in ORBIT_HOME]))
         self.orbit_home.add_prefix(Gtk.Image.new_from_icon_name("folder-saved-search-symbolic"))

@@ -538,7 +538,7 @@ class SuperMenu(Gtk.ApplicationWindow):
                   lambda: self.alternar_fixado(app))]
         if self.secao == "recentes" and not self.busca.get_text():
             itens.append(("Remove from Recent", lambda: self.remover_recente(app)))
-        itens.append(("Add to Dock", lambda: self.adicionar_dock(app)))
+        itens.append(("Add to Atlas", lambda: self.adicionar_dock(app)))
         pop = Gtk.Popover(child=caixa)
         for texto, acao in itens:
             b = Gtk.Button(label=texto)

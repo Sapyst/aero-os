@@ -167,7 +167,7 @@ def abrir(janela):
     g_tudo = Adw.PreferencesGroup(description="Each place can have its own picture, or use the same one as the desktop.")
     pag.add(g_tudo)
     tudo = Adw.SwitchRow(title="Use the desktop wallpaper everywhere",
-                         subtitle="Lock screen and Super Menu follow the desktop")
+                         subtitle="Lock screen and Kairos follow the desktop")
     g_tudo.add(tudo)
 
     # ---- desktop ----
@@ -203,7 +203,7 @@ def abrir(janela):
     g_login.add(teste)
 
     # ---- Super Menu ----
-    g_menu_previa = Adw.PreferencesGroup(title="Super Menu", description="The picture at the top of the menu")
+    g_menu_previa = Adw.PreferencesGroup(title="Kairos", description="The picture at the top of the menu")
     pag.add(g_menu_previa)
     previa_menu = Previa(90)
     g_menu_previa.add(previa_menu)
@@ -269,10 +269,10 @@ def abrir(janela):
     def usar_menu(caminho):
         copiar(caminho, FUNDO_MENU)
         mostrar()
-        avisar("Super Menu picture updated")
+        avisar("Kairos picture updated")
 
     b_login.connect("clicked", lambda *_: escolher_imagem(raiz, "Lock screen picture", usar_login))
-    b_menu.connect("clicked", lambda *_: escolher_imagem(raiz, "Super Menu picture", usar_menu))
+    b_menu.connect("clicked", lambda *_: escolher_imagem(raiz, "Kairos picture", usar_menu))
 
     def ao_encaixe(*_):
         with open(CONF_LOGIN, "w") as f:
@@ -292,7 +292,7 @@ def abrir(janela):
         except GLib.Error:
             avatar.set_custom_image(None)
     mostrar_foto()
-    perfil = Adw.ActionRow(title=nome, subtitle="Shown on the login screen, the Super Menu and the quick settings")
+    perfil = Adw.ActionRow(title=nome, subtitle="Shown on the login screen, Kairos and Hestia")
     perfil.add_prefix(avatar)
 
     def trocar(caminho):

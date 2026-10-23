@@ -153,7 +153,7 @@ ATALHOS_SETTINGS = [
       "window buttons", "buttons", "minimize", "botões", "cursor", "pointer"),
      "aparencia", "Theme", "preferences-desktop-appearance-symbolic"),
     (("wallpaper", "background", "papel"), "wallpapers", "Theme → Wallpaper", "preferences-desktop-wallpaper-symbolic"),
-    (("dock",), "dock", "Dock", "view-app-grid-symbolic"),
+    (("atlas", "dock", "taskbar"), "dock", "Atlas", "view-app-grid-symbolic"),
     (("keyboard", "shortcut", "layout", "clipboard", "alt+tab", "teclado"), "teclado", "Keyboard",
      "input-keyboard-symbolic"),
     (("mouse", "touchpad", "trackpad", "gesture", "scroll"), "mouse", "Mouse & Touchpad", "input-mouse-symbolic"),

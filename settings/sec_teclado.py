@@ -32,7 +32,7 @@ def descrever(b):
                               ("hypr-area-de-trabalho", "Show desktop"), ("emojis", "Emoji picker"),
                               ("energia logout", "Log out (asks first)"), ("alttab overview", "All windows (overview)"), ("alttab next", "Switch windows (Alt+Tab)"), ("clipboard", "Clipboard history"), ("alttab prev", "Switch windows, backwards"),
                               ("hypr-quit", "Quit app (all its windows)"), ("hypr-minimizar", "Minimize window"), ("hypr-sempre-visivel", "Always visible (no dim)"),
-                              ("supermenu", "Open Super Menu"), ("hypr-minimizados", "Restore a minimized window"), ("wofi", "Open Super Menu"), ("kitty", "Open terminal"),
+                              ("supermenu", "Open Kairos"), ("hypr-minimizados", "Restore a minimized window"), ("wofi", "Open Kairos"), ("kitty", "Open terminal"),
                               ("thunar", "Open Files"), ("configuracoes", "Open Settings"),
                               ("print-area", "Screenshot of an area")):
             if trecho in arg:

@@ -21,7 +21,7 @@ except ImportError:                       # Hermes not installed: the page expla
     H = None
 
 CTL = os.path.expanduser("~/.local/bin/hermesctl")
-POSICOES = [("Under the notification bell", "follow-bell"), ("Next to the quick center", "follow-central"), ("Top left", "top-left"), ("Top center", "top-center"),
+POSICOES = [("Under the notification bell", "follow-bell"), ("Next to Hestia", "follow-central"), ("Top left", "top-left"), ("Top center", "top-center"),
             ("Top right", "top-right"), ("Bottom left", "bottom-left"), ("Bottom center", "bottom-center"),
             ("Bottom right", "bottom-right")]
 ESTILOS = [("DotStyle", "dotstyle"), ("AeroTerm", "aeroterm"), ("AeroCloud", "aerocloud")]
@@ -30,7 +30,7 @@ SOBRE_CHEIA = [("Faded", "faded"), ("Normal", "normal"), ("Off", "off")]
 CARTAO_CHEIA = [("Hold until I leave fullscreen", "hold"), ("Show anyway", "show")]
 SOB_BARRA = [("Soft (blurred)", "soft"), ("Same as the rest", "normal"), ("Hidden", "hide")]
 MOVIMENTO = [("Follow the system", "auto"), ("Always reduced", "on"), ("Never reduced", "off")]
-STEAM = [("Wave where they appear", "wave"), ("Move them next to the quick center", "move"),
+STEAM = [("Wave where they appear", "wave"), ("Move them next to Hestia", "move"),
          ("Leave them alone", "off")]
 
 
@@ -170,7 +170,7 @@ class SecaoNotificacoes(Secao):
         arquivo.add_suffix(Gtk.Image(icon_name="document-open-symbolic"))
         arquivo.connect("activated", lambda *_: subprocess.Popen(["xdg-open", H.CONFIG]) if os.path.exists(H.CONFIG)
                         else self.janela.avisar("Change something first: the file is created on the first change"))
-        padrao = Adw.ActionRow(title="Back to defaults", subtitle="DotStyle, next to the quick center", activatable=True)
+        padrao = Adw.ActionRow(title="Back to defaults", subtitle="DotStyle, next to Hestia", activatable=True)
         padrao.add_suffix(Gtk.Image(icon_name="edit-undo-symbolic"))
         padrao.connect("activated", lambda *_: self.restaurar())
         avancado.add(arquivo)

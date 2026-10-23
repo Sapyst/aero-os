@@ -2325,7 +2325,7 @@ class Orbita(nuvem.Nuvem):
                             (0.05, 0.05, 0.05) if ligado else FG, fundo * (1 if ligado else 0.6))
             self.zonas.append(("chip", t, x + lw / 2, y + alt / 2, lw / 2))
             x += lw + 12
-        self._texto_cor(cr, "ORBIT", 80, h - 69, "Doto Black 18", FG, 0.55 * fundo)
+        self._texto_cor(cr, "ARGUS", 80, h - 69, "Doto Black 18", FG, 0.55 * fundo)
         dica = "TAB ORBIT · ENTER OPEN · SPACE PEEK · ⌫ UP · ESC DISSOLVE"
         layout.set_font_description(Pango.FontDescription.from_string("Doto Black 10"))
         layout.set_text(dica, -1)

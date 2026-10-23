@@ -39,7 +39,7 @@ class SecaoTema(Secao):
               ("Wallpaper", "image-x-generic-symbolic", "aparencia", "wallpaper"),
               ("Glass and windows", "window-new-symbolic", "aparencia", "glass"),
               ("Icons", "applications-graphics-symbolic", "icones", None),
-              ("Dock", "user-desktop-symbolic", "dock", None),
+              ("Atlas", "user-desktop-symbolic", "dock", None),
               ("Widgets", "view-grid-symbolic", "widgets", None),
               ("Text and motion", "font-x-generic-symbolic", "aparencia", "text"),
               ("Workspace transition", "media-playlist-shuffle-symbolic", "transitions", None)]
@@ -128,7 +128,7 @@ class SecaoTema(Secao):
                                  f"taskbar {round(float(p.get('BAR_ALPHA', '0.45')) * 100)}%",
             "Icons": ("ASCII, " + TINT.get(p.get("ICONS_TINT", "classic"), "")) if p.get("ICONES_ASCII") == "1"
                      else f"Pack {p.get('ICONES_BASE', 'Adwaita')}",
-            "Dock": DOCK.get(p.get("DOCK_MODO", ""), p.get("DOCK_MODO", "—")),
+            "Atlas": DOCK.get(p.get("DOCK_MODO", ""), p.get("DOCK_MODO", "—")),
             "Widgets": f"{ativos} active",
             "Text and motion": "Animations on" if p.get("ANIM", "1") == "1" else "Animations off",
             "Workspace transition": nomes.get(efeito_global(p), efeito_global(p))

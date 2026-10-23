@@ -22,7 +22,7 @@ ALCANCES = [("Narrow", "0.8"), ("Medium", "1.2"), ("Wide", "1.8")]
 
 class SecaoDock(Secao):
     id = "dock"
-    titulo = "Dock"
+    titulo = "Atlas"
     icone = "view-app-grid-symbolic"
 
     def __init__(self, janela):
@@ -31,10 +31,10 @@ class SecaoDock(Secao):
         conteudo = Adw.PreferencesPage()
 
         geral = Adw.PreferencesGroup(
-            title="Dock", description="The app bar at the bottom of the screen. Changes apply right away.")
+            title="Atlas", description="The app bar at the bottom of the screen. Changes apply right away.")
         self.modo = combo("Behavior", MODOS, 0)
         self.modo.set_subtitle("Intellihide: hides when a window touches it. Hidden, it leaves a thin "
-                               "line at the bottom: touch it to bring the Dock up.")
+                               "line at the bottom: touch it to bring Atlas up.")
         self.abertos = Adw.SwitchRow(title="Show open apps that aren't pinned",
                                      subtitle="They appear after a separator")
         for r in (self.modo, self.abertos):
@@ -45,7 +45,7 @@ class SecaoDock(Secao):
         self.onda = combo("Wave effect", ONDAS, 2, "How much icons grow and rise under the mouse")
         self.alcance = combo("Wave width", ALCANCES, 1, "How many neighbors rise with it")
         self.movimento = Adw.SwitchRow(title="Reduce motion",
-                                       subtitle="No wave, no bounce: the Dock just appears and disappears")
+                                       subtitle="No wave, no bounce: Atlas just appears and disappears")
         for r in (self.tamanho, self.onda, self.alcance, self.movimento):
             visual.add(r)
 
@@ -57,8 +57,8 @@ class SecaoDock(Secao):
 
         apps_grupo = Adw.PreferencesGroup(title="Apps")
         editar = Adw.ActionRow(use_markup=False, title="Add or remove apps",
-                               subtitle="Right-click the Dock (an icon or the bar) → Add App: search and click. "
-                                        "To remove, right-click the icon → Remove from Dock.")
+                               subtitle="Right-click Atlas (an icon or the bar) → Add App: search and click. "
+                                        "To remove, right-click the icon → Remove from Atlas.")
         editar.add_prefix(Gtk.Image(icon_name="input-mouse-symbolic"))
         padrao = Adw.ActionRow(use_markup=False, title="Reset apps",
                                subtitle="Back to Claude, Firefox and Settings")
@@ -96,4 +96,4 @@ class SecaoDock(Secao):
             os.remove(LISTA)          # sem o arquivo, o Dock volta pros 3 apps padrão
         except FileNotFoundError:
             pass
-        self.janela.avisar("Dock apps reset")
+        self.janela.avisar("Atlas apps reset")

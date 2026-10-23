@@ -1168,9 +1168,9 @@ class Dock(Gtk.ApplicationWindow):
             acoes.append((texto, lambda: [hypr(f"dispatch closewindow address:{c['address']}") for c in item.janelas]))
         acoes.append(None)
         if item.fixado:
-            acoes.append(("Remove from Dock", lambda: self.remover(item)))
+            acoes.append(("Remove from Atlas", lambda: self.remover(item)))
         else:
-            acoes.append(("Keep in Dock", lambda: self.fixar(item)))
+            acoes.append(("Keep in Atlas", lambda: self.fixar(item)))
         acoes += self.acoes_gerais(item if item.fixado else None)
         self.popover(item.widget, acoes, depois_de=item if item.fixado else None)
 
@@ -1196,7 +1196,7 @@ class Dock(Gtk.ApplicationWindow):
         return [("Add Separator", lambda: self.inserir({"tipo": "separador"}, depois_de)),
                 ("Add Space", lambda: self.inserir({"tipo": "espaco"}, depois_de)),
                 None,
-                ("Dock Settings…", lambda: subprocess.Popen(
+                ("Atlas Settings…", lambda: subprocess.Popen(
                     ["hyprctl", "dispatch", "exec", "env CONFIG_ABA=dock " + os.path.expanduser("~/.local/bin/configuracoes")],
                     stdout=subprocess.DEVNULL))]
 

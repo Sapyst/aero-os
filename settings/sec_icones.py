@@ -47,7 +47,7 @@ class SecaoIcones(Secao):
         # ---- iconizador ASCII ----
         g1 = Adw.PreferencesGroup(
             title="ASCII icons",
-            description="Every app icon in the menu, dock and Alt+Tab becomes a monochrome ASCII tile. "
+            description="Every app icon in Kairos, Atlas and Alt+Tab becomes a monochrome ASCII tile. "
                         "Done once and remembered; new apps are converted at login. Turning it off restores the originals.")
         self.chave = Adw.SwitchRow(title="Iconize app icons")
         self.chave.connect("notify::active", lambda *_: self.carregando or self.alternar())
@@ -87,7 +87,7 @@ class SecaoIcones(Secao):
         g2.add(self.chave_sistema)
         # icons that got stuck (blank or "broken image" in the dock): read everything again
         recarregar = Adw.ActionRow(title="Reload icons",
-                                   subtitle="If icons look broken or old: rebuilds the icon cache and restarts the dock, Alt+Tab, Super Menu and tray")
+                                   subtitle="If icons look broken or old: rebuilds the icon cache and restarts Atlas, Alt+Tab, Kairos and the tray")
         botao_recarregar = Gtk.Button(label="Reload", valign=Gtk.Align.CENTER)
         botao_recarregar.connect("clicked", lambda *_: self.executar(["--reload"], "Reloading icons…"))
         recarregar.add_suffix(botao_recarregar)

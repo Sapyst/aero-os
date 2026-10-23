@@ -535,10 +535,10 @@ class Barra(Gtk.Window):
                          cor=lambda: cor_ultrasu(minutos_ultrasu(self.ultrasu)) or FG,
                          alfa=lambda: 1.0 if minutos_ultrasu(self.ultrasu) is not None else 0.45),
             Sino(self, "bell", lambda: "bellx" if self.dnd else "bell", {1: f"{som} notificacoes abrir"},
-                 alfa=lambda: 0.55 if self.dnd else 1.0, dica="Notifications"),
+                 alfa=lambda: 0.55 if self.dnd else 1.0, dica="Hermes"),
             IconeSimples(self, "gear", "gear", {1: cfg}, dica="Settings"),
             EspacoBandeja(self, "tray"),
-            IconeSimples(self, "central", "grid", {1: f"{som} central abrir", 3: cfg}, dica="Quick center"),
+            IconeSimples(self, "central", "grid", {1: f"{som} central abrir", 3: cfg}, dica="Hestia"),
         ]
 
         clique = Gtk.GestureClick(button=0)
@@ -739,7 +739,7 @@ class Barra(Gtk.Window):
                 mins = minutos_ultrasu(self.ultrasu)
                 texto_ = f"{mins // 60}H {mins % 60:02d}M" if mins is not None else "CLOSED"
                 cor = cor_ultrasu(mins) or DIM
-                self.gota.mostrar(texto_, cor, m.x + m.w / 2)
+                self.gota.mostrar(texto_, cor, m.x + m.w / 2, self.largura_tela())
             elif m is not None and m.nome not in ("workspaces", "tray", "clock"):
                 self.gota.esconder()
                 self._dica_id = GLib.timeout_add(420, lambda mm=m: self._mostrar_dica(mm))   # a short, still hover
@@ -752,8 +752,12 @@ class Barra(Gtk.Window):
             return False
         texto_ = self.texto_dica(m)
         if texto_:
-            self.gota.mostrar(texto_[:30], ESCURA["FG"], m.x + m.w / 2)
+            self.gota.mostrar(texto_, ESCURA["FG"], m.x + m.w / 2, self.largura_tela())
         return False
+
+    def largura_tela(self):
+        """Largura da tela em pixels lógicos (a barra + as duas margens): a gota não passa da borda."""
+        return self.area.get_width() + 2 * LADO
 
     def texto_dica(self, m):
         textos = {"vol": f"VOLUME {self.volume}%" + (" MUTED" if self.mudo else ""),
@@ -763,8 +767,8 @@ class Barra(Gtk.Window):
                   "bat": f"{self.bat_nivel}%" + (" CHARGING" if self.carregando else " PLUGGED" if self.na_tomada else "")
                          + (" SAVER" if self.perfil == "power-saver" else ""),
                   "lang": f"KEYBOARD {self.idioma}", "min": f"{self.minimizados} MINIMIZED",
-                  "bell": "NOTIFICATIONS" + (" (DND)" if self.dnd else ""), "gear": "SETTINGS",
-                  "central": "QUICK CENTER"}
+                  "bell": "HERMES" + (" (DND)" if self.dnd else ""), "gear": "SETTINGS",
+                  "central": "HESTIA"}
         return textos.get(m.nome, m.dica.upper() if m.dica else "")
 
     def ao_clicar(self, g, _n, x, _y):
@@ -852,7 +856,7 @@ class Barra(Gtk.Window):
             self.ws_ativo = ativo.get("id", self.ws_ativo)
         except (ValueError, KeyError, TypeError):
             pass
-        self.redesenhar()
+        GLib.idle_add(self.redesenhar)
         return False
 
     def ler_idioma(self):
@@ -863,7 +867,7 @@ class Barra(Gtk.Window):
                     self.idioma = self._curto(nome)
         except (ValueError, TypeError):
             pass
-        self.redesenhar()
+        GLib.idle_add(self.redesenhar)
         return False
 
     @staticmethod
@@ -883,11 +887,12 @@ class Barra(Gtk.Window):
                     s.connect(caminho)
                     for linha in s.makefile("r", encoding="utf-8", errors="replace"):
                         nome = linha.split(">>", 1)[0]
+                        # lidos aqui, nesta thread: o hyprctl nunca trava a thread do GTK (hover, gota)
                         if nome in ("workspace", "workspacev2", "createworkspace", "destroyworkspace", "openwindow",
                                     "closewindow", "movewindow", "movewindowv2", "focusedmon"):
-                            GLib.idle_add(self.ler_workspaces)
+                            self.ler_workspaces()
                         elif nome == "activelayout":
-                            GLib.idle_add(self.ler_idioma)
+                            self.ler_idioma()
             except OSError:
                 pass
             time.sleep(3)
@@ -1250,12 +1255,30 @@ class Calendario(Gtk.Window):
 
 class Gota(Gtk.Window):
     """A small dot label that drops down under a bar icon on hover: its dots fall from the bar and
-    settle into the letters; on leave they rise back and fade. Click-through, own layer."""
+    settle into the letters; on leave they rise back and fade. Click-through, own layer.
+
+    Sem trancos: a camada tem tamanho FIXO (cabe o maior texto, MAX_CHARS letras) e só muda a margem;
+    redimensionar uma camada já aberta cortava a última letra até o compositor confirmar o tamanho novo.
+    Depois de sumir ela fica aberta (transparente) por um tempinho, pra passar de ícone em ícone sem
+    reabrir a camada (cada reabertura roda a animação de entrada do Hyprland). Os pontos de cada texto
+    ficam guardados e o halo colorido é um carimbo pronto, então o quadro só pinta."""
 
     PASSO = 2.4
+    MAX_CHARS = 30
+    PAD_X, PAD_Y = 12, 9
+    QUEDA, SAIDA, ESPERA = 0.28, 0.3, 1.5      # s: queda de cada ponto, subida/fade, aberta e vazia
+    ONDA = 0.4                                 # s: a onda da esquerda à direita, qualquer que seja o texto
+
+    @classmethod
+    def medidas(cls, n):
+        """Caixa para n letras 5×7 (6 colunas por letra, a última sem o espaço) + respiro dos dois lados."""
+        return (max(1, n * 6 - 1)) * cls.PASSO + 2 * cls.PAD_X, 7 * cls.PASSO + 2 * cls.PAD_Y
 
     def __init__(self):
         super().__init__(decorated=False)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from hermes_dots import normalizar, FONTE         # uma vez só (antes era a cada hover)
+        self._normalizar, self._fonte = normalizar, FONTE
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.OVERLAY)
         Camada.set_namespace(self, "aerobar-gota")
@@ -1263,94 +1286,152 @@ class Gota(Gtk.Window):
         Camada.set_anchor(self, Camada.Edge.LEFT, True)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
         Camada.set_exclusive_zone(self, -1)
+        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA + 2)
         self.add_css_class("aerobar-gota")
         prov = Gtk.CssProvider()
         prov.load_from_string(".aerobar-gota { background: none; background-color: transparent; }")
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        self.area = Gtk.DrawingArea()
+        lw, lh = self.medidas(self.MAX_CHARS)
+        self.W, self.H = int(math.ceil(lw)) + 2, int(math.ceil(lh))
+        self.area = Gtk.DrawingArea(content_width=self.W, content_height=self.H)
         self.area.set_draw_func(self.desenhar)
         self.set_child(self.area)
+        self.set_default_size(self.W, self.H)
+        self.set_size_request(self.W, self.H)
         self.connect("realize", self._sem_entrada)
-        self.texto, self.cor, self.t0, self.saindo, self.tique = "", FG, 0.0, False, None
-        self.pontos = []
+        self.texto, self.cor, self.saindo, self.tique = "", FG, False, None
+        self.e, self.t0 = 0.0, None             # tempo da animação (pelo relógio de quadros) / início
+        self.caixa = (0.0, 0.0)                 # x da caixa dentro da camada, largura da caixa
+        self.pontos, self.fim, self._cache, self._carimbos = [], 0.0, {}, {}
+        self._fechar_id = None
 
     def _sem_entrada(self, *_):
         import cairo
         if self.get_surface() is not None:
             self.get_surface().set_input_region(cairo.Region())
 
-    def mostrar(self, texto_, cor, centro_x):
-        import random
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from hermes_dots import normalizar, FONTE
-        t = normalizar(texto_)
-        p = self.PASSO
-        largura = (len(t) * 6 - 1) * p + 24
-        altura = 7 * p + 18
-        self.pontos = []
-        rnd = random.Random(len(t))
-        for i, ch in enumerate(t):
-            for c in range(5):
-                for linha in range(7):
-                    if FONTE[ch][linha][c] == "1":
-                        x = 12 + (i * 6 + c) * p + p / 2
-                        y = 9 + linha * p + p / 2
-                        atraso = (i * 6 + c) * 0.012 + rnd.uniform(0, 0.05)
-                        self.pontos.append((x, y, atraso, rnd.uniform(14, 26)))
+    def _pontos_de(self, t):
+        """(x, y, atraso, queda) de cada ponto aceso, relativos à caixa. Guardado por texto.
+        O atraso por coluna encolhe nos textos longos: a onda dura no máximo ONDA, e a animação só
+        termina depois do último ponto pousar (antes ela parava em 0.7 s fixos e as últimas letras
+        de um texto comprido ficavam congeladas no meio da queda, meio apagadas)."""
+        if t not in self._cache:
+            import random
+            p, rnd, pts = self.PASSO, random.Random(len(t)), []
+            passo_t = min(0.012, self.ONDA / max(1, len(t) * 6))
+            for i, ch in enumerate(t):
+                g = self._fonte[ch]
+                for c in range(5):
+                    for linha in range(7):
+                        if g[linha][c] == "1":
+                            pts.append((self.PAD_X + (i * 6 + c) * p + p / 2, self.PAD_Y + linha * p + p / 2,
+                                        (i * 6 + c) * passo_t + rnd.uniform(0, 0.05), rnd.uniform(14, 26)))
+            if len(self._cache) > 64:
+                self._cache.clear()
+            fim = max((pt[2] for pt in pts), default=0) + self.QUEDA + 0.02
+            self._cache[t] = (pts, fim)
+        return self._cache[t]
+
+    def mostrar(self, texto_, cor, centro_x, tela_w=None):
+        t = self._normalizar(texto_).strip()
+        if len(t) > self.MAX_CHARS:                                # nome de rede comprido: corta com ".."
+            t = t[:self.MAX_CHARS - 2].rstrip() + ".."
+        if not t.strip():
+            return
+        largura, _ = self.medidas(len(t))
+        self.pontos, self.fim = self._pontos_de(t)
         self.texto, self.cor = t, cor
-        self.set_size_request(int(largura), int(altura))
-        self.area.set_content_width(int(largura))
-        self.area.set_content_height(int(altura))
-        Camada.set_margin(self, Camada.Edge.LEFT, max(0, int(LADO + centro_x - largura / 2)))
-        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA + 2)
-        self.t0, self.saindo = time.monotonic(), False
-        self.set_visible(True)
+        meio = LADO + centro_x                                    # centro do ícone, em pixels da tela
+        tela_w = tela_w or (meio * 2)
+        esq = int(round(min(max(0, meio - self.W / 2), max(0, tela_w - self.W))))
+        Camada.set_margin(self, Camada.Edge.LEFT, esq)           # só a margem muda; o tamanho é sempre o mesmo
+        x0 = min(max(0.0, meio - esq - largura / 2), self.W - largura)
+        self.caixa = (math.floor(x0), largura)
+        if self._fechar_id:
+            GLib.source_remove(self._fechar_id)
+            self._fechar_id = None
+        self.e, self.t0, self.saindo = 0.0, None, False
+        if not self.get_visible():
+            self.set_visible(True)
+        self._animar()
+
+    def esconder(self):
+        if self.get_visible() and self.texto and not self.saindo:
+            self.e, self.t0, self.saindo = 0.0, None, True
+            self._animar()
+
+    def _animar(self):
+        self.area.queue_draw()
         if self.tique is None:
             self.tique = self.area.add_tick_callback(self._quadro)
 
-    def esconder(self):
-        if self.get_visible() and not self.saindo:
-            self.saindo, self.t0 = True, time.monotonic()
-            if self.tique is None:
-                self.tique = self.area.add_tick_callback(self._quadro)
-
-    def _quadro(self, *_):
-        e = time.monotonic() - self.t0
+    def _quadro(self, _w, relogio):
+        agora = relogio.get_frame_time() / 1e6
+        if self.t0 is None:
+            self.t0 = agora
+        self.e = agora - self.t0
         self.area.queue_draw()
-        if self.saindo and e > 0.3:
-            self.tique = None
-            self.set_visible(False)
+        if self.saindo and self.e > self.SAIDA:
+            self.tique, self.texto = None, ""
+            self._fechar_id = GLib.timeout_add(int(self.ESPERA * 1000), self._fechar)
             return GLib.SOURCE_REMOVE
-        if not self.saindo and e > 0.7:
+        if not self.saindo and self.e > self.fim:
             self.tique = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
+    def _fechar(self):
+        self._fechar_id = None
+        if not self.texto:
+            self.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    def _carimbo(self, cor):
+        """O halo de um ponto colorido, pintado uma vez numa superfície pequena (antes: um gradiente
+        de 13 paradas por ponto, por quadro)."""
+        chave = tuple(round(c, 3) for c in cor)
+        if chave not in self._carimbos:
+            import cairo
+            r = self.PASSO * 1.6 * 1.35
+            lado = int(math.ceil(2 * r)) + 2
+            s = cairo.ImageSurface(cairo.FORMAT_ARGB32, lado, lado)
+            halo(cairo.Context(s), lado / 2, lado / 2, self.PASSO * 1.6, cor, 0.22)
+            self._carimbos[chave] = (s, lado / 2)
+        return self._carimbos[chave]
+
     def desenhar(self, _a, cr, w, h):
-        e = time.monotonic() - self.t0
-        fundo = min(1.0, e / 0.18) if not self.saindo else max(0.0, 1 - e / 0.3)
-        r = 9
+        if not self.texto:
+            return                                                # aberta e vazia: nada a pintar
+        e = self.e
+        fundo = min(1.0, e / 0.18) if not self.saindo else max(0.0, 1 - e / self.SAIDA)
+        x0, bw = self.caixa
+        bh, r = h, 9
+        cr.translate(x0, 0)
         cr.new_sub_path()
-        for (ax, ay, a0) in ((w - r, r, -math.pi / 2), (w - r, h - r, 0), (r, h - r, math.pi / 2), (r, r, math.pi)):
+        for (ax, ay, a0) in ((bw - r, r, -math.pi / 2), (bw - r, bh - r, 0), (r, bh - r, math.pi / 2), (r, r, math.pi)):
             cr.arc(ax, ay, r, a0, a0 + math.pi / 2)
         cr.close_path()
         cr.set_source_rgba(*FUNDO, 0.9 * fundo)
         cr.fill()
+        carimbo = self._carimbo(self.cor) if colorida(self.cor) else None
+        raio = self.PASSO * 0.38
         for x, y, atraso, queda in self.pontos:
             if not self.saindo:
-                k = min(1.0, max(0.0, (e - atraso) / 0.28))
+                k = min(1.0, max(0.0, (e - atraso) / self.QUEDA))
                 k = 1 - (1 - k) ** 3                              # falls and lands softly
                 yy, a = y - queda * (1 - k), k
             else:
-                k = min(1.0, e / 0.3)
+                k = min(1.0, e / self.SAIDA)
                 yy, a = y - queda * 0.6 * k, 1 - k
             if a <= 0.01:
                 continue
-            if colorida(self.cor):
-                halo(cr, x, yy, self.PASSO * 1.6, self.cor, 0.22 * a)
+            if carimbo is not None:
+                s, meio = carimbo
+                cr.set_source_surface(s, x - meio, yy - meio)
+                cr.paint_with_alpha(a)
             cr.set_source_rgba(*self.cor, a)
-            cr.arc(x, yy, self.PASSO * 0.38, 0, 2 * math.pi)
+            cr.arc(x, yy, raio, 0, 2 * math.pi)
             cr.fill()
 
 

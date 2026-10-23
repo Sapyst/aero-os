@@ -32,7 +32,7 @@ class SecaoLocal(Secao):
         conteudo = Adw.PreferencesPage()
 
         # ---- o clima de agora (prévia, com o mesmo desenho do Super Menu) ----
-        g_agora = Adw.PreferencesGroup(title="Weather now", description="Shown at the top of the Super Menu")
+        g_agora = Adw.PreferencesGroup(title="Weather now", description="Shown at the top of Kairos")
         conteudo.add(g_agora)
         self.agora = Adw.ActionRow(title="Loading…")
         self.desenho = Gtk.DrawingArea(content_width=48, content_height=48, valign=Gtk.Align.CENTER)
