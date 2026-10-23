@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# aero-supervise — supervisor genérico dos serviços de fundo do Aero OS: roda a versão em Rust (a oficial)
+# e, se ela cair demais, troca sozinho pra versão clássica (Python), registra e avisa UMA vez.
+#
+# Uso:  aero-supervise NOME "Rótulo" "COMANDO RUST" "COMANDO CLÁSSICO"
+#       aero-supervise --reload NOME      (relê o daemons.conf; o Settings faz isso ao trocar)
+#   ex: aero-supervise clipboard Clipboard "$HOME/.local/bin/aero-clipd" "wl-paste --watch ..."
+#   (feito genérico de propósito: o hermesd pode usar igual depois)
+#
+# Regras:
+#  - ~/.config/aero/daemons.conf escolhe a versão:  NOME=rust | NOME=python   (sem linha = rust)
+#  - rust: se o binário não existir, ou cair (saída ≠ 0 ou sinal) QUEDAS vezes em JANELA s, vira python
+#    até o próximo início do supervisor (relogar = tenta o Rust de novo) ou um --reload.
+#  - queda abaixo do limite: reinicia o Rust depois de 1 s. Saída 0 = o serviço quis parar: o supervisor para.
+#  - python caindo 5× em 60 s: desiste (não fica girando em falso).
+#  - um supervisor por NOME (flock): chamar o lançador de novo com ele rodando não faz nada.
+#  - log: ~/.local/state/aero/daemons.log | estado (pro Settings): $XDG_RUNTIME_DIR/aero-supervise-NOME.state
+QUEDAS=${AERO_SUPERVISE_QUEDAS:-3}
+JANELA=${AERO_SUPERVISE_JANELA:-60}
+
+run="${XDG_RUNTIME_DIR:-/tmp}"
+if [ "$1" = --reload ]; then
+    pid=$(cat "$run/aero-supervise-$2.pid" 2>/dev/null) && kill -HUP "$pid" 2>/dev/null
+    exit
+fi
+nome=$1 rotulo=$2 rust=$3 classico=$4
+[ -n "$classico" ] || { echo "uso: aero-supervise NOME RÓTULO 'CMD RUST' 'CMD CLÁSSICO'" >&2; exit 2; }
+
+exec 9>"$run/aero-supervise-$nome.lock"
+flock -n 9 || exit 0                                   # já tem um supervisor desse serviço
+echo $$ > "$run/aero-supervise-$nome.pid"
+estado="$run/aero-supervise-$nome.state"
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/aero/daemons.conf"
+log="${XDG_STATE_HOME:-$HOME/.local/state}/aero/daemons.log"
+mkdir -p "${log%/*}"
+
+registrar() {
+    [ "$(stat -c %s "$log" 2>/dev/null || echo 0)" -gt 262144 ] && mv -f "$log" "$log.1"   # log pequeno
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "$nome" "$*" >> "$log"
+}
+modo_conf() {
+    local v
+    v=$(sed -n "s/^[[:space:]]*$nome[[:space:]]*=[[:space:]]*\([a-z]*\).*/\1/p" "$conf" 2>/dev/null | tail -1)
+    [ "$v" = python ] && echo python || echo rust
+}
+# avisa uma vez; com jogo/app em tela cheia, espera ele sair (nada de UI por cima de jogo)
+avisar() {
+    (
+        while hyprctl activewindow -j 2>/dev/null | grep -q '"fullscreen": *[12]'; do sleep 15; done
+        notify-send -a "Aero" -i dialog-warning "$rotulo fell back to the classic version" \
+            "The native service crashed $QUEDAS times in a minute. Switch back in Settings → System → Background services."
+    ) 9>&- &
+}
+
+filho= recarregar=0 reserva=0 avisou=0
+quedas=() quedas_py=()
+trap 'recarregar=1; [ -n "$filho" ] && kill "$filho" 2>/dev/null' HUP
+trap '[ -n "$filho" ] && kill "$filho" 2>/dev/null; rm -f "$estado"; registrar "supervisor stopped"; exit 0' TERM INT
+
+# só os tempos dentro da janela
+recentes() { local agora=$1; shift; local t; for t in "$@"; do [ $((agora - t)) -lt "$JANELA" ] && echo "$t"; done; }
+
+while :; do
+    if [ $recarregar = 1 ]; then                       # --reload: troca de versão / zera a reserva
+        recarregar=0 reserva=0 quedas=() quedas_py=()
+        registrar "reload: config says $(modo_conf)"
+    fi
+    modo=$(modo_conf)
+    if [ "$modo" = rust ] && [ $reserva = 0 ]; then
+        bin=${rust%% *}; bin=${bin/#\~/$HOME}
+        if [ ! -x "$bin" ]; then
+            registrar "rust binary missing ($bin): falling back to classic"
+            reserva=1
+            [ $avisou = 0 ] && { avisou=1; avisar; }
+        fi
+    fi
+    [ "$modo" = rust ] && [ $reserva = 1 ] && modo=python
+    if [ "$modo" = rust ]; then cmd=$rust; else cmd=$classico; fi
+    echo "$modo $([ $reserva = 1 ] && echo fallback || echo chosen)" > "$estado"
+    inicio=$(date +%s)
+    bash -c "exec $cmd" 9>&- &                         # exec: o PID do filho É o daemon (kill PID funciona)
+    filho=$!
+    registrar "started $modo (pid $filho)"
+    wait "$filho"; st=$?
+    if [ $recarregar = 1 ]; then                       # foi o --reload que derrubou: não é queda
+        while kill -0 "$filho" 2>/dev/null; do wait "$filho" 2>/dev/null; done
+        filho=
+        continue
+    fi
+    filho=
+    agora=$(date +%s)
+    if [ $st = 0 ]; then
+        registrar "$modo exited normally after $((agora - inicio))s: supervisor stops"
+        rm -f "$estado"
+        exit 0
+    fi
+    registrar "$modo died (status $st) after $((agora - inicio))s"
+    if [ "$modo" = rust ]; then
+        mapfile -t quedas < <(recentes "$agora" "${quedas[@]}" "$agora")
+        if [ ${#quedas[@]} -ge "$QUEDAS" ]; then
+            registrar "rust crashed ${#quedas[@]}x in ${JANELA}s: falling back to classic"
+            reserva=1
+            [ $avisou = 0 ] && { avisou=1; avisar; }
+        fi
+    else
+        mapfile -t quedas_py < <(recentes "$agora" "${quedas_py[@]}" "$agora")
+        if [ ${#quedas_py[@]} -ge 5 ]; then
+            registrar "classic crashed 5x in ${JANELA}s too: giving up"
+            rm -f "$estado"
+            exit 1
+        fi
+    fi
+    sleep 1 & wait $!                                  # (wait: um --reload durante a pausa é atendido)
+done

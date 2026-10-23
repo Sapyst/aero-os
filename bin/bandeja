@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bandeja do sistema (ícones dos apps), com clique duplo = abrir.
-# Usa o daemon nativo em Rust (aero-trayd) com reserva automática para ~/.local/share/aero-shell/bandeja.py
-if [ -x "$HOME/.local/bin/aero-trayd" ]; then
-    exec "$HOME/.local/bin/aero-trayd" "$@"
-fi
-LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 "$HOME/.local/share/aero-shell/bandeja.py" "$@"
+# Supervisionada (aero-supervise): roda o daemon nativo em Rust (aero-trayd); se ele cair 3x em 60 s, ou com
+# tray=python em ~/.config/aero/daemons.conf, roda a clássica ~/.local/share/aero-shell/bandeja.py.
+# Chamar de novo com ela rodando não abre outra (o supervisor é um só).
+exec "$HOME/.local/bin/aero-supervise" tray Tray "$HOME/.local/bin/aero-trayd $*" \
+    "env LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so python3 $HOME/.local/share/aero-shell/bandeja.py $*"

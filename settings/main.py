@@ -44,6 +44,7 @@ from sec_mouse import SecaoMouse
 from sec_notificacoes import SecaoNotificacoes
 from sec_padroes import SecaoPadroes
 from sec_rede import SecaoRede
+from sec_servicos import SecaoServicos
 from sec_recording import SecaoGravacao
 from sec_sobre import SecaoSobre
 from sec_som import SecaoSom
@@ -68,7 +69,7 @@ ARVORE = [
     ("Connections", "network-wireless-symbolic", [("Network", SecaoRede, None), ("Bluetooth", SecaoBluetooth, None)]),
     ("System", "emblem-system-symbolic", [
         ("Power", SecaoEnergia, None), ("Memory", SecaoMemoria, None), ("Notifications", SecaoNotificacoes, None), ("Default apps", SecaoPadroes, None), ("Location", SecaoLocal, None),
-        ("Updates", SecaoAtualizacoes, None),
+        ("Updates", SecaoAtualizacoes, None), ("Background services", SecaoServicos, None),
         ("About", SecaoSobre, None)]),
 ]
 # Animações da árvore (doc 57): filhos deslizam (Gtk.Revealer), a seta gira, a linha clareia ao passar
