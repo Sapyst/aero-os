@@ -10,13 +10,36 @@
 # (jogo, vídeo: nunca desenhamos por cima), sem grim, ou se algo falhar. O comando roda de qualquer jeito.
 # Dentro de uma troca já com onda (AERO_TEMA_ONDA=1 herdado), só roda o comando: nada de onda dentro de onda.
 # painel.conf: THEME_ANIM=wave|none (padrão wave) e THEME_ANIM_MS=1000 (duração).
+#
+# --cascata (troca claro/escuro no Solid; o hypr-tema chama assim): as peças do shell já estão trocando as
+# cores AO VIVO, uma depois da outra (solido.cascata). Então a onda não pode congelar a tela no começo:
+#   1. o COMANDO roda com AERO_TEMA_FASE=preparar (só escreve arquivos) e, junto, a onda já carrega
+#      (Python + GTK levam ~0,4 s) sem mostrar nada (--esperar);
+#   2. quando a cascata termina (~0,6 s depois do clique), o print é tirado JÁ com o shell novo e fica
+#      parado por cima; por baixo, o COMANDO com AERO_TEMA_FASE=mostrar avisa os apps e o Hyprland;
+#   3. a onda revela: o que muda nela são só os apps (o shell já estava novo no print).
 PAINEL="$HOME/.config/hypr/painel.conf"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.log"
-[ $# -gt 0 ] || { echo "uso: aero-tema-onda COMANDO [ARGS...]" >&2; exit 2; }
+CASCATA=0
+[ "${1:-}" = --cascata ] && { CASCATA=1; shift; }
+[ $# -gt 0 ] || { echo "uso: aero-tema-onda [--cascata] COMANDO [ARGS...]" >&2; exit 2; }
 [ -n "${AERO_TEMA_ONDA:-}" ] && exec "$@"
 export AERO_TEMA_ONDA=1
+marca() { echo "$(date +%T.%3N) $1" >> "$LOG"; }
 
-so_rodar() { "$@"; exit $?; }
+pid_prep=""; preparado=""
+if [ "$CASCATA" = 1 ]; then
+    marca inicio
+    AERO_TEMA_FASE=preparar "$@" &       # só arquivos: em paralelo com a cascata e com a onda carregando
+    pid_prep=$!
+fi
+so_rodar() {
+    if [ -n "$pid_prep" ]; then          # cascata sem onda: termina a preparação e mostra direto
+        wait "$pid_prep"; AERO_TEMA_FASE=mostrar "$@"; exit $?
+    fi
+    [ -n "$preparado" ] && { AERO_TEMA_FASE=mostrar "$@"; exit $?; }
+    "$@"; exit $?
+}
 anim="$(sed -n 's/^THEME_ANIM=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
 [ "${anim:-wave}" = wave ] || so_rodar "$@"
 ms="$(sed -n 's/^THEME_ANIM_MS=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
@@ -47,6 +70,49 @@ PY
 )
 [ -n "${mon:-}" ] || so_rodar "$@"
 
+if [ "$CASCATA" = 1 ]; then
+    marca monitor
+    exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.lock"
+    flock -w 5 8 || so_rodar "$@"
+    print="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.ppm"
+    coproc ONDA { GDK_DISABLE=vulkan GSK_RENDERER=gl LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 \
+        "$HOME/.local/share/aero-shell/onda_wallpaper.py" --revelar --esperar --novo - \
+        --monitor "$mon" --x "$mx" --y "$my" --ms "$ms" 2>>"$LOG"; }
+    pid_onda=$ONDA_PID
+    exec {LE}<&"${ONDA[0]}" {ESCREVE}>&"${ONDA[1]}"
+    falhou() {
+        marca "onda não rolou ($1): sem onda"; shift
+        kill "$pid_onda" 2>/dev/null; rm -f "$print"
+        so_rodar "$@"
+    }
+    linha=""
+    read -r -t 4 linha <&"$LE" || linha=""
+    [ "$linha" = carregado ] || { falhou "${linha:-sem resposta}" "$@"; }
+    marca onda-carregada
+    wait "$pid_prep"; pid_prep=""; preparado=1
+    marca preparado
+    # espera a cascata acabar (fim = t0 + a última peça + a transição dela; solido.ORDEM/PASSO_MS/FADE_MS)
+    t0=$(sed -n 's/.*"t0": *\([0-9.]*\).*/\1/p' "$HOME/.cache/hypr-tema/cascata" 2>/dev/null)
+    resta=$(awk -v t0="${t0:-0}" -v agora="${EPOCHREALTIME/,/.}" 'BEGIN { r = t0 + 0.66 - agora; printf "%.3f", (r > 0 && r < 2) ? r : 0 }')
+    [ "$resta" = 0.000 ] || sleep "$resta"
+    marca cascata-fim
+    grim -o "$mon" -t ppm "$print" 2>>"$LOG" || falhou grim "$@"
+    { echo "foto $print" >&"$ESCREVE"; } 2>/dev/null
+    linha=""
+    read -r -t 4 linha <&"$LE" || linha=""
+    rm -f "$print"
+    [ "$linha" = pronto ] || falhou "${linha:-sem resposta}" "$@"
+    marca onda-pronta
+    AERO_TEMA_FASE=mostrar "$@"
+    r=$?
+    marca tema-aplicado
+    sleep 0.2                  # os apps terminam de redesenhar com o visual novo
+    { echo ir >&"$ESCREVE"; } 2>/dev/null
+    wait "$pid_onda" 2>/dev/null
+    exit $r
+fi
+
+echo "$(date +%T.%3N) inicio" >> "$LOG"
 exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.lock"
 flock -w 5 8 || so_rodar "$@"
 print="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.ppm"
@@ -61,6 +127,7 @@ exec {LE}<&"${ONDA[0]}" {ESCREVE}>&"${ONDA[1]}"
 linha=""
 read -r -t 4 linha <&"$LE" || linha=""
 rm -f "$print"
+echo "$(date +%T.%3N) onda-pronta" >> "$LOG"
 if [ "$linha" != pronto ]; then
     echo "$(date +%T) onda não rolou (${linha:-sem resposta}): troca instantânea" >> "$LOG"
     kill "$pid_onda" 2>/dev/null
@@ -68,7 +135,8 @@ if [ "$linha" != pronto ]; then
 fi
 "$@"
 r=$?
-sleep 0.5                      # os apps e as peças do shell terminam de redesenhar com o visual novo
+echo "$(date +%T.%3N) tema-aplicado" >> "$LOG"
+sleep 0.2                      # os apps e as peças do shell terminam de redesenhar com o visual novo
 { echo ir >&"$ESCREVE"; } 2>/dev/null
 wait "$pid_onda" 2>/dev/null
 exit $r

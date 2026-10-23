@@ -66,11 +66,67 @@ def raio(painel=None):
 
 
 def escuro_agora():
-    """O tema que o hypr-tema aplicou por último (escuro/claro); sem ele, o TEMA_MODO."""
+    """O tema que o hypr-tema aplicou por último (escuro/claro); sem ele, o TEMA_MODO.
+    Uma CASCATA em andamento (cascata(), mais nova que o estado do hypr-tema) já vale: as peças trocam
+    de cor antes de o hypr-tema terminar."""
+    c = ler_cascata()
+    try:
+        if c and os.path.getmtime(ARQ_CASCATA) >= os.path.getmtime(ESTADO_TEMA):
+            return c["tema"] != "claro"
+    except OSError:
+        if c:
+            return c["tema"] != "claro"
     try:
         return open(ESTADO_TEMA).read().strip() != "claro"
     except OSError:
         return ler_painel().get("TEMA_MODO", "escuro") != "claro"
+
+
+# ---------- a CASCATA da troca de tema ----------
+# Quem foi clicado (a Hestia...) grava ~/.cache/hypr-tema/cascata = {"tema", "t0", "origem"} e já troca as
+# PRÓPRIAS cores; cada processo do shell vê o arquivo (inotify) e troca as dele no seu turno da fila:
+# a origem primeiro, depois AeroBar -> Atlas -> widgets -> o resto, PASSO_MS entre um e outro, cada um
+# numa transição de cor de FADE_MS. O hypr-tema faz o trabalho pesado (gsettings, apps, Hyprland) por trás.
+ARQ_CASCATA = os.path.join(H, ".cache/hypr-tema/cascata")
+ORDEM = ("hestia", "aerobar", "dock", "widgets", "outros")
+PASSO_MS = 100
+FADE_MS = 220
+
+
+def ler_cascata():
+    try:
+        with open(ARQ_CASCATA) as f:
+            c = json.load(f)
+        if c.get("tema") in ("claro", "escuro") and isinstance(c.get("t0"), (int, float)):
+            return c
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def atraso_ms(peca, origem=None):
+    fila = [origem] + [p for p in ORDEM if p != origem] if origem in ORDEM else list(ORDEM)
+    return fila.index(peca if peca in fila else "outros") * PASSO_MS
+
+
+def fim_cascata_ms(origem=None):
+    """Quanto depois do clique a última peça termina a transição."""
+    return atraso_ms("outros", origem) + FADE_MS
+
+
+def cascata(tema, origem=None):
+    """Começa a cascata (chame NO CLIQUE): grava o aviso e já dispara a peça deste processo, sem esperar
+    o inotify. tema = "claro" | "escuro"."""
+    import time
+    c = {"tema": tema, "t0": time.time(), "origem": origem or ""}
+    os.makedirs(os.path.dirname(ARQ_CASCATA), exist_ok=True)
+    # no lugar, numa escrita só (trocar por rename atrasa o inotify do Gio em ~100 ms; quem ler no meio
+    # pega JSON quebrado, ignora, e relê no aviso seguinte)
+    with open(ARQ_CASCATA, "w") as f:
+        f.write(json.dumps(c))
+    for disparar in list(_vigias):
+        disparar(c)
+    return c
 
 
 # ---------- cor: sRGB <-> CIELAB (D65) ----------
@@ -216,7 +272,11 @@ def recarregar():
 
 def css_shell(esq=None):
     """CSS das peças do shell no Solid: as cores com nome (@solid_*) e as formas comuns."""
-    e = esq or esquema()
+    if esq is None:                         # o esquema em uso (no meio de uma cascata: as cores do meio)
+        if "esq" not in _cache:
+            _cache["esq"] = esquema()
+        esq = _cache["esq"]
+    e = esq
     r = raio()
     cores = "\n".join(f"@define-color solid_{k} #{v};" for k, v in e.items() if k != "dark")
     return cores + f"""
@@ -255,29 +315,111 @@ def aplicar_css(prioridade_extra=2):
 
 
 ARQ_CORES = os.path.join(H, ".cache/hypr-tema/cores")      # o hypr-tema reescreve a cada troca de cor/tema
+_vigias = []          # os disparadores de cascata deste processo (cascata() chama direto, sem inotify)
 
 
-def vigiar(ao_mudar=None):
+def _misturar(a, b, t):
+    """Esquema no meio do caminho entre a e b (t de 0 a 1), papel por papel."""
+    out = dict(b)
+    for k, vb in b.items():
+        va = a.get(k)
+        if k == "dark" or not isinstance(va, str):
+            continue
+        ra, rb = de_hexa(va), de_hexa(vb)
+        out[k] = hexa(tuple(x + (y - x) * t for x, y in zip(ra, rb)))
+    return out
+
+
+def vigiar(ao_mudar=None, peca="outros"):
     """Vigia a troca de cores (inotify, zero custo parado). Ao mudar: relê a paleta, recarrega o CSS do
-    shell (se aplicar_css() foi usado) e chama ao_mudar(). Guarde o retorno (o monitor) num atributo."""
+    shell (se aplicar_css() foi usado) e chama ao_mudar(). Guarde o retorno (o monitor) num atributo.
+    peca = o nome desta peça na CASCATA (ORDEM): quando alguém começa uma troca de tema, esta peça
+    espera o seu turno e passa as cores velhas -> novas numa transição de FADE_MS (CSS + ao_mudar() a
+    cada quadro, com rgb() já devolvendo as cores do meio do caminho)."""
+    import time
     from gi.repository import Gio, GLib
     mon = Gio.File.new_for_path(ARQ_CORES).monitor_file(Gio.FileMonitorFlags.NONE, None)
+    mon_c = Gio.File.new_for_path(ARQ_CASCATA).monitor_file(Gio.FileMonitorFlags.NONE, None)
+    mon._cascata = mon_c                       # o chamador guarda só um monitor: o outro vai junto
     pendente = [None]
+    estado = {"t0": None, "anim": None, "agendado": None}
+
+    def mostrar(e):
+        _cache["esq"] = e
+        if _provedor[0] is not None:
+            _provedor[0].load_from_string(css_shell(e))
+        if ao_mudar:
+            ao_mudar()
 
     def ir():
         pendente[0] = None
+        if estado["anim"] is not None or estado["agendado"] is not None:
+            return False                       # a cascata desta peça ainda vai/está rodando: ela resolve
+        velho = _cache.get("esq")
         recarregar()
-        if _provedor[0] is not None:
-            _provedor[0].load_from_string(css_shell())
-        if ao_mudar:
-            ao_mudar()
+        novo = esquema()
+        if novo == velho:                      # o hypr-tema terminou o que a cascata já mostrou: nada a fazer
+            _cache["esq"] = novo
+            return False
+        mostrar(novo)
         return False
 
     def mudou(*_):
         if pendente[0] is None:
             pendente[0] = GLib.timeout_add(150, ir)
+
+    def transicao():
+        estado["agendado"] = None
+        velho = _cache.get("esq") or esquema()
+        recarregar()
+        novo = esquema()
+        if novo == velho:
+            _cache["esq"] = novo
+            return False
+        comeco = time.monotonic()
+        _diario(f"{peca} inicio")
+
+        def quadro():
+            t = min(1.0, (time.monotonic() - comeco) * 1000 / FADE_MS)
+            mostrar(_misturar(velho, novo, enfatizado(t)) if t < 1 else novo)
+            if t >= 1:
+                estado["anim"] = None
+                _diario(f"{peca} fim")
+                return False
+            return True
+        quadro()
+        estado["anim"] = GLib.timeout_add(16, quadro)
+        return False
+
+    def disparar(c):
+        if c is None or c["t0"] == estado["t0"]:
+            return
+        estado["t0"] = c["t0"]
+        espera = c["t0"] * 1000 + atraso_ms(peca, c.get("origem")) - time.time() * 1000
+        if espera < -3000:                     # aviso velho (processo que acabou de abrir): ignora
+            return
+        if estado["agendado"] is not None:
+            GLib.source_remove(estado["agendado"])
+        if espera <= 1:
+            estado["agendado"] = GLib.idle_add(transicao, priority=GLib.PRIORITY_HIGH)
+        else:
+            estado["agendado"] = GLib.timeout_add(int(espera), transicao)
+
     mon.connect("changed", mudou)
+    mon_c.connect("changed", lambda *_: disparar(ler_cascata()))
+    estado["t0"] = (ler_cascata() or {}).get("t0")
+    _vigias.append(disparar)
     return mon
+
+
+def _diario(texto):
+    """Marcas de tempo da cascata no mesmo log do aero-tema-onda (pra medir clique -> cada peça)."""
+    import time
+    try:
+        with open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aero-tema-onda.log"), "a") as f:
+            f.write(time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d} cascata {texto}\n")
+    except OSError:
+        pass
 
 
 # ---------- movimento ----------
@@ -548,6 +690,14 @@ if __name__ == "__main__":
     modo = (sys.argv[2] if len(sys.argv) > 2 else "") or ("escuro" if escuro_agora() else "claro")
     if acao == "vars":
         print(vars_shell(modo != "claro"))
+    elif acao == "hypr":
+        # o hypr-tema numa chamada só: surface/primary dos dois modos + o CSS GTK do modo pedido num arquivo
+        for nome, esc in (("ESCURO", True), ("CLARO", False)):
+            e = esquema(esc)
+            print(f"{nome}_SURFACE={e['surface']}\n{nome}_PRIMARY={e['primary']}")
+        if len(sys.argv) > 3:
+            with open(sys.argv[3], "w") as f:
+                f.write(css_gtk(modo != "claro") + "\n")
     elif acao == "gtk":
         print(css_gtk(modo != "claro"))
     elif acao == "json":

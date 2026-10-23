@@ -2252,8 +2252,13 @@ class CentralRapida(Janelinha):
         comum.atualizar_painel(**kv)
 
     def alternar_tema(self, escuro):
-        """Dark mode na mão (desliga o automático). Trocar o tema precisa regerar as cores: roda em thread."""
-        self.gravar_painel(TEMA_MODO="escuro" if escuro else "claro")
+        """Dark mode na mão (desliga o automático). Trocar o tema precisa regerar as cores: roda em thread.
+        Solid: a CASCATA começa já no clique (a Hestia troca as próprias cores na hora, as outras peças em
+        sequência); o hypr-tema faz o resto por trás."""
+        tema = "escuro" if escuro else "claro"
+        if visual_atual() == "Solid":
+            solido.cascata(tema, "hestia")
+        self.gravar_painel(TEMA_MODO=tema)
         rodar(f"{self.BIN}/hypr-tema", timeout=90)
 
     def agenda(self, titulo, chave_modo, modo_manual, horarios, painel, temperatura=False):
@@ -2476,7 +2481,7 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
             prov_s.load_from_string(CSS_SOLIDO % {"r": r, "r2": max(12, r - 8)})
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov_s,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
-            self._vigia_cores = solido.vigiar()          # paleta nova: o CSS recarrega sozinho
+            self._vigia_cores = solido.vigiar(peca="hestia")   # paleta nova: o CSS recarrega sozinho (cascata)
         pontos = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotstyle-janelinhas.css")
         if os.path.exists(pontos):                       # DotStyle (só age em janelas com a classe "dots")
             prov_dots = Gtk.CssProvider()

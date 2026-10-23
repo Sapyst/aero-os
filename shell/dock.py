@@ -1389,6 +1389,8 @@ class App(Adw.Application):    # Adw = menus acompanham o claro/escuro (doc 35)
         self.vigiar(os.path.dirname(os.path.join(apps.CONFIG, "dock.json")), "dock.json", self.ao_mudar_lista)
         self.vigiar(os.path.dirname(PAINEL), "painel.conf", self.ao_mudar_opcoes)
         self.vigiar(os.path.dirname(CORES_BARRA), None, self.ao_mudar_cores)
+        if self.dock.solido:      # troca de tema/paleta: o Atlas entra na cascata no seu turno
+            self.vigia_paleta = solido.vigiar(self.aplicar_cores, peca="dock")
         threading.Thread(target=self.ouvir_hyprland, daemon=True).start()
 
     def vigiar(self, pasta, nome, funcao):
@@ -1430,8 +1432,7 @@ class App(Adw.Application):    # Adw = menus acompanham o claro/escuro (doc 35)
 
     def aplicar_cores(self):
         self.dock.cores = ler_cores()
-        if self.dock.solido:                         # Solid: as cores da paleta tonal (mudam com o wallpaper)
-            solido.recarregar()
+        if self.dock.solido:      # Solid: as cores da paleta tonal (o solido.vigiar relê; na cascata, as do meio)
             self.dock.cores = {"fundo": solido.rgb("surface_container") + (1.0,),
                                "texto": solido.rgb("on_surface") + (1.0,), "destaque": solido.rgb("primary") + (1.0,)}
         r, g, b, _a = self.dock.cores["texto"]

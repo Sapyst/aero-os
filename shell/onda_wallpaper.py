@@ -186,6 +186,8 @@ def decodificar(caminho, w, h):
     if not img.get_has_alpha():
         img = img.add_alpha(False, 0, 0, 0)
     iw, ih = img.get_width(), img.get_height()
+    if (iw, ih) == (w, h):                          # o print da tela já vem no tamanho: nada de reescalar
+        return img.read_pixel_bytes().get_data(), img.get_rowstride()
     s = max(w / iw, h / ih)
     destino = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, w, h)
     img.scale(destino, 0, 0, w, h, -(iw * s - w) / 2, -(ih * s - h) / 2, s, s, GdkPixbuf.InterpType.BILINEAR)
@@ -408,13 +410,16 @@ def falhar(laco, motivo):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--velho", required=True)
+    ap.add_argument("--velho", default="")
     ap.add_argument("--novo", required=True)
     ap.add_argument("--monitor", default="")
     ap.add_argument("--ms", type=int, default=1200)
     ap.add_argument("--x", type=float)
     ap.add_argument("--y", type=float)
     ap.add_argument("--revelar", action="store_true")
+    # --esperar (com --revelar; o aero-tema-onda --cascata): carrega Python + GTK já, escreve "carregado" e
+    # espera "foto ARQUIVO" na entrada — o print é tirado só depois que a cascata do shell terminou.
+    ap.add_argument("--esperar", action="store_true")
     args = ap.parse_args()
     laco = GLib.MainLoop()
 
@@ -427,6 +432,14 @@ def main():
     geo = monitor.get_geometry()
     esc = monitor.get_scale()                        # fracionário também (1.25, 1.6...)
     w, h = round(geo.width * esc), round(geo.height * esc)
+    if args.esperar:
+        avisar("carregado")
+        linha = sys.stdin.readline().strip()
+        if not linha.startswith("foto "):
+            return 1
+        args.velho = linha[5:]
+    if not args.velho:
+        return falhar(laco, "sem --velho") or 1
 
     # 1. as duas imagens, decodificadas em paralelo, ANTES de qualquer coisa aparecer
     imagens, erros = [None, None], []

@@ -20,12 +20,15 @@
 #                          sai sozinho quando o Hyprland que o iniciou morre (ex: travou)
 
 ESTADO="$HOME/.cache/hypr-tema"
-mkdir -p "$ESTADO"
+[ -d "$ESTADO" ] || mkdir -p "$ESTADO"
+# SEM PROCESSOS À TOA: a troca roda junto com a cascata (as peças do shell animando), e aí cada comando
+# externo (cat, cmp, mv, awk, date...) custava ~25 ms só pra nascer — dezenas deles davam ~0,7 s. Por isso
+# aqui quase tudo é do próprio bash: read/printf -v/[[ ]] em vez de $(...), cat, cmp e awk.
 
 # "07:30" -> 450 (minutos desde a meia-noite). 10# = ler como decimal ("08" não é octal)
-minutos() {   # "HH:MM" -> minutos; qualquer outra coisa vale 0 (o valor vem do painel.conf: nunca vira conta)
-    [[ $1 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || { echo 0; return; }
-    echo $((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+minutos() {   # "HH:MM" -> minutos em $REPLY; qualquer outra coisa vale 0 (vem do painel.conf: nunca vira conta)
+    REPLY=0
+    [[ $1 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] && REPLY=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
 }
 
 # dentro AGORA INICIO FIM: o horário está no intervalo? (funciona passando da meia-noite)
@@ -34,15 +37,29 @@ dentro() {
     if (( i <= f )); then (( a >= i && a < f )); else (( a >= i || a < f )); fi
 }
 
+# Arquivo gerado só é trocado se o conteúdo MUDOU: quem vigia (Hyprland recarrega sozinho todo .conf
+# que ele lê; waybar; apps) não acorda à toa. Uso: gera em "ARQ.novo" e chama trocar ARQ.
+# gravar ARQ CONTEÚDO: escreve só se mudou (devolve 0 = mudou, 1 = igual)
+gravar() {
+    local atual=""
+    [ -f "$1" ] && IFS= read -r -d '' atual < "$1"
+    [ "$atual" = "$2" ] && return 1
+    printf '%s' "$2" > "$1"
+}
+
 # "f6f6f6" -> "246,246,246"   (cada par de letras é um número em hexadecimal: f6 = 246)
-rgb() { printf "%d,%d,%d" "0x${1:0:2}" "0x${1:2:2}" "0x${1:4:2}"; }
+rgb() { printf -v REPLY "%d,%d,%d" "0x${1:0:2}" "0x${1:2:2}" "0x${1:4:2}"; }
 # "0.80" -> "cc"   (opacidade de 0 a 1 vira 00 a ff, o formato que o Hyprland usa)
-alfa_hex() { awk -v a="$1" 'BEGIN { printf "%02x", int(a * 255 + 0.5) }'; }
+alfa_hex() {   # sem awk: "0.8" -> 800 milésimos -> round(800 * 255 / 1000)
+    local i=0 f=000
+    [[ $1 =~ ^([0-9]*)(\.([0-9]*))?$ ]] && { i=${BASH_REMATCH[1]:-0}; f=${BASH_REMATCH[3]}000; f=${f:0:3}; }
+    printf -v REPLY "%02x" $(( ((10#$i * 1000 + 10#$f) * 255 + 500) / 1000 ))
+}
 
 # Apps GTK3 não leem as --variáveis do libadwaita: o tema Adwaita do GTK3 usa "@define-color".
 # Fundo com transparência = o vidro do Hyprland aparece atrás (Thunar com o mesmo branco 80% da barra).
 gerar_gtk3() {
-    local tema=$1 rgbs=$2 arquivo="$HOME/.config/gtk-3.0/cores-tema.css"
+    local tema=$1 rgbs=$2 arquivo="$HOME/.config/gtk-3.0/cores-tema.css" txt
     {
         echo "/* Gerado pelo hypr-tema (tema $tema). Importado no gtk-3.0/gtk.css. Doc 25. */"
         echo "@define-color theme_selected_bg_color #$DEST;"
@@ -67,14 +84,17 @@ gerar_gtk3() {
             echo "headerbar, .titlebar { background-color: @theme_bg_color; }"
             echo ".sidebar, placessidebar, placessidebar list { background: transparent; }"
         fi
-    } > "$arquivo"
+    } > "$ESTADO/gtk3.tmp"
+    IFS= read -r -d '' txt < "$ESTADO/gtk3.tmp"
+    gravar "$arquivo" "$txt"
 }
 
 gerar_cores() {
     local tema=$1 hex texto hover rgbs ah
     if [ "$tema" = escuro ]; then hex=$COR_ESCURA; texto=f0f0f0; hover="rgba(255, 255, 255, 0.10)"
     else hex=$COR_CLARA; texto=1e1e1e; hover="rgba(0, 0, 0, 0.07)"; fi
-    rgbs=$(rgb "$hex"); ah=$(alfa_hex "$COR_ALFA")
+    rgb "$hex"; rgbs=$REPLY; alfa_hex "$COR_ALFA"; ah=$REPLY
+    local txt fonte; [ "$tema" = escuro ] && fonte=ESCURA || fonte=CLARA
 
     # Cor de destaque EM USO (globais, usadas abaixo e no gerar_gtk3). "mono" = a cor do próprio tema:
     #   escuro: quase branco, texto escuro por cima, SOMBRA preta em volta das linhas
@@ -91,8 +111,8 @@ gerar_cores() {
     echo "$DEST" > "$ESTADO/destaque"          # o print-area lê daqui a cor da linha de seleção
 
     # 1) Barra de cima (waybar): sempre a cor escolhida. É ela a referência.
-    cat > "$HOME/.config/waybar/cores-$tema.css" <<EOF
-/* Gerado pelo hypr-tema a partir de COR_$( [ "$tema" = escuro ] && echo ESCURA || echo CLARA ) e BAR_ALPHA (painel.conf). */
+    IFS= read -r -d '' txt <<EOF
+/* Gerado pelo hypr-tema a partir de COR_$fonte e BAR_ALPHA (painel.conf). */
 @define-color fundo rgba($rgbs, $BAR_ALPHA);
 @define-color fundo-solido #$hex;
 @define-color texto #$texto;
@@ -100,12 +120,13 @@ gerar_cores() {
 @define-color destaque-texto #$DEST_FG;
 @define-color hover $hover;
 EOF
+    gravar "$HOME/.config/waybar/cores-$tema.css" "$txt"
 
     # 2) Barras de título (hyprbars) e 3) apps GTK4: a cor da barra se sincronizado; senão, o padrão
     local barra textoh
     if [ "$COR_SINC" = 1 ]; then
         barra="rgba(${hex}${ah})"
-        cat > "$HOME/.config/gtk-4.0/cores-tema.css" <<EOF
+        IFS= read -r -d '' txt <<EOF
 /* Gerado pelo hypr-tema: apps GTK4/libadwaita com a MESMA cor da barra de cima (COR_SINC=1), em VIDRO
    FOSCO: fundo semitransparente + desfoque do Hyprland ("carbono"); texto sempre nítido (doc 44).
    As --variáveis são as cores com nome do libadwaita: trocando aqui, muda em todos os apps. */
@@ -130,14 +151,17 @@ entry:focus-within, spinbutton:focus-within { box-shadow: 0 0 0 1px var(--accent
 EOF
     else
         [ "$tema" = escuro ] && barra="rgba(242424e6)" || barra="rgba(f2f2f2e6)"
-        printf '%s\n' "/* COR_SINC=0: apps GTK4 com as cores padrão do tema (só a cor de destaque é nossa). */" \
-            ":root { --accent-bg-color: #$DEST; --accent-color: #$DEST; --accent-fg-color: #$DEST_FG; }" \
-            > "$HOME/.config/gtk-4.0/cores-tema.css"
+        printf -v txt '%s\n' "/* COR_SINC=0: apps GTK4 com as cores padrão do tema (só a cor de destaque é nossa). */" \
+            ":root { --accent-bg-color: #$DEST; --accent-color: #$DEST; --accent-fg-color: #$DEST_FG; }"
     fi
     # 3a) Visual Solid: por cima, o Material dos apps GTK4 (superfícies tonais, sem contornos, pílulas)
     if [ "${VISUAL:-}" = Solid ]; then
-        python3 -I "$SOLIDO" gtk "$tema" >> "$HOME/.config/gtk-4.0/cores-tema.css" 2>/dev/null
+        # (o solido_cores já gerou este CSS na mesma chamada do Python que leu a paleta)
+        local extra=""
+        [ -f "$ESTADO/solido-gtk.css" ] && IFS= read -r -d '' extra < "$ESTADO/solido-gtk.css"
+        txt+=$extra
     fi
+    gravar "$HOME/.config/gtk-4.0/cores-tema.css" "$txt"
     # 3b) Apps GTK3 (Thunar, pavucontrol...): mesmas cores, pelo jeito antigo do GTK3 (@define-color)
     gerar_gtk3 "$tema" "$rgbs"
     [ "$tema" = escuro ] && textoh="rgba(ffffffdd)" || textoh="rgba(1e1e1edd)"
@@ -156,13 +180,15 @@ EOF
     # O Hyprland só conhece as fontes que existiam quando ELE começou. Se a Aero Symbols é mais nova que
     # este Hyprland, ela apareceria como quadradinhos: usa os símbolos comuns até o próximo login (doc 49).
     local s_fechar s_max s_min s_vis tam fonte_sym="$HOME/.local/share/fonts/AeroSymbols.ttf" hpid
-    hpid=$(pgrep -xo Hyprland || pgrep -xo hyprland)
-    if [ -f "$fonte_sym" ] && [ -n "$hpid" ] && [ "$(stat -c %Y "/proc/$hpid")" -gt "$(stat -c %Y "$fonte_sym")" ]; then
+    hpid=""
+    read -r hpid < "${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hyprland.lock" 2>/dev/null
+    [ -n "$hpid" ] || hpid=$(pgrep -xo Hyprland || pgrep -xo hyprland)
+    if [ -f "$fonte_sym" ] && [ -n "$hpid" ] && [ "/proc/$hpid" -nt "$fonte_sym" ]; then
         s_fechar=""; s_max=""; s_min=""; s_vis=""; tam=22
     else
         s_fechar="✖"; s_max="▲"; s_min="▼"; s_vis="●"; tam=15
     fi
-    cat > "$HOME/.config/hypr/tema-atual.conf" <<EOF
+    IFS= read -r -d '' txt <<EOF
 # Gerado pelo hypr-tema (tema $tema). Não editar: é reescrito a cada troca de tema/cor.
 plugin {
     hyprbars {
@@ -180,10 +206,10 @@ windowrule = hyprbars:bar_color $kitty_barra, match:class ^(kitty|[Tt]hunar)$
 # Janelas "sempre visível": barra de título com outro tom, pra saber que está ligado
 windowrule = hyprbars:bar_color $destaque, match:tag sempre-visivel
 EOF
-    # Os botões da barra só trocam de cor recarregando o Hyprland (só acontece quando o tema/cor muda)
-    if hyprctl plugin list 2>/dev/null | grep -q hyprbars; then
-        hyprctl reload >/dev/null
-    fi
+    gravar "$HOME/.config/hypr/tema-atual.conf" "$txt"
+    # Nada de "hyprctl reload" (refaz tudo e pisca): os valores AO VIVO vão por keyword, numa chamada só,
+    # na fase "mostrar". Os botões (hyprbars-button) só trocam de cor no próximo login/reload.
+    HYPR_LOTE="keyword plugin:hyprbars:bar_color $barra ; keyword plugin:hyprbars:col.text $textoh"
 
     # 4) Notificações (mako): modo padrão = escuro, modo "claro" = claro
     local fundo_escuro fundo_claro
@@ -192,7 +218,7 @@ EOF
     else
         fundo_escuro="#1e1e1ecc"; fundo_claro="#f6f6f6cc"
     fi
-    cat > "$HOME/.config/mako/config" <<EOF
+    IFS= read -r -d '' txt <<EOF
 # Gerado pelo hypr-tema (cores do tema). O modo "claro" é ativado com: "$HOME/.local/bin/hermesctl" mode -s claro
 anchor=top-right
 margin=12
@@ -229,50 +255,87 @@ default-timeout=1500
 background-color=$fundo_claro
 text-color=#1e1e1e
 EOF
-    "$HOME/.local/bin/hermesctl" reload >/dev/null 2>&1
-    pkill -SIGUSR2 -x waybar    # SIGUSR2 = "waybar, recarregue o visual"
+    MAKO_MUDOU=0; gravar "$HOME/.config/mako/config" "$txt" && MAKO_MUDOU=1
 }
 
-aplicar_tema() {
-    local tema=$1 mako
-    # ORDEM IMPORTA (doc 42): primeiro escrever TODAS as cores novas, só depois avisar os apps da troca
-    # (gsettings). Os apps GTK recarregam o visual no instante do aviso; antes, eles liam as cores VELHAS
-    # (o Thunar trocava pro claro com o menu e a barra de baixo pretos).
+# A troca em DUAS fases (o aero-tema-onda --cascata chama uma de cada vez, AERO_TEMA_FASE=preparar|mostrar;
+# sem fase = as duas seguidas):
+#   preparar  só escreve arquivos (ninguém vê nada ainda) — roda junto com a CASCATA das peças do shell;
+#   mostrar   avisa todo mundo (gsettings, Hyprland, Hermes, waybar) — roda debaixo do print parado da onda.
+# ORDEM IMPORTA (doc 42): primeiro escrever TODAS as cores novas, só depois avisar os apps da troca
+# (gsettings). Os apps GTK recarregam o visual no instante do aviso; antes, eles liam as cores VELHAS.
+preparar_tema() {
+    local tema=$1 nome escuro_ini v txt
     # Super Menu e barra: trocam o arquivo de cores (ln -sf = atalho apontando pro arquivo certo)
-    ln -sf "style-$tema.css" "$HOME/.config/wofi/style.css"
-    ln -sf "cores-$tema.css" "$HOME/.config/waybar/cores.css"
+    # (-ef = já aponta pro mesmo arquivo: nem roda o ln)
+    [ "$HOME/.config/wofi/style.css" -ef "$HOME/.config/wofi/style-$tema.css" ] ||
+        ln -sfn "style-$tema.css" "$HOME/.config/wofi/style.css"
+    [ "$HOME/.config/waybar/cores.css" -ef "$HOME/.config/waybar/cores-$tema.css" ] ||
+        ln -sfn "cores-$tema.css" "$HOME/.config/waybar/cores.css"
     gerar_cores "$tema"
+    if [ "$tema" = escuro ]; then nome=ArchAeroX16-Dark; escuro_ini=true
+    else nome=ArchAeroX16; escuro_ini=false; fi
+    # o mesmo nome nos arquivos que alguns programas leem em vez do gsettings (GTK2, GTK3/4 sem sessão, fastfetch...)
+    for v in 3.0 4.0; do
+        [ -d "$HOME/.config/gtk-$v" ] || mkdir -p "$HOME/.config/gtk-$v"
+        printf -v txt '[Settings]\ngtk-theme-name=%s\ngtk-application-prefer-dark-theme=%s\n' "$nome" "$escuro_ini"
+        gravar "$HOME/.config/gtk-$v/settings.ini" "$txt"
+    done
+    printf -v txt '# Gerado pelo hypr-tema (doc 46)\ngtk-theme-name="%s"\n' "$nome"
+    gravar "$HOME/.gtkrc-2.0" "$txt"
+    # o que a fase "mostrar" precisa (ela pode rodar em outro processo, depois do print da onda)
+    printf 'M_TEMA=%q\nM_NOME=%q\nM_VISUAL=%q\nM_LOTE=%q\nM_MAKO=%q\nM_CORES=%q\n' "$tema" "$nome" "${VISUAL:-}" \
+        "$HYPR_LOTE" "$MAKO_MUDOU" "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" \
+        > "$ESTADO/mostrar"
+}
+
+mostrar_tema() {
+    local M_TEMA M_NOME M_VISUAL M_LOTE M_MAKO M_CORES
+    . "$ESTADO/mostrar" || return
+    # Hermes (notificações): recarrega só se o config mudou; o modo claro/escuro em paralelo
+    # (-a/-r = acrescentar/tirar em vez de -s: assim o "dnd" (Não perturbe) sobrevive)
+    {
+        [ "$M_MAKO" = 1 ] && "$HOME/.local/bin/hermesctl" reload >/dev/null 2>&1
+        if [ "$M_TEMA" = claro ]; then "$HOME/.local/bin/hermesctl" mode -a claro >/dev/null 2>&1
+        else "$HOME/.local/bin/hermesctl" mode -r claro >/dev/null 2>&1; fi
+    } &
+    hyprctl --batch "$M_LOTE" >/dev/null 2>&1 &
+    pkill -SIGUSR2 -x waybar    # SIGUSR2 = "waybar, recarregue o visual"
     # Firefox (textfox): as duas paletas do sistema; claro/escuro troca sozinho, cor nova vale ao reabrir
     [ -x "$HOME/.local/bin/firefox-tema" ] && "$HOME/.local/bin/firefox-tema" >/dev/null 2>&1 &
     # Tema do sistema: ArchAeroX16 (claro) / ArchAeroX16-Dark (escuro), em ~/.local/share/themes (doc 46).
-    local nome escuro_ini
-    if [ "$tema" = escuro ]; then
-        nome=ArchAeroX16-Dark; escuro_ini=true
-        gsettings set org.gnome.desktop.interface color-scheme prefer-dark
-        mako=default
-    else
-        nome=ArchAeroX16; escuro_ini=false
-        gsettings set org.gnome.desktop.interface color-scheme prefer-light
-        mako=claro
-    fi
+    # (color-scheme e gtk-theme são chaves independentes: em paralelo; os arquivos já estão escritos)
+    if [ "$M_TEMA" = escuro ]; then gsettings set org.gnome.desktop.interface color-scheme prefer-dark &
+    else gsettings set org.gnome.desktop.interface color-scheme prefer-light & fi
     # Solid: a paleta muda com o wallpaper sem mudar o nome do tema, e o GTK só relê o CSS quando o nome
     # muda. Um "pisca" de nome força a releitura (invisível: acontece debaixo da onda do aero-tema-onda).
-    if [ "${VISUAL:-}" = Solid ] && [ "$(gsettings get org.gnome.desktop.interface gtk-theme)" = "'$nome'" ]; then
+    if [ "$M_VISUAL" = Solid ] && [ "$(gsettings get org.gnome.desktop.interface gtk-theme)" = "'$M_NOME'" ]; then
         gsettings set org.gnome.desktop.interface gtk-theme Adwaita
     fi
-    gsettings set org.gnome.desktop.interface gtk-theme "$nome"
-    # o mesmo nome nos arquivos que alguns programas leem em vez do gsettings (GTK2, GTK3/4 sem sessão, fastfetch...)
-    for v in 3.0 4.0; do
-        mkdir -p "$HOME/.config/gtk-$v"
-        printf '[Settings]\ngtk-theme-name=%s\ngtk-application-prefer-dark-theme=%s\n' "$nome" "$escuro_ini" \
-            > "$HOME/.config/gtk-$v/settings.ini"
-    done
-    printf '# Gerado pelo hypr-tema (doc 46)\ngtk-theme-name="%s"\n' "$nome" > "$HOME/.gtkrc-2.0"
-    # -a/-r (acrescentar/tirar) em vez de -s (substituir tudo): assim o "dnd" (Não perturbe) sobrevive
-    if [ "$mako" = claro ]; then "$HOME/.local/bin/hermesctl" mode -a claro >/dev/null 2>&1
-    else "$HOME/.local/bin/hermesctl" mode -r claro >/dev/null 2>&1; fi
-    echo "$tema" > "$ESTADO/tema"
-    echo "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" > "$ESTADO/cores"
+    gsettings set org.gnome.desktop.interface gtk-theme "$M_NOME"
+    echo "$M_TEMA" > "$ESTADO/tema"
+    echo "$M_CORES" > "$ESTADO/cores"
+    wait
+}
+
+aplicar_tema() {
+    case "${AERO_TEMA_FASE:-}" in
+        preparar) preparar_tema "$1" ;;
+        mostrar)  mostrar_tema ;;
+        *)        preparar_tema "$1"; mostrar_tema ;;
+    esac
+}
+
+# A CASCATA (solido.py): avisa as peças do shell, que trocam as próprias cores em sequência, já. Se quem
+# foi clicado (Hestia...) já avisou este mesmo tema há pouco, não repete (ela já começou).
+cascata_avisar() {
+    local tema=$1 arq="$ESTADO/cascata" atual agora
+    atual=""; [ -f "$arq" ] && IFS= read -r atual < "$arq"
+    agora=${EPOCHREALTIME/,/.}
+    if [[ $atual =~ \"tema\":\ *\"([a-z]+)\".*\"t0\":\ *([0-9]+) ]] && [ "${BASH_REMATCH[1]}" = "$tema" ] &&
+       (( ${agora%.*} - BASH_REMATCH[2] < 5 )); then return; fi
+    # no lugar, numa escrita só (rename atrasa o inotify do Gio em ~100 ms)
+    printf '{"tema": "%s", "t0": %s, "origem": ""}\n' "$tema" "$agora" > "$arq"
 }
 
 aplicar_filtro() {
@@ -293,20 +356,18 @@ aplicar_filtro() {
 
 SOLIDO="$HOME/.local/share/aero-shell/solido.py"
 solido_cores() {   # COR_ESCURA/COR_CLARA = surface de cada modo, destaque = primary (só na memória)
-    local k v
+    local k v                     # uma chamada só do Python: as cores dos dois modos + o CSS GTK do modo
     while IFS='=' read -r k v; do
         [[ $v =~ ^[0-9a-f]{6}$ ]] || continue
-        case "$k" in SOLID_SURFACE) COR_ESCURA=$v ;; SOLID_PRIMARY) DEST_ESCURO=$v ;; esac
-    done < <(python3 -I "$SOLIDO" vars escuro 2>/dev/null)
-    while IFS='=' read -r k v; do
-        [[ $v =~ ^[0-9a-f]{6}$ ]] || continue
-        case "$k" in SOLID_SURFACE) COR_CLARA=$v ;; SOLID_PRIMARY) DEST_CLARO=$v ;; esac
-    done < <(python3 -I "$SOLIDO" vars claro 2>/dev/null)
+        case "$k" in ESCURO_SURFACE) COR_ESCURA=$v ;; ESCURO_PRIMARY) DEST_ESCURO=$v ;;
+                     CLARO_SURFACE) COR_CLARA=$v ;; CLARO_PRIMARY) DEST_CLARO=$v ;; esac
+    done < <(python3 -I "$SOLIDO" hypr "$tema" "$ESTADO/solido-gtk.css" 2>/dev/null)
     COR_ALFA=1.0; BAR_ALPHA=1.0; COR_SINC=1
     if [ "$tema" = escuro ]; then COR_DESTAQUE=${DEST_ESCURO:-$COR_DESTAQUE}; else COR_DESTAQUE=${DEST_CLARO:-$COR_DESTAQUE}; fi
 }
 
 aplicar() {
+    if [ "${AERO_TEMA_FASE:-}" = mostrar ]; then mostrar_tema; return; fi
     # Valores padrão; o painel.conf sobrescreve
     TEMA_MODO=auto; TEMA_CLARO=07:00; TEMA_ESCURO=18:00
     FILTRO_MODO=auto; FILTRO_INICIO=19:00; FILTRO_FIM=07:00; FILTRO_TEMP=4500
@@ -318,28 +379,41 @@ aplicar() {
     if [ "${WALL_CORES:-0}" = 1 ] && [ -n "${COR_DESTAQUE_WALL:-}" ]; then COR_DESTAQUE=$COR_DESTAQUE_WALL; fi
 
     local agora tema filtro
-    agora=$(minutos "$(date +%H:%M)")
+    printf -v agora '%(%H:%M)T' -1; minutos "$agora"; agora=$REPLY
+    local m1 m2
 
     case "$TEMA_MODO" in
         claro|escuro) tema=$TEMA_MODO ;;
-        *) dentro "$agora" "$(minutos "$TEMA_CLARO")" "$(minutos "$TEMA_ESCURO")" && tema=claro || tema=escuro ;;
+        *) minutos "$TEMA_CLARO"; m1=$REPLY; minutos "$TEMA_ESCURO"; m2=$REPLY
+           dentro "$agora" "$m1" "$m2" && tema=claro || tema=escuro ;;
     esac
     case "$FILTRO_MODO" in
         ligado) filtro=$FILTRO_TEMP ;;
         desligado) filtro=0 ;;
-        *) dentro "$agora" "$(minutos "$FILTRO_INICIO")" "$(minutos "$FILTRO_FIM")" && filtro=$FILTRO_TEMP || filtro=0 ;;
+        *) minutos "$FILTRO_INICIO"; m1=$REPLY; minutos "$FILTRO_FIM"; m2=$REPLY
+           dentro "$agora" "$m1" "$m2" && filtro=$FILTRO_TEMP || filtro=0 ;;
     esac
 
     # Visual Solid: as cores saem da PALETA TONAL (solido.py, a partir da cor do wallpaper): superfícies
     # sólidas (sem vidro: alfa 1) e destaque = a primária do esquema.
     if [ "${VISUAL:-}" = Solid ]; then solido_cores; fi
 
-    if [ "$1" = --forcar ] || [ "$tema" != "$(cat "$ESTADO/tema" 2>/dev/null)" ] ||
-       [ "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" != "$(cat "$ESTADO/cores" 2>/dev/null)" ]; then
+    local e_tema="" e_cores="" e_filtro=""
+    [ -f "$ESTADO/tema" ] && read -r e_tema < "$ESTADO/tema"
+    [ -f "$ESTADO/cores" ] && read -r e_cores < "$ESTADO/cores"
+    [ -f "$ESTADO/filtro" ] && read -r e_filtro < "$ESTADO/filtro"
+    if [ "$1" = --forcar ] || [ "$tema" != "$e_tema" ] ||
+       [ "$COR_SINC $COR_CLARA $COR_ESCURA $COR_ALFA $COR_DESTAQUE $BAR_ALPHA" != "$e_cores" ]; then
         # a troca de cores com a onda (aero-tema-onda): roda este mesmo script por baixo de um print que
         # se desfaz numa onda. No login (--loop) e dentro de uma troca que já tem onda, troca direto.
+        # Solid: a CASCATA começa já (as peças do shell trocam as cores ao vivo, uma depois da outra) e a
+        # onda só cobre o que sobra (apps, Hyprland), em duas fases (aero-tema-onda --cascata).
+        if [ "${VISUAL:-}" = Solid ] && [ -z "${AERO_TEMA_ONDA:-}" ] && [ -z "${SEM_ONDA:-}" ]; then
+            cascata_avisar "$tema"
+        fi
         if [ -z "${AERO_TEMA_ONDA:-}" ] && [ -z "${SEM_ONDA:-}" ] && [ -x "$HOME/.local/bin/aero-tema-onda" ]; then
-            "$HOME/.local/bin/aero-tema-onda" "$0" --forcar
+            if [ "${VISUAL:-}" = Solid ]; then "$HOME/.local/bin/aero-tema-onda" --cascata "$0" --forcar
+            else "$HOME/.local/bin/aero-tema-onda" "$0" --forcar; fi
             return
         fi
         aplicar_tema "$tema"
@@ -348,7 +422,7 @@ aplicar() {
     # placa, e na NVIDIA isso pisca a tela em PRETO — era o "apagão" ao trocar claro/escuro (a troca com
     # onda chama este script com --forcar). O --forcar só força o filtro fora da onda (login, na mão).
     if { [ "$1" = --forcar ] && [ -z "${AERO_TEMA_ONDA:-}" ]; } ||
-       [ "$filtro" != "$(cat "$ESTADO/filtro" 2>/dev/null)" ]; then aplicar_filtro "$filtro"; fi
+       [ "$filtro" != "$e_filtro" ]; then aplicar_filtro "$filtro"; fi
 }
 
 # O Hyprland que me iniciou ainda está vivo?

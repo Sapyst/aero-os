@@ -1593,7 +1593,7 @@ class App(Gtk.Application):
         self.vigia.connect("changed", self.ao_mudar_arquivo)
         self._debounce = None
         # claro/escuro e paleta: o hypr-tema reescreve ~/.cache/hypr-tema/cores a cada troca (inotify, parado = 0)
-        self.vigia_paleta = solido.vigiar(self.ao_mudar_paleta)
+        self.vigia_paleta = solido.vigiar(self.ao_mudar_paleta, peca="widgets")
         self.vigia_cores = Gio.File.new_for_path(CORES_BARRA).monitor_file(Gio.FileMonitorFlags.NONE, None)
         self.vigia_cores.connect("changed", lambda *_: GLib.timeout_add(300, lambda: ([w.ao_tema() for w in self.widgets], False)[1]))
         GLib.timeout_add_seconds(20, self.vigiar_hyprland)
