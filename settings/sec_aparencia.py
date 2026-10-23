@@ -6,10 +6,16 @@ sec_aparencia.py — seção Appearance.
   Vidro (transparência + desfoque): reescreve ~/.config/hypr/aparencia.conf.
   Tamanho do texto: gsettings (apps GTK).
   Animações: bloco "animations" no aparencia.conf, entre linhas-marca (doc 23).
+  Raio dos cantos (Glass and windows → Corner roundness): UM número para o sistema inteiro, gravado como
+  RAIO_CANTOS no painel.conf. Vale na hora: o Hyprland recebe `hyprctl keyword decoration:rounding N` e a
+  linha `rounding =` do aparencia.conf e do visual.conf (o que vale por último) é trocada; o Daimon lê o
+  painel.conf sozinho (ele vigia a pasta). Sem RAIO_CANTOS, o padrão do sistema é 24 px.
 """
+import json
 import os
+import shutil
 
-from gi.repository import Adw, Gdk, Gio, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from comum import (Secao, aplicar_css, atualizar_painel, combo, em_segundo_plano, grupo_botao_aplicar, indice, ler_painel, linha_app,
                    pagina, rodar, valor_de)
@@ -53,6 +59,9 @@ CSS_DESTAQUES = "".join(f".bolinha-{n} {{ background: #{h}; min-width: 22px; min
 # Curva dos cantos. "Round" (círculo) é o padrão: é a única que os apps (CSS) desenham igual ao Hyprland,
 # então janelas, central, menus e Dock ficam com a MESMA curva (regra do Aero, doc 30).
 CANTOS = [("Round", "2"), ("Smooth (Apple-like)", "3.5")]
+# Raio dos cantos (px). 0 = reto; o padrão do Aero é 24 (mais redondo que os 16 de antes)
+RAIO_MIN, RAIO_MAX, RAIO_PADRAO = 0, 40, 24
+VISUAL_CONF = os.path.expanduser("~/.config/hypr/visual.conf")
 ESMAECER = [("Off", "0"), ("Subtle", "0.08"), ("Medium", "0.15"), ("Strong", "0.25")]
 OPACIDADE = [("70%", "0.70"), ("80%", "0.80"), ("90%", "0.90"), ("100%", "1.0")]
 # taskbar: below ~35% Hyprland stops blurring it (ignore_alpha 0.3 in aparencia.conf)
@@ -141,6 +150,77 @@ def gerar_aparencia(nivel, esmaecer="0.08", cantos="2"):
                 linhas[i] = f"{valor:<29}{comentario}" if comentario else valor
     with open(APARENCIA, "w") as f:
         f.write("\n".join(linhas) + "\n")
+
+
+def nome_do_raio(n):
+    """O nome mostrado ao lado do número: o dono pensa em "reto, curvo, muito curvo", não em pixels."""
+    if n <= 0:
+        return "Square"
+    if n < 10:
+        return "Slightly curved"
+    if n < 28:
+        return "Curved"
+    return "Very curved"
+
+
+def raio_atual():
+    """O raio do sistema: o RAIO_CANTOS do painel.conf; sem ele, o que o Hyprland usa agora; sem
+    Hyprland, o padrão."""
+    try:
+        return max(RAIO_MIN, min(RAIO_MAX, int(ler_painel().get("RAIO_CANTOS", ""))))
+    except ValueError:
+        pass
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        try:
+            return max(RAIO_MIN, min(RAIO_MAX, int(json.loads(
+                rodar(["hyprctl", "-j", "getoption", "decoration:rounding"]).stdout)["int"])))
+        except (ValueError, KeyError, TypeError):
+            pass
+    return RAIO_PADRAO
+
+
+def trocar_rounding(caminho, n):
+    """Troca SÓ a linha `rounding =` do bloco decoration de um .conf do Hyprland (o resto do arquivo fica
+    intacto). Antes da primeira troca guarda uma cópia (.bak-raio-cantos). Devolve True se trocou."""
+    try:
+        with open(caminho) as f:
+            linhas = f.read().splitlines()
+    except OSError:
+        return False
+    blocos, trocou = [], False
+    for i, linha in enumerate(linhas):
+        limpa = linha.split("#")[0].strip()
+        if limpa.endswith("{"):
+            blocos.append(limpa[:-1].strip())
+        elif limpa == "}":
+            if blocos:
+                blocos.pop()
+        elif blocos == ["decoration"] and "=" in limpa and limpa.split("=")[0].strip() == "rounding":
+            recuo = linha[:len(linha) - len(linha.lstrip())]
+            valor = f"{recuo}rounding = {n}"
+            linhas[i] = f"{valor:<29}# corner radius of the whole system (Settings: Corner roundness)"
+            trocou = True
+    if trocou:
+        if not os.path.exists(caminho + ".bak-raio-cantos"):
+            shutil.copy2(caminho, caminho + ".bak-raio-cantos")
+        with open(caminho + ".tmp", "w") as f:
+            f.write("\n".join(linhas) + "\n")
+        os.replace(caminho + ".tmp", caminho)
+    return trocou
+
+
+def aplicar_raio(n):
+    """Grava e aplica o raio dos cantos em todo lugar que o Aero conhece:
+      painel.conf  RAIO_CANTOS=n    a fonte da verdade (o Daimon lê daqui; o aero-visual reaplica)
+      aparencia.conf / visual.conf  a linha `rounding` (o Hyprland relê isto no login e no reload)
+      Hyprland ao vivo              hyprctl keyword decoration:rounding n"""
+    n = max(RAIO_MIN, min(RAIO_MAX, int(n)))
+    atualizar_painel(RAIO_CANTOS=n)
+    for arq in (APARENCIA, VISUAL_CONF):
+        trocar_rounding(arq, n)
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        rodar(["hyprctl", "keyword", "decoration:rounding", str(n)])
+    return n
 
 
 class SecaoAparencia(Secao):
@@ -238,7 +318,24 @@ class SecaoAparencia(Secao):
         self.esmaecer = combo("Dim unfocused windows", ESMAECER, 1,
                               "Super+O (or the blue title-bar button) keeps a window from dimming")
         self.cantos = combo("Window corners", CANTOS, 1)
-        for r in (self.botoes_sw, self.vidro, self.cantos, self.esmaecer):
+        # Raio dos cantos: um controle deslizante E um número no MESMO Gtk.Adjustment (mexer em um mexe
+        # no outro). Vale na hora, sem Apply (como a cor de destaque): espera o dedo parar 250 ms.
+        self.raio_linha = Adw.ActionRow(use_markup=False, title="Corner roundness")
+        self.raio_ajuste = Gtk.Adjustment(value=RAIO_PADRAO, lower=RAIO_MIN, upper=RAIO_MAX,
+                                          step_increment=1, page_increment=4)
+        self.raio_escala = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.raio_ajuste,
+                                     digits=0, draw_value=False, hexpand=True, width_request=200,
+                                     valign=Gtk.Align.CENTER)
+        self.raio_escala.add_mark(RAIO_PADRAO, Gtk.PositionType.BOTTOM, None)   # o padrão do sistema
+        self.raio_numero = Gtk.SpinButton(adjustment=self.raio_ajuste, climb_rate=1, digits=0, numeric=True,
+                                          valign=Gtk.Align.CENTER, tooltip_text="Radius in pixels (0 = square)")
+        self.raio_linha.add_suffix(self.raio_escala)
+        self.raio_linha.add_suffix(self.raio_numero)
+        self.raio_ajuste.connect("value-changed", self.ao_mudar_raio)
+        self.carregando_raio = False
+        self.raio_timer = 0
+        self.mostrar_raio()
+        for r in (self.botoes_sw, self.vidro, self.raio_linha, self.cantos, self.esmaecer):
             vidro.add(r)
 
         fontes = Adw.PreferencesGroup(title="Text and pointer",
@@ -391,6 +488,27 @@ class SecaoAparencia(Secao):
             except Exception:  # noqa: BLE001 — sem miniatura, só o nome
                 pass
 
+    # ---- raio dos cantos ----
+    def mostrar_raio(self):
+        """O nome ao vivo embaixo do título: "Curved · 24 px" (o padrão ganha a marca "default")."""
+        n = int(round(self.raio_ajuste.get_value()))
+        padrao = " (default)" if n == RAIO_PADRAO else ""
+        self.raio_linha.set_subtitle(f"{nome_do_raio(n)} · {n} px{padrao} · windows, menus and the whole system")
+
+    def ao_mudar_raio(self, *_):
+        self.mostrar_raio()
+        if self.carregando_raio:
+            return
+        if self.raio_timer:
+            GLib.source_remove(self.raio_timer)
+        self.raio_timer = GLib.timeout_add(250, self.aplicar_raio_agora)
+
+    def aplicar_raio_agora(self):
+        self.raio_timer = 0
+        n = int(round(self.raio_ajuste.get_value()))
+        em_segundo_plano(lambda: aplicar_raio(n))
+        return GLib.SOURCE_REMOVE
+
     # ---- botões de janela ----
     def ao_trocar_botoes(self, *_):
         if self.mexendo_botoes:
@@ -427,6 +545,10 @@ class SecaoAparencia(Secao):
         self.vidro.set_selected(indice(VIDRO, p.get("VIDRO", "media"), 2))
         self.esmaecer.set_selected(indice(ESMAECER, p.get("ESMAECER", "0.08"), 1))
         self.cantos.set_selected(indice(CANTOS, p.get("CANTOS", "2"), 0))
+        self.carregando_raio = True
+        self.raio_ajuste.set_value(raio_atual())
+        self.carregando_raio = False
+        self.mostrar_raio()
         self.sinc.set_active(p.get("COR_SINC", "1") == "1")
         self.animar.set_active(p.get("ANIM", "1") == "1")
         self.velocidade.set_selected(indice(VELOCIDADE, p.get("ANIM_VEL", "normal"), 1))
@@ -465,6 +587,9 @@ class SecaoAparencia(Secao):
         for botao in (self.cor_clara, self.cor_escura):
             botao.linha.set_sensitive(not do_wall)
             botao.linha.set_subtitle("From the wallpaper" if do_wall else "")
+        # o destaque também vem do wallpaper (hypr-tema usa COR_DESTAQUE_WALL); as bolinhas guardam a sua
+        self.linha_destaque.set_sensitive(not do_wall)
+        self.linha_destaque.set_subtitle("From the wallpaper" if do_wall else "")
 
     def ao_mudar_cores_wall(self, *_):
         if self.mudando_cores_wall:

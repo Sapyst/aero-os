@@ -176,6 +176,27 @@ def restaurar(nome):
     return estado
 
 
+def raio_do_sistema(conf):
+    """O raio dos cantos é do sistema, não do visual: RAIO_CANTOS (painel.conf, gravado pelo Settings →
+    Theme → Glass and windows → Corner roundness) não entra nos perfis (CHAVES). Depois de restaurar o
+    visual.conf de um perfil, a linha `rounding` do bloco decoration volta a ser a do sistema."""
+    raio = ler_painel().get("RAIO_CANTOS", "")
+    if not raio.isdigit() or not os.path.exists(conf):
+        return
+    linhas, blocos = open(conf).read().splitlines(), []
+    for i, l in enumerate(linhas):
+        limpa = l.split("#")[0].strip()
+        if limpa.endswith("{"):
+            blocos.append(limpa[:-1].strip())
+        elif limpa == "}" and blocos:
+            blocos.pop()
+        elif blocos == ["decoration"] and limpa.split("=")[0].strip() == "rounding":
+            linhas[i] = l[:len(l) - len(l.lstrip())] + f"rounding = {raio}"
+    with open(conf + ".tmp", "w") as f:
+        f.write("\n".join(linhas) + "\n")
+    os.replace(conf + ".tmp", conf)
+
+
 def aplicar(estado, nome):
     antes = ler_painel()
     gravar_painel(dict(estado["painel"], VISUAL=nome))
@@ -192,6 +213,7 @@ def aplicar(estado, nome):
             w = json.load(open(WIDGETS)); w["por_area"] = estado["widgets"]["por_area"]
             json.dump(w, open(WIDGETS, "w"), indent=2)
     rodar(os.path.join(BIN, "hypr-tema"), "--forcar")
+    raio_do_sistema(VISUAL_CONF)
     p = estado["painel"]
     if p.get("ICONES_BASE") and p.get("ICONES_BASE") != antes.get("ICONES_BASE"):
         rodar(os.path.join(BIN, "aero-icones"), "--base", p["ICONES_BASE"])
