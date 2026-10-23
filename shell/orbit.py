@@ -16,14 +16,27 @@ No window, no list: the search is the centre of the screen and the files orbit a
 - Keys: type to search, Enter opens (a folder: goes inside), Tab / arrows move, Space peeks,
   Ctrl+C copies the path, Backspace with nothing typed goes up one folder, Esc steps back / closes.
 
+HOME (a primeira estrela do caminho, onde o ORBIT abre) não é uma pasta: é uma vista que se adapta ao uso.
+- "frequent" (padrão): as pastas que você mais visita (frecência, visitas.py): maior e mais perto do meio =
+  mais usada. ~ e o D: sempre aparecem; sem histórico ainda, as pastas padrão (Desktop, Downloads...) servem de
+  semente e somem sozinhas conforme o uso de verdade toma o lugar.
+- "computer": o "Meu computador" do jeito do ORBIT: uma bolha por disco (/, D:, pendrives...) com um anel de
+  pontos aceso até onde ele está cheio (vermelho passando de 90%), as pastas padrão e a Lixeira.
+- A pílula FREQUENT | COMPUTER no alto da HOME troca o modo (o mesmo do Settings → Default apps → File finder,
+  gravado em ~/.config/aero/orbit.json). Backspace em ~ ou na raiz de um disco volta pra HOME; buscar na HOME
+  procura em tudo (~ e D:).
+
 Runs as its own small process (com.aero.Orbit) and quits by itself 10 minutes after closing.
 """
 import hashlib
+import heapq
 import math
 from array import array
 from bisect import bisect_right
 import os
 import random
+import re
+import stat
 import subprocess
 import sys
 import threading
@@ -46,17 +59,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import campotexto  # noqa: E402
 import liquido  # noqa: E402
 import visor  # noqa: E402
+import visitas  # noqa: E402
 import nuvem  # noqa: E402
 from nuvem import FG, RED, empacotar, pop, suave  # noqa: E402
 
 CASA = os.path.expanduser("~")
 DADOS = os.environ.get("AERO_DADOS", "/mnt/d")          # the data drive (shown as "D:" next to your folders)
 RAIZES = [CASA] + ([DADOS] if os.path.ismount(DADOS) else [])
-NOME_RAIZ = {CASA: "HOME", DADOS: "D:"}
+LIXO = visitas.LIXO                                     # a Lixeira (as coisas apagadas ficam em .../Trash/files)
+NOME_RAIZ = {CASA: "~", DADOS: "D:"}
+# a HOME virtual: um "endereço" que não é caminho de verdade (não começa com /), então nada o confunde com uma
+# pasta: os.scandir falha, as visitas ignoram, e cada lugar que precisa trata ele antes
+INICIO = "aero:home"
+MODOS_TELA = [("FREQUENT", "frequent"), ("COMPUTER", "computer")]
 
 
 def exibir(path):
-    """~/x for the home, D:/x for the data drive."""
+    """~/x for the home, D:/x for the data drive; HOME for the virtual home."""
+    if path == INICIO:
+        return "HOME"
     for raiz, nome in ((DADOS, "D:"), (CASA, "~")):
         if path == raiz or path.startswith(raiz + "/"):
             return nome + path[len(raiz):]
@@ -222,9 +243,10 @@ class Indice:
 class Arquivo:
     __slots__ = ("path", "nome", "tipo", "mtime", "tam", "r", "x", "y", "cx", "cy", "alvo_x", "alvo_y", "vx", "vy",
                  "escala", "visivel", "lente", "ox", "oy", "atraso", "nasce", "filhos", "sup", "pedido",
-                 "grupo", "variantes", "pontos", "rank", "parado")
+                 "grupo", "variantes", "pontos", "rank", "parado", "extra")
 
     def __init__(self, path, eh_dir, mtime, tam, grupo=0):
+        self.extra = None                          # bolhas da HOME: como mostrar (raio, anel, rótulo, uso do disco)
         self.path, self.nome = path, NOME_RAIZ.get(path) or os.path.basename(path) or path
         self.grupo = grupo                         # > 0: a folder standing for that many results inside it
         self.tipo = "grupo" if grupo else tipo_de(self.nome, eh_dir)
@@ -240,7 +262,7 @@ class Arquivo:
 
 # ---------- the heavy part (search, layout, filler), done in a thread: typing never stutters ----------
 
-SETOR = {"grupo": 180, "dir": 180, "other": -132, "arc": -132, "img": -55, "doc": 0, "code": 58, "aud": 122, "vid": 122}
+SETOR = {"grupo": 180, "dir": 180, "disco": 180, "other": -132, "arc": -132, "img": -55, "doc": 0, "code": 58, "aud": 122, "vid": 122}
 NOME_SETOR = {180: "FOLDERS", -132: "OTHER", -55: "IMAGES", 0: "DOCS", 58: "CODE", 122: "MEDIA"}
 SX, SY = 1.45, 0.82              # the orbit is an ellipse: screens are wide
 ANEIS = (75, 205, 320)           # ring distances past the empty middle (best results on the first ring)
@@ -262,15 +284,24 @@ def buscar(p, itens):
     anel = p["anel"]
     lo, hi = idade_fracao(anel[0] / ANEL_N), idade_fracao(anel[1] / ANEL_N)
 
-    def passa(eh_dir, nome, mtime):
-        if p["filtro"] and tipo_de(nome, eh_dir) != p["filtro"]:
-            return False
+    def na_janela(mtime):
         idade = agora - mtime
         return not ((anel[0] > 0 and idade > lo) or (anel[1] < ANEL_N and idade < hi))
 
+    def passa(eh_dir, nome, mtime):
+        if p["filtro"] and tipo_de(nome, eh_dir) != p["filtro"]:
+            return False
+        return na_janela(mtime)
+
     q = p["consulta"].strip().casefold()
     cands = []
-    if not q:
+    inicio = p["pasta"] == INICIO
+    if not q and inicio:
+        if p["filtro"] in (None, "dir") and tuple(anel) == (0, ANEL_N):
+            return itens_inicio(p)                          # a HOME de sempre
+        # um tipo/uma idade escolhidos na HOME: o mais novo daquilo em tudo
+        cands = recentes(itens, p["filtro"], None if tuple(anel) == (0, ANEL_N) else na_janela)
+    elif not q:
         try:
             with os.scandir(p["pasta"]) as it:
                 for e in it:
@@ -284,10 +315,9 @@ def buscar(p, itens):
                         cands.append((st.st_mtime, e.path, eh_dir, st.st_mtime, st.st_size))
         except OSError:
             pass
-        if p["pasta"] == CASA and DADOS in RAIZES and p["filtro"] in (None, "dir"):
-            cands.append((float("inf"), DADOS, True, agora, 0))        # the D: drive, always in the home view
     else:
-        bases = tuple(r + "/" for r in RAIZES) if p["pasta"] == CASA else (p["pasta"].rstrip("/") + "/",)
+        # da HOME a busca cobre todas as raízes do índice (~ e D:); de uma pasta, só o que está debaixo dela
+        bases = tuple(r + "/" for r in RAIZES) if inicio else (p["pasta"].rstrip("/") + "/",)
         caminhos, mtimes, tams, dirs, texto, inicios = itens if len(itens) == 6 else (*itens, "", array("q"))
         achados, pos = [], texto.find(q)
         while pos != -1 and len(achados) < 20000:
@@ -343,6 +373,137 @@ def buscar(p, itens):
     return unicos[:MAX_BOLHAS]
 
 
+def recentes(itens, filtro, na_janela=None):
+    """Na HOME, sem nada digitado, com um tipo (IMAGES, DOCS...) ou uma idade (a régua MODIFIED) escolhidos:
+    os arquivos mais novos daquele tipo em TUDO o que está no índice. O tipo é achado com UMA expressão regular
+    sobre todos os nomes de uma vez (velocidade de C), não com um loop Python chamando tipo_de() 250 mil vezes.
+    na_janela(mtime): a régua (None = qualquer idade)."""
+    if len(itens) != 6 or not itens[0]:
+        return []                                         # o índice ainda está sendo montado
+    caminhos, mtimes, tams, dirs, texto, inicios = itens
+    if filtro in TIPOS:
+        exts = "|".join(sorted((re.escape(e) for e in TIPOS[filtro][0]), key=len, reverse=True))
+        # ".ext" no fim de um nome ($ com re.M = antes de cada \n). O começo do nome sai pelo bisect.
+        idx = (bisect_right(inicios, m.start()) - 1 for m in re.finditer(r"\.(?:%s)$" % exts, texto, re.M))
+        bons = (i for i in idx if not dirs[i] and (na_janela is None or na_janela(mtimes[i])))
+    else:
+        quer_dir = filtro == "dir"
+        bons = (i for i in range(len(caminhos)) if (not quer_dir or dirs[i])
+                and (na_janela is None or na_janela(mtimes[i])))
+    return [(mtimes[i], caminhos[i], bool(dirs[i]), mtimes[i], tams[i])
+            for i in heapq.nlargest(300, bons, key=mtimes.__getitem__)]
+
+
+def _nome_disco(ponto, removivel):
+    if ponto == "/":
+        return "SYSTEM", "/"
+    if ponto == DADOS:
+        return "D:", "D:"
+    nome = os.path.basename(ponto.rstrip("/")) or ponto
+    return nome, ("USB" if removivel else nome[:3].upper())
+
+
+def _fora_do_ar(path):
+    """A pasta sumiu só porque o disco dela não está ligado agora (pendrive, D: desmontado)? Então não esquece."""
+    if path.startswith(visitas.REMOVIVEL):
+        return True
+    return (path == DADOS or path.startswith(DADOS + "/")) and not os.path.ismount(DADOS)
+
+
+def itens_inicio(p):
+    """A HOME virtual (roda na thread de trabalho: os stat/statvfs nunca encostam no desenho).
+    - frequent: as pastas de maior frecência (raio e anel pela nota: maior e mais perto = mais usada), com ~ e D:
+      sempre presentes; com pouco histórico, as pastas padrão entram como sementes pequenas.
+    - computer: cada disco de verdade no primeiro anel (com o espaço usado), ~ / as pastas padrão / a Lixeira no
+      segundo, cada uma do tamanho do quanto você usa (as posições ficam fixas: dá pra decorar onde está cada uma).
+    Cada item leva um 8º campo, o "extra" (raio, anel, nome, rótulo, uso), que orbitar() e desenhar_bolha() leem.
+    p["saida"] devolve à thread principal os discos achados (pro caminho e o Backspace) e as pastas que sumiram."""
+    agora = time.time()
+    vis = p.get("visitas") or {}
+    notas = {k: visitas.nota(v, agora) for k, v in vis.items()}
+    saida = p.setdefault("saida", {})
+    lista_discos = visitas.discos(DADOS)
+    saida["discos"] = [d for d, _ in lista_discos]
+    removiveis = {d for d, rem in lista_discos if rem}
+
+    def pasta(path, r, anel, nome=None):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        v = vis.get(path) or {}
+        if os.path.ismount(path) and path != CASA:              # a raiz de um disco: mostra como disco
+            return disco(path, r, anel, path in removiveis)
+        # ~ vira bolha com o nome da pasta (o seu usuário: um "~" solto some de tão pequeno); a estrela do caminho é "~"
+        extra = {"r": r, "nivel": anel, "nome": nome or os.path.basename(path) or NOME_RAIZ.get(path),
+                 "n": v.get("n", 0.0), "t": v.get("t", 0.0)}
+        return [path, True, st.st_mtime, 0, 0, 0, "dir", extra]
+
+    def disco(ponto, r, anel, removivel=False):
+        nome, glifo = _nome_disco(ponto, removivel)
+        esp = visitas.espaco(ponto)
+        extra = {"r": r, "nivel": anel, "nome": nome, "glifo": glifo, "uso": esp, "rotulo": nome}
+        if esp:
+            usado, total, livre = esp
+            extra["uso_txt"] = visitas.uso_txt(usado, total)
+            extra["rotulo"] = f"{nome} · {extra['uso_txt']}"
+            extra["livre_txt"] = visitas.livre_txt(livre)
+            extra["frac"] = usado / max(1, usado + livre)            # como o df: o reservado do root não conta
+        try:
+            mt = os.stat(ponto).st_mtime
+        except OSError:
+            mt = agora
+        return [ponto, True, mt, 0, 0, 0, "disco", extra]
+
+    itens = []
+    if p.get("modo") == "computer":
+        for ponto, rem in lista_discos:
+            itens.append(disco(ponto, 50 if rem else 60, 0, rem))
+        lugares = [CASA] + visitas.lugares() + ([LIXO] if os.path.isdir(LIXO) else [])
+        smax = max([notas.get(c, 0.0) for c in lugares] + [1.0])
+        for c in lugares:
+            r = 34 + 14 * math.sqrt(notas.get(c, 0.0) / smax)
+            itens.append(pasta(c, r, 1, "Trash" if c == LIXO else None))
+        return [it for it in itens if it is not None][:MAX_BOLHAS]
+
+    fixos = [CASA] + ([DADOS] if os.path.ismount(DADOS) else [])
+    escolhidas, sumidas = [], []
+    for c, s in sorted(notas.items(), key=lambda kv: -kv[1]):
+        if len(escolhidas) >= 16:
+            break
+        if c in fixos:
+            continue
+        if not os.path.isdir(c):
+            if not _fora_do_ar(c):
+                sumidas.append(c)                                    # apagada/renomeada: esquece
+            continue
+        escolhidas.append((c, s))
+    saida["sumidos"] = sumidas
+    if len(escolhidas) < 6:
+        # pouco histórico: as pastas padrão entram como sementes, com nota minúscula (ficam pequenas e por fora,
+        # e vão sendo empurradas pra fora da HOME pelas pastas que você usa de verdade)
+        for k, c in enumerate(visitas.lugares()):
+            if c not in fixos and all(c != e for e, _ in escolhidas):
+                escolhidas.append((c, 0.01 * (6 - k)))
+    # ~ e D: são âncoras: nota mínima 0,1 (acima das sementes), e crescem com o uso como as outras
+    todas = escolhidas + [(f, max(0.1, notas.get(f, 0.0))) for f in fixos]
+    todas.sort(key=lambda t: -t[1])
+    smax = max([s for _, s in todas] + [1.0])
+    # nomes iguais (dois "src") ganham a pasta de cima na frente: "aero-os/src"
+    base = [os.path.basename(c) for c, _ in todas]
+    for k, (c, s) in enumerate(todas):
+        r = 30 + 36 * math.sqrt(s / smax)
+        if c in fixos:
+            r = max(r, 44.0)
+        nome = None
+        if base.count(base[k]) > 1 and c not in fixos:
+            nome = os.path.basename(os.path.dirname(c)) + "/" + base[k]
+        itens.append(pasta(c, r, nivel(k), nome))
+    return [it for it in itens if it is not None][:MAX_BOLHAS]
+
+
 CENTROS = {}                     # slice centre of each kind in the last layout (for the slice names)
 
 
@@ -351,7 +512,9 @@ def orbitar(itens, w, h):
     docs right, code down-right, media down-left, folders left), then relaxation so nothing overlaps.
     Returns [(x, y, r)] around (0, 0)."""
     n = len(itens)
-    raios = [raio_rank(k) for k in range(n)]
+    # as bolhas da HOME trazem o próprio raio e anel no "extra" (pela nota de uso); as outras, pelo rank
+    extras = [it[7] if len(it) > 7 else None for it in itens]
+    raios = [e["r"] if e and "r" in e else raio_rank(k) for k, e in enumerate(extras)]
     R = [BURACO + a for a in ANEIS]
     # each kind's slice grows with how much it has (a folder full of folders uses the whole orbit),
     # keeping the order around the circle: folders, other, images, docs, code, media
@@ -367,7 +530,8 @@ def orbitar(itens, w, h):
         inicio += vaos[g]
     fatias = {}
     for k, it in enumerate(itens):
-        fatias.setdefault((nivel(k), SETOR[it[6]]), []).append(k)
+        nv = extras[k]["nivel"] if extras[k] and "nivel" in extras[k] else nivel(k)
+        fatias.setdefault((nv, SETOR[it[6]]), []).append(k)
     alvo = [(0.0, 0.0)] * n
     for (nv, g), ks in fatias.items():
         ang = centro[g]
@@ -496,7 +660,13 @@ class Orbita(nuvem.Nuvem):
         self.area.add_controller(rolar)
         self.set_child(raiz)
         self.indice = Indice()
-        self.pasta = CASA
+        self.pasta = INICIO
+        # o que o ORBIT aprende: as pastas visitadas (visitas.py). _aqui = [pasta, quando entrou, abriu algo?]:
+        # a visita só é contada ao sair dela, pra saber se você ficou ou só passou
+        self.visitas = visitas.Visitas()
+        self._aqui = None
+        self.modo = visitas.ler_modo()
+        self.discos = []                         # pontos de montagem achados na última HOME (caminho, Backspace)
         self.consulta = ""
         self.filtro = None
         self.anel = [0, ANEL_N]                  # handles (dot indexes): all ages
@@ -528,7 +698,10 @@ class Orbita(nuvem.Nuvem):
 
     def _disparar(self, g):
         self._agendado = None
-        p = {"consulta": self.consulta, "pasta": self.pasta, "filtro": self.filtro, "anel": list(self.anel)}
+        p = {"consulta": self.consulta, "pasta": self.pasta, "filtro": self.filtro, "anel": list(self.anel),
+             "modo": self.modo, "saida": {}}
+        if self.pasta == INICIO:
+            p["visitas"] = self.visitas.copia()      # uma cópia: a thread lê sem disputar com quem registra
         # the real size; before the first show the area measures 0 and the default size may be -1
         w = next((v for v in (self.area.get_width(), self.get_default_size()[0]) if v > 200), 1920)
         h = next((v for v in (self.area.get_height(), self.get_default_size()[1]) if v > 200), 1080)
@@ -537,20 +710,29 @@ class Orbita(nuvem.Nuvem):
         def trabalho():
             res = buscar(p, itens)
             xyr = orbitar(res, w, h)
-            GLib.idle_add(self._aplicar, g, res, xyr, semear(xyr, voo))
+            GLib.idle_add(self._aplicar, g, res, xyr, semear(xyr, voo), p["saida"])
         threading.Thread(target=trabalho, daemon=True).start()
         return False
 
-    def _aplicar(self, g, res, xyr, sementes):
+    def _aplicar(self, g, res, xyr, sementes, saida=None):
+        if saida:                                    # vale mesmo se esta resposta ficou velha
+            self.discos = saida.get("discos", self.discos)
+            self.visitas.esquecer(saida.get("sumidos", ()))
         if g != self.geracao:
             return False
         velhas = {(b.path, b.grupo > 0): b for b in self.bolhas}
         agora, novas = time.monotonic(), []
         abrindo = getattr(self, "_abrindo", False)
-        for k, (path, eh_dir, mtime, tam, grupo, variantes, _tipo) in enumerate(res):
+        for k, item in enumerate(res):
+            path, eh_dir, mtime, tam, grupo, variantes, tipo = item[:7]
+            extra = item[7] if len(item) > 7 else None
             chave = (path, grupo > 0)
             b = velhas.get(chave) or Arquivo(path, eh_dir, mtime, tam, grupo)
-            b.grupo, b.variantes, b.rank = grupo, variantes, k
+            b.grupo, b.variantes, b.rank, b.extra = grupo, variantes, k, extra
+            b.mtime, b.tam = mtime, tam
+            # a mesma pasta pode ser bolha da HOME (disco, nome "~") e depois resultado de busca: refeito sempre
+            b.tipo = "grupo" if grupo else tipo
+            b.nome = (extra or {}).get("nome") or NOME_RAIZ.get(path) or os.path.basename(path) or path
             if grupo:
                 b.filhos = grupo
             b.x, b.y, b.r = xyr[k]
@@ -660,18 +842,38 @@ class Orbita(nuvem.Nuvem):
     # ---------- navigation ----------
 
     def ir_para(self, pasta, manter=False):
-        """Go to a folder. manter=True keeps the search (a group bubble: its results, inside it)."""
+        """Go to a folder (or INICIO, the virtual home). manter=True keeps the search (a group bubble: its
+        results, inside it). Toda pasta mostrada vira uma visita (contada quando você sair dela)."""
+        self._sair_da_pasta()
         self.pasta = pasta
+        if pasta != INICIO:
+            self._aqui = [pasta, time.monotonic(), False]
         if not manter:
             self.consulta = ""
             self.campo.texto, self.campo.cursor, self.campo.tudo = "", 0, False
         self.atualizar(imediato=True)
 
+    def _sair_da_pasta(self):
+        """Saindo de uma pasta: agora ela é contada. Visita inteira se você ficou um pouco ou abriu algo nela;
+        uma pequena (visitas.PASSOU) se só passou a caminho de outra."""
+        aqui, self._aqui = self._aqui, None
+        if aqui:
+            pasta, t0, abriu = aqui
+            ficou = abriu or time.monotonic() - t0 >= visitas.FICOU
+            self.visitas.registrar(pasta, 1.0 if ficou else visitas.PASSOU)
+
+    def _abriu_arquivo(self, path):
+        """Um arquivo aberto pelo ORBIT (até de uma busca): a pasta dele é das "suas", ponto na hora."""
+        pasta = os.path.dirname(path)
+        self.visitas.registrar(pasta)
+        if self._aqui is not None and self._aqui[0] == pasta:
+            self._aqui[2] = True                          # e a estadia aqui conta inteira
+
     def abrir_item(self, b):
         if b.tipo == "grupo":
             self.ir_para(b.path, manter=True)
             return
-        if b.tipo == "dir":
+        if b.tipo in ("dir", "disco"):
             self.ir_para(b.path)
             return
         if visor.tipo_midia(b.path):
@@ -680,6 +882,7 @@ class Orbita(nuvem.Nuvem):
         self.abrir_fora(b)
 
     def abrir_fora(self, b):
+        self._abriu_arquivo(b.path)
         self.fechar(lambda: subprocess.Popen(["gio", "open", b.path], stdout=subprocess.DEVNULL,
                                              stderr=subprocess.DEVNULL, start_new_session=True))
 
@@ -687,6 +890,7 @@ class Orbita(nuvem.Nuvem):
 
     def abrir_visor(self, b):
         self.peek = None
+        self._abriu_arquivo(b.path)
         itens = visor.irmaos(b.path)
         self.vis = {"b": b, "itens": itens, "i": itens.index(b.path) if b.path in itens else 0,
                     "t0": time.monotonic(), "fechando": None, "atual": None}
@@ -817,12 +1021,13 @@ class Orbita(nuvem.Nuvem):
 
     def acao(self, nome, b):
         if nome == "OPEN":
-            if b.tipo in ("dir", "grupo"):
+            if b.tipo in ("dir", "grupo", "disco"):
                 self.abrir_item(b)
             else:
                 self.abrir_fora(b)                         # OPEN = its own app; click/Enter = the viewer
         elif nome == "SHOW":
-            pasta = os.path.dirname(b.path)
+            pasta = b.path if b.tipo == "disco" else os.path.dirname(b.path)    # um disco: ele mesmo
+            self.visitas.registrar(pasta)
             self.fechar(lambda: subprocess.Popen(["gio", "open", pasta], stdout=subprocess.DEVNULL,
                                                  stderr=subprocess.DEVNULL, start_new_session=True))
         elif nome == "COPY":
@@ -833,7 +1038,7 @@ class Orbita(nuvem.Nuvem):
             self.espiar(b)
 
     def espiar(self, b):
-        if visor.tipo_midia(b.path) and b.tipo not in ("dir", "grupo"):
+        if visor.tipo_midia(b.path) and b.tipo not in ("dir", "grupo", "disco"):
             self.abrir_visor(b)
             return
         if self.peek is not None and self.peek[0] is b:
@@ -851,7 +1056,7 @@ class Orbita(nuvem.Nuvem):
                         conteudo = bruto.decode("utf-8", "replace").expandtabs(4).splitlines()[:28]
                 except OSError:
                     pass
-            elif b.tipo in ("dir", "grupo"):
+            elif b.tipo in ("dir", "grupo", "disco"):
                 try:
                     conteudo = sorted((e.name + ("/" if e.is_dir() else "")) for e in os.scandir(b.path)
                                       if not e.name.startswith("."))[:28]
@@ -864,6 +1069,9 @@ class Orbita(nuvem.Nuvem):
 
     def abrir(self):
         self.ajustar_ao_monitor()
+        self._sair_da_pasta()
+        # sempre abre na HOME, no modo gravado agora (o Settings pode ter mudado enquanto estava fechado)
+        self.pasta, self.modo = INICIO, visitas.ler_modo()
         self.consulta, self.peek, self.foco, self.filtro = "", None, None, None
         self.editando = None
         self.campo.texto, self.campo.cursor, self.campo.tudo = "", 0, False
@@ -879,11 +1087,24 @@ class Orbita(nuvem.Nuvem):
         self.app_orbit.segurar()
 
     def _indice_pronto(self):
-        if self.get_visible() and self.consulta:
+        na_home_filtrando = self.pasta == INICIO and (self.filtro not in (None, "dir") or
+                                                      tuple(self.anel) != (0, ANEL_N))
+        if self.get_visible() and (self.consulta or na_home_filtrando):
             self.atualizar()
         self.area.queue_draw()
 
+    def trocar_modo(self, modo):
+        """A pílula FREQUENT | COMPUTER: grava (numa thread) e refaz a HOME. As bolhas que existem nos dois
+        modos (~, D:, as pastas padrão) deslizam até o lugar novo; as outras escorrem pra dentro."""
+        if modo == self.modo or modo not in visitas.MODOS:
+            return
+        self.modo = modo
+        threading.Thread(target=visitas.gravar_modo, args=(modo,), daemon=True).start()
+        self.atualizar(imediato=True)
+        self.animar()
+
     def fechar(self, depois=None):
+        self._sair_da_pasta()
         if self.vis is not None:
             self.visor.parar()
             self.vis, self.visor.janela = None, None
@@ -904,7 +1125,7 @@ class Orbita(nuvem.Nuvem):
                     or (self.vis is not None and (agora - self.vis["t0"] < 0.6 or self.vis["fechando"] is not None
                                                   or self.vis.get("mexendo")))
                     or (getattr(self, "aviso", None) and agora - self.aviso[1] < 1.6)
-                    or getattr(self, "_caixa_mexendo", False))
+                    or getattr(self, "_caixa_mexendo", False) or getattr(self, "_pilula_mexendo", False))
             if vivo:
                 GLib.idle_add(lambda: (self.animar(), False)[1])
         return r
@@ -992,6 +1213,7 @@ class Orbita(nuvem.Nuvem):
         if foco is not None and 0 <= foco < len(self.bolhas) and self.t_fechar is None:
             self.desenhar_satelites(cr, self.bolhas[foco], agora)
         self.desenhar_centro(cr, w, h, fundo, agora)
+        self.desenhar_modo(cr, w, h, fundo)
         if liq:
             self.formas_liquidas(agora, foco, fundo)
         self.desenhar_caminho(cr, w, h, fundo)
@@ -1036,7 +1258,7 @@ class Orbita(nuvem.Nuvem):
             bx, by, br, _a = self._onde(self.peek[0], agora)
             R = min(self.area.get_width(), self.area.get_height()) * 0.3
             formas.append((bx + (cx - bx) * pk, by + (cy - by) * pk, br + (R - br) * pk))
-        janelas = [self.caixa_jan] if getattr(self, "caixa_jan", None) else []
+        janelas = [j for j in (getattr(self, "caixa_jan", None), getattr(self, "pilula_jan", None)) if j]
         jan = self.visor_janela(agora)
         if jan is not None:
             janelas.append(jan)
@@ -1093,7 +1315,9 @@ class Orbita(nuvem.Nuvem):
                 cr.set_source_rgba(*FG, 0.12 * a)
                 cr.set_line_width(1.2)
                 cr.stroke()
-            if b.tipo in ("dir", "grupo"):
+            if b.tipo == "disco":
+                self.medidor(cr, b, x, y, r, a)
+            elif b.tipo in ("dir", "grupo"):
                 self.aglomerado(cr, b, x, y, r, a)
                 if b.tipo == "grupo":
                     self._texto_cor(cr, str(b.grupo), x, y, f"Doto Black {max(10, int(r * 0.5))}", FG, a)
@@ -1114,18 +1338,63 @@ class Orbita(nuvem.Nuvem):
             cr.set_source_rgba(*FG, 0.92 * a)
             cr.fill()
             self._texto_cor(cr, f"+{b.variantes}", bx, by, "Doto Black 9", (0.05, 0.05, 0.05), a)
-        if b.rank < 5 and not focada:                           # names only on the first ring (no pile-up)
+        e = b.extra
+        if e is not None and not focada:                        # HOME: todas têm nome (são poucas)
+            nome = e.get("rotulo") or b.nome
+            nome = nome if len(nome) <= 30 else nome[:28] + "…"
+            self._texto_cor(cr, nome, x, y + r + 14, "Inter 10.5", FG, 0.78 * a)
+        elif b.rank < 5 and not focada:                         # names only on the first ring (no pile-up)
             nome = b.nome if len(b.nome) <= 22 else b.nome[:20] + "…"
             if b.tipo == "grupo":
                 nome = f"{b.grupo} in {nome}"
             self._texto_cor(cr, nome, x, y + r + 14, "Inter 10.5", FG, 0.72 * a)
         elif focada:
-            nome = b.nome if len(b.nome) <= 34 else b.nome[:32] + "…"
+            nome = (e.get("rotulo") if e and b.tipo == "disco" else None) or b.nome
+            nome = nome if len(nome) <= 34 else nome[:32] + "…"
             self._texto_cor(cr, nome, x, y + r + 16, "Inter Semi-Bold 12.5", FG, a)
-            sub = (f"{b.grupo} RESULTS · ENTER TO OPEN" if b.tipo == "grupo" else
-                   f"{b.filhos} ITEMS" if b.tipo == "dir" and b.filhos is not None else
-                   "FOLDER" if b.tipo == "dir" else tamanho_txt(b.tam)) + " · " + idade_txt(b.mtime)
+            if b.tipo == "disco":
+                frac = (e or {}).get("frac")
+                sub = (f"{round(frac * 100)}% FULL · {e['livre_txt']} FREE" if frac is not None
+                       else "DRIVE · ENTER TO OPEN")
+            elif e is not None:                                  # uma pasta da HOME: o que o ORBIT sabe dela
+                partes = []
+                if e.get("n"):
+                    v = math.ceil(e["n"])
+                    partes.append(f"{v} VISIT{'S' if v != 1 else ''} · {idade_txt(e['t'])}")
+                if b.filhos is not None:
+                    partes.append(f"{b.filhos} ITEMS")
+                sub = " · ".join(partes) or "FOLDER"
+            else:
+                sub = (f"{b.grupo} RESULTS · ENTER TO OPEN" if b.tipo == "grupo" else
+                       f"{b.filhos} ITEMS" if b.tipo == "dir" and b.filhos is not None else
+                       "FOLDER" if b.tipo == "dir" else tamanho_txt(b.tam)) + " · " + idade_txt(b.mtime)
             self._texto_cor(cr, sub, x, y + r + 34, "Doto Black 10", FG, 0.5 * a)
+            if e is not None and b.tipo != "disco" and b.path != CASA:     # onde fica (pastas fundas: nome curto)
+                self._texto_cor(cr, exibir(b.path), x, y + r + 52, "Inter 10", FG, 0.4 * a)
+
+    def medidor(self, cr, b, x, y, r, a):
+        """Um disco: a letra dele no meio e um anel de pontos por dentro da borda, aceso no sentido do relógio a
+        partir do topo até onde o disco está cheio (vermelho passando de 90%: quase sem espaço)."""
+        e = b.extra or {}
+        frac = e.get("frac")
+        n = 44 if r > 40 else 32
+        acesos = round((frac or 0.0) * n)
+        raio, pr = r * 0.8, max(1.1, r * 0.034)
+        for aceso in (False, True):                       # dois preenchimentos (um por cor), não um por ponto
+            cr.new_path()
+            for k in range(n):
+                if (k < acesos) != aceso:
+                    continue
+                ang = -math.pi / 2 + 2 * math.pi * k / n
+                cr.new_sub_path()
+                cr.arc(x + raio * math.cos(ang), y + raio * math.sin(ang), pr if aceso else pr * 0.7, 0, 2 * math.pi)
+            if aceso:
+                cr.set_source_rgba(*(RED if (frac or 0) >= 0.9 else FG), 0.92 * a)
+            else:
+                cr.set_source_rgba(*FG, 0.2 * a)
+            cr.fill()
+        glifo = e.get("glifo", "•")
+        self._texto_cor(cr, glifo, x, y, f"Doto Black {max(9, int(r * (0.5 if len(glifo) <= 2 else 0.34)))}", FG, a)
 
     def aglomerado(self, cr, b, x, y, r, a):
         """A folder: one dot per item inside (up to 24), scattered like a little cluster (made once)."""
@@ -1148,6 +1417,8 @@ class Orbita(nuvem.Nuvem):
             cr.fill()
 
     def glifo(self, b):
+        if b.tipo == "disco":
+            return (b.extra or {}).get("glifo", "•"), FG
         if b.tipo in TIPOS:
             _e, g, cor = TIPOS[b.tipo]
             if b.tipo == "doc":
@@ -1288,17 +1559,93 @@ class Orbita(nuvem.Nuvem):
             cr.stroke()
             self.zonas.append(("anel", k, x, yy, 16))
 
+    # ---------- the virtual HOME: tops, the path from HOME, the mode pill ----------
+
+    def eh_raiz(self, b):
+        """Um disco inteiro, a ~ ou a Lixeira: nunca vão pra área de transferência como ARQUIVOS (colar copiaria
+        o disco todo, ou uma pasta pra dentro dela mesma). Ctrl+C neles copia só o caminho."""
+        return b.tipo == "disco" or b.path in (CASA, LIXO, "/")
+
+    def topos(self):
+        """Onde um caminho "começa" visto da HOME: ~, D:, a Lixeira e cada disco montado."""
+        return [CASA, DADOS, LIXO] + self.discos
+
+    def topo_de(self, pasta):
+        """O topo mais comprido que contém a pasta (a Lixeira ganha de ~, um pendrive ganha de /); senão /."""
+        melhor = "/"
+        for t in self.topos():
+            if (pasta == t or pasta.startswith(t.rstrip("/") + "/")) and len(t) > len(melhor):
+                melhor = t
+        return melhor
+
+    def cadeia(self):
+        """As estrelas do caminho: [(nome, pasta)] da HOME até aqui (a HOME e as 5 últimas, se for fundo)."""
+        passos = [("HOME", INICIO)]
+        if self.pasta == INICIO:
+            return passos
+        raiz = self.topo_de(self.pasta)
+        nomes = {CASA: "~", DADOS: "D:", LIXO: "TRASH", "/": "/"}
+        passos.append((nomes.get(raiz) or os.path.basename(raiz.rstrip("/")) or raiz, raiz))
+        atual = raiz
+        for parte in self.pasta[len(raiz):].split("/"):
+            if parte:
+                atual = os.path.join(atual, parte)
+                passos.append((parte, atual))
+        return passos if len(passos) <= 6 else passos[:1] + passos[-5:]
+
+    def desenhar_modo(self, cr, w, h, fundo):
+        """O botão da HOME: uma pílula líquida pequena no alto, FREQUENT | COMPUTER, com uma gota clara que
+        desliza até o lado ligado. Só na HOME sem nada digitado (fora dela a pílula derrete até sumir)."""
+        ligado = self.pasta == INICIO and not self.consulta and self.vis is None and self.peek is None
+        m = getattr(self, "_pilula", 0.0)
+        m += ((1.0 if ligado else 0.0) - m) * 0.25
+        if abs((1.0 if ligado else 0.0) - m) < 0.01:
+            m = 1.0 if ligado else 0.0
+        fonte = "Doto Black 11"
+        larg = [self._texto_cor(cr, nome, -9999, -9999, fonte, FG, 0) + 30 for nome, _ in MODOS_TELA]
+        cx, cy, total = w / 2, 100, sum(larg)
+        centros = [cx - total / 2 + larg[0] / 2, cx + total / 2 - larg[1] / 2]
+        i = 1 if self.modo == "computer" else 0
+        px = getattr(self, "_pil_x", None)
+        px = centros[i] if px is None or m == 0.0 else px + (centros[i] - px) * 0.3
+        if abs(centros[i] - px) < 0.3:
+            px = centros[i]
+        self._pilula, self._pil_x = m, px
+        self._pilula_mexendo = m not in (0.0, 1.0) or px != centros[i]
+        if m <= 0.0:
+            self.pilula_jan = None
+            return
+        hw, hh = 6 + (total / 2 + 4 - 6) * m, 6 + (17 - 6) * m          # nasce de um ponto, como a caixa da busca
+        self.pilula_jan = (cx, cy, hw, hh, hh)
+        if not self.liquido.ok:
+            cr.new_path()
+            cr.arc(cx - hw + hh, cy, hh, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(cx + hw - hh, cy, hh, -math.pi / 2, math.pi / 2)
+            cr.close_path()
+            cr.set_source_rgba(*FUNDO_BOLHA, 0.95 * fundo)
+            cr.fill()
+        a = min(1.0, max(0.0, (m - 0.5) / 0.5)) * fundo
+        if a <= 0.01:
+            return
+        t = (px - centros[0]) / ((centros[1] - centros[0]) or 1)       # 0 = FREQUENT, 1 = COMPUTER
+        gw, gh = (larg[0] + (larg[1] - larg[0]) * t) / 2 - 4, 12.5
+        cr.new_path()                                                    # a gota clara embaixo do modo ligado
+        cr.arc(px - gw + gh, cy, gh, math.pi / 2, 3 * math.pi / 2)
+        cr.arc(px + gw - gh, cy, gh, -math.pi / 2, math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(0.93, 0.92, 0.91, 0.95 * a)
+        cr.fill()
+        for k, (nome, modo) in enumerate(MODOS_TELA):
+            sob = abs(px - centros[k]) < larg[k] / 4                    # a gota está em cima deste: letra escura
+            self._texto_cor(cr, nome, centros[k], cy, fonte, (0.05, 0.05, 0.05) if sob else FG,
+                            a * (1.0 if sob else 0.55))
+            self.zonas.append(("modo", modo, centros[k], cy, larg[k] / 2))
+
     def desenhar_caminho(self, cr, w, h, fundo):
-        """The path as a constellation: one star per folder, joined by a dotted line."""
-        raiz = next((r for r in RAIZES[::-1] if self.pasta == r or self.pasta.startswith(r + "/")), None)
-        if raiz is not None:
-            partes = ([NOME_RAIZ[CASA]] if raiz != CASA else []) + [NOME_RAIZ[raiz]] + \
-                     [p for p in self.pasta[len(raiz):].split("/") if p]
-        else:
-            partes = ["/"] + [p for p in self.pasta.split("/") if p]
-        partes = partes[-6:]
+        """The path as a constellation: one star per folder, joined by a dotted line. The first star is HOME."""
+        passos = self.cadeia()
         pts, x = [], 80
-        for i, nome in enumerate(partes):
+        for i, (nome, _alvo) in enumerate(passos):
             y = 92 + (14 if i % 2 else -6)
             pts.append((x, y, nome))
             x += max(90, 12 * len(nome) + 40)
@@ -1319,11 +1666,7 @@ class Orbita(nuvem.Nuvem):
             cr.set_source_rgba(*(RED if ultimo else FG), (1 if ultimo else 0.7) * fundo)
             cr.fill()
             self._texto_cor(cr, nome.upper(), x, y - 20, "Doto Black 13", FG, (0.9 if ultimo else 0.5) * fundo)
-            subir = len(partes) - 1 - i
-            alvo = self.pasta
-            for _ in range(subir):
-                alvo = CASA if alvo in RAIZES[1:] else os.path.dirname(alvo)
-            self.zonas.append(("pasta", alvo, x, y - 8, 22))
+            self.zonas.append(("pasta", passos[i][1], x, y - 8, 22))
         # the path as editable text (click / Ctrl+L) and a COPY drop next to it
         editando = getattr(self, "editando", None)
         texto = editando if editando is not None else exibir(self.pasta)
@@ -1346,6 +1689,8 @@ class Orbita(nuvem.Nuvem):
             cr.set_source_rgba(*RED, fundo)
             cr.fill()
         self.zonas.append(("editar", None, x0 + larg / 2, y0, larg / 2))
+        if self.pasta == INICIO:
+            return                                           # a HOME não é um caminho: nada pra copiar
         bx = x0 + larg + 26
         cr.new_path()
         cr.arc(bx, y0, 18, 0, 2 * math.pi)
@@ -1448,7 +1793,10 @@ class Orbita(nuvem.Nuvem):
         cr.set_line_width(1.2)
         cr.stroke()
         self._texto_cor(cr, b.nome, cx, cy + R + 30, "Inter Semi-Bold 15", FG, 1)
-        sub = (tamanho_txt(b.tam) if b.tipo != "dir" else f"{b.filhos or 0} ITEMS") + " · " + idade_txt(b.mtime)
+        if b.tipo == "disco":
+            sub = (b.extra or {}).get("uso_txt", "DRIVE")
+        else:
+            sub = (tamanho_txt(b.tam) if b.tipo != "dir" else f"{b.filhos or 0} ITEMS") + " · " + idade_txt(b.mtime)
         self._texto_cor(cr, sub, cx, cy + R + 54, "Doto Black 12", FG, 0.5)
         onde = exibir(os.path.dirname(b.path))
         self._texto_cor(cr, onde, cx, cy + R + 76, "Inter 10.5", FG, 0.4)
@@ -1478,7 +1826,7 @@ class Orbita(nuvem.Nuvem):
 
     def zona_em(self, x, y):
         for tipo, valor, zx, zy, zr in reversed(self.zonas):
-            if tipo in ("chip", "editar"):
+            if tipo in ("chip", "editar", "modo"):
                 if abs(x - zx) <= zr and abs(y - zy) <= 17:
                     return tipo, valor
             elif math.hypot(x - zx, y - zy) <= zr:
@@ -1530,6 +1878,8 @@ class Orbita(nuvem.Nuvem):
             elif tipo == "chip":
                 self.filtro = valor
                 self.atualizar()
+            elif tipo == "modo":
+                self.trocar_modo(valor)
             elif tipo == "editar":
                 self.editando = exibir(self.pasta)
                 self.area.queue_draw()
@@ -1541,6 +1891,10 @@ class Orbita(nuvem.Nuvem):
         i = self.bolha_em(x, y)
         if i is not None and g.get_current_button() == 2:     # middle click: pick / unpick this file
             p = self.bolhas[i].path
+            if self.eh_raiz(self.bolhas[i]):
+                self.aviso = ("A WHOLE DRIVE OR HOME CAN'T BE PICKED", time.monotonic())
+                self.animar()
+                return
             if p in self.selecionados:
                 self.selecionados.remove(p)
             else:
@@ -1638,6 +1992,9 @@ class Orbita(nuvem.Nuvem):
             self.espiar(atual)                             # with text typed, space is just a space
             return True
         if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.campo.tudo:
+            if not self.selecionados and atual is not None and self.eh_raiz(atual):
+                self.acao("COPY", atual)                   # um disco / a ~: só o caminho, como texto
+                return True
             alvos = list(self.selecionados) or ([atual.path] if atual is not None else [])
             if alvos:
                 self.copiar_arquivos(alvos)
@@ -1659,9 +2016,11 @@ class Orbita(nuvem.Nuvem):
                 self.acao("COPY", atual)
             return True
         if tecla == Gdk.KEY_BackSpace:
-            if self.pasta in RAIZES[1:]:
-                self.ir_para(CASA)                       # D: lives next to your folders
-            elif self.pasta != "/":
+            if self.pasta == INICIO:
+                pass                                     # a HOME é o topo de tudo
+            elif self.pasta == "/" or self.pasta in self.topos():
+                self.ir_para(INICIO)                     # ~, D:, um disco, a Lixeira: um passo acima é a HOME
+            else:
                 self.ir_para(os.path.dirname(self.pasta.rstrip("/")) or "/")
             return True
         if tecla in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) and self.bolhas:
@@ -1694,18 +2053,23 @@ class Orbita(nuvem.Nuvem):
 
     def colar_arquivos(self):
         """Ctrl+V: copies of the files on the clipboard into the current folder (name (copy).ext when taken)."""
+        if self.pasta == INICIO:
+            self.aviso = ("OPEN A FOLDER TO PASTE INTO", time.monotonic())
+            self.animar()
+            return
         try:
             r = subprocess.run(["wl-paste", "-n", "-t", "text/uri-list"], capture_output=True, timeout=3)
         except (OSError, subprocess.SubprocessError):
             return
         fontes = [urllib.parse.unquote(u[7:]) for u in r.stdout.decode(errors="replace").split()
                   if u.startswith("file://")]
-        fontes = [f for f in fontes if os.path.exists(f)]
+        destino = self.pasta
+        # uma pasta nunca é colada dentro dela mesma (o copytree iria se copiando pra sempre)
+        fontes = [f for f in fontes if os.path.exists(f) and not (destino + "/").startswith(f.rstrip("/") + "/")]
         if not fontes:
             self.aviso = ("NOTHING TO PASTE", time.monotonic())
             self.animar()
             return
-        destino = self.pasta
         self.aviso = (f"PASTING {len(fontes)} …", time.monotonic())
         self.animar()
 
@@ -1753,6 +2117,8 @@ class Orbita(nuvem.Nuvem):
 
     def resolver(self, texto):
         t = texto.strip()
+        if t.upper() == "HOME":
+            return INICIO                                  # o nome da HOME virtual leva de volta pra ela
         if t.upper().startswith("D:"):
             t = DADOS + t[2:]
         elif t.startswith("~"):
@@ -1763,18 +2129,22 @@ class Orbita(nuvem.Nuvem):
         """Typing a path: Enter goes there (a file: its folder), Tab completes the folder name,
         Ctrl+V pastes, Esc cancels."""
         e = self.editando
+        # na HOME o campo começa com "HOME", que não é um caminho: digitar/colar troca o texto todo
+        novo = e == exibir(INICIO)
         if tecla == Gdk.KEY_Escape:
             self.editando = None
         elif tecla in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             alvo = self.resolver(e)
-            if os.path.isfile(alvo):
+            if alvo != INICIO and os.path.isfile(alvo):
                 alvo = os.path.dirname(alvo)
-            if os.path.isdir(alvo):
+            if alvo == INICIO or os.path.isdir(alvo):
                 self.editando = None
                 self.ir_para(alvo)
             else:
                 self.aviso = ("NOT FOUND", time.monotonic())
                 self.animar()
+        elif tecla == Gdk.KEY_Tab and (novo or not e):
+            self.editando = "~/"                           # de "HOME" (ou vazio), o Tab começa pela ~
         elif tecla == Gdk.KEY_Tab:
             base = self.resolver(e)
             pai, parte = (base, "") if e.endswith("/") else os.path.split(base)
@@ -1786,21 +2156,22 @@ class Orbita(nuvem.Nuvem):
             if nomes:
                 self.editando = exibir(os.path.join(pai, nomes[0])) + "/"
         elif tecla == Gdk.KEY_BackSpace:
-            self.editando = e[:-1]
+            self.editando = "" if novo else e[:-1]
         elif ctrl and tecla in (Gdk.KEY_v, Gdk.KEY_V):
             def colado(cb, res):
                 try:
                     t = cb.read_text_finish(res)
                 except GLib.Error:
                     t = None
-                if t and self.editando is not None:
-                    self.editando += t.strip().splitlines()[0]
+                if t and t.strip() and self.editando is not None:
+                    base = "" if self.editando == exibir(INICIO) else self.editando
+                    self.editando = base + t.strip().splitlines()[0]
                     self.area.queue_draw()
             self.get_display().get_clipboard().read_text_async(None, colado)
         else:
             u = Gdk.keyval_to_unicode(tecla)
             if u and chr(u).isprintable() and not ctrl:
-                self.editando = e + chr(u)
+                self.editando = ("" if novo else e) + chr(u)
         self.area.queue_draw()
         return True
 
