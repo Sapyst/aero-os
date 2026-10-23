@@ -218,7 +218,16 @@ fn fontes_do_tipo(tipo: &str) -> Vec<PathBuf> {
 
 /// Retorna `Some(true)` se o carregador está conectado, `Some(false)` se está na bateria,
 /// ou `None` se a máquina não tem fonte de tomada/bateria.
+/// (Aceita `~/.config/aero-shell/.simulacao_tomada` com `"0"` ou `"1"` para testes de simulação.)
 pub fn na_tomada() -> Option<bool> {
+    let sim = pasta_home().join(".config/aero-shell/.simulacao_tomada");
+    if let Ok(v) = fs::read_to_string(&sim) {
+        match v.trim() {
+            "0" | "false" => return Some(false),
+            "1" | "true" => return Some(true),
+            _ => {}
+        }
+    }
     let adaptadores: Vec<PathBuf> = fontes_do_tipo("Mains")
         .into_iter()
         .filter(|p| ler_sysfs(p.join("online")).is_some())
@@ -694,27 +703,32 @@ impl EstadoBateria {
         let tomada = na_tomada();
 
         if tomada != self.tomada {
-            if tomada == Some(true) {
-                // O relógio das 24 h só zera numa ligação de verdade (não quando o daemon reinicia)
-                if self.tomada == Some(false) || self.mem.tomada_desde.is_none() {
-                    self.mem.tomada_desde = Some(agora_unix());
-                }
-                self.salvando = None;
-            } else {
-                self.mem.tomada_desde = None;
-                if self.tomada.is_some() {
-                    // Tirou da tomada (não é a primeira leitura ao iniciar)
-                    unsafe {
-                        libc::sync();
+            let simulando = pasta_home()
+                .join(".config/aero-shell/.simulacao_tomada")
+                .exists();
+            if !simulando {
+                if tomada == Some(true) {
+                    // O relógio das 24 h só zera numa ligação de verdade (não quando o daemon reinicia)
+                    if self.tomada == Some(false) || self.mem.tomada_desde.is_none() {
+                        self.mem.tomada_desde = Some(agora_unix());
                     }
-                    if cfg.cheia_uma_vez {
-                        cfg.cheia_uma_vez = false;
-                        gravar_config(&cfg);
+                    self.salvando = None;
+                } else {
+                    self.mem.tomada_desde = None;
+                    if self.tomada.is_some() {
+                        // Tirou da tomada (não é a primeira leitura ao iniciar)
+                        unsafe {
+                            libc::sync();
+                        }
+                        if cfg.cheia_uma_vez {
+                            cfg.cheia_uma_vez = false;
+                            gravar_config(&cfg);
+                        }
                     }
                 }
+                gravar_memoria(&self.mem);
             }
             self.tomada = tomada;
-            gravar_memoria(&self.mem);
             atualizar_barra();
         }
 

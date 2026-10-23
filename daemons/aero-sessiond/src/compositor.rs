@@ -22,7 +22,6 @@ use std::time::Duration;
 
 /// Eventos emitidos pelo compositor que interessam ao `aero-sessiond`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum EventoCompositor {
     /// Uma janela foi aberta: `(endereco_sem_0x, classe)`.
     JanelaAberta { endereco: String, classe: String },
@@ -34,9 +33,68 @@ pub enum EventoCompositor {
     WorkspaceMudou(i32),
 }
 
+/// A taxa que o DONO escolheu para esse monitor em `~/.config/hypr/monitores.conf` (Settings → Display).
+/// É o TETO: o monitor pode anunciar modos que ele não aguenta direito (o Dell DP-2 anuncia 180 Hz,
+/// mas o dono usa 144 Hz e passar disso pode deixar a tela sem imagem).
+/// Retorna `None` se o monitor não tiver regra própria com `@` no `monitores.conf`.
+pub fn teto_do_dono(nome: &str) -> Option<f64> {
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/sapista".to_string());
+    let caminho = PathBuf::from(home).join(".config/hypr/monitores.conf");
+    let txt = fs::read_to_string(caminho).ok()?;
+    let prefixo = format!("monitor={nome},");
+    for l in txt.lines() {
+        let l = l.trim();
+        if l.starts_with(&prefixo)
+            && l.contains('@')
+            && let Some(modo) = l.split(',').nth(1)
+            && let Some((_, hz_str)) = modo.split_once('@')
+        {
+            let limpo = hz_str.strip_suffix("Hz").unwrap_or(hz_str).trim();
+            if let Ok(hz) = limpo.parse::<f64>() {
+                return Some(hz);
+            }
+        }
+    }
+    None
+}
+
+/// Grava a regra do monitor em `~/.config/hypr/taxa-atual.conf` (atômico: `.tmp` + `rename`;
+/// não regrava se o conteúdo for igual), reproduzindo `servicos/telas.py::lembrar_taxa`.
+/// O `hyprland.conf` lê esse arquivo logo depois do `monitores.conf`, impedindo que um `hyprctl reload`
+/// volte o modo do monitor e faça a tela piscar/apagar.
+pub fn lembrar_taxa(nome: &str, regra: &str) {
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/sapista".to_string());
+    let taxa_conf = PathBuf::from(home).join(".config/hypr/taxa-atual.conf");
+    let prefixo_este = format!("monitor={nome},");
+    let mut linhas: Vec<String> = Vec::new();
+    if let Ok(atual) = fs::read_to_string(&taxa_conf) {
+        for l in atual.lines() {
+            if l.starts_with("monitor=") && !l.starts_with(&prefixo_este) {
+                linhas.push(l.to_string());
+            }
+        }
+    }
+    linhas.push(format!("monitor={regra}"));
+    let novo = format!(
+        "# Gerado pelo taxa.py (taxa de atualização em uso). Não editar.\n{}\n",
+        linhas.join("\n")
+    );
+    if let Ok(atual) = fs::read_to_string(&taxa_conf)
+        && atual == novo
+    {
+        return;
+    }
+    if let Some(dir) = taxa_conf.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let tmp = taxa_conf.with_extension("conf.tmp");
+    if fs::write(&tmp, &novo).is_ok() {
+        let _ = fs::rename(&tmp, &taxa_conf);
+    }
+}
+
 /// Dados de um monitor conectado e ativo, independentes do compositor.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MonitorInfo {
     pub nome: String,
     pub largura: i32,
@@ -53,7 +111,6 @@ pub struct MonitorInfo {
 impl MonitorInfo {
     /// Extrai todas as taxas de atualização (Hz) disponíveis na resolução atual do monitor,
     /// ordenadas da menor para a maior (mesma lógica de `servicos/telas.py::taxas`).
-    #[allow(dead_code)]
     pub fn taxas_na_resolucao(&self) -> Vec<f64> {
         let prefixo = format!("{}x{}@", self.largura, self.altura);
         let mut taxas: Vec<f64> = Vec::new();
@@ -71,12 +128,31 @@ impl MonitorInfo {
         taxas
     }
 
-    /// Calcula a taxa-alvo para o modo pedido (`"max"` = maior disponível; `"60"` = mais próxima de 60 Hz).
-    #[allow(dead_code)]
+    /// Calcula a taxa-alvo para o modo pedido (`"max"` = maior até o teto do dono em `monitores.conf`;
+    /// `"60"` = mais próxima de 60 Hz), reproduzindo exatamente `servicos/telas.py::alvo`.
     pub fn taxa_alvo(&self, modo: &str) -> f64 {
-        let taxas = self.taxas_na_resolucao();
+        let mut taxas = self.taxas_na_resolucao();
         if taxas.is_empty() {
-            return self.taxa_atual;
+            taxas.push(self.taxa_atual);
+        }
+        if let Some(teto) = teto_do_dono(&self.nome)
+            && teto > 0.0
+        {
+            let ate_o_teto: Vec<f64> = taxas
+                .iter()
+                .copied()
+                .filter(|&hz| hz <= teto + 0.5)
+                .collect();
+            if !ate_o_teto.is_empty() {
+                taxas = ate_o_teto;
+            } else if let Some(&mais_perto) = taxas.iter().min_by(|&&a, &&b| {
+                (a - teto)
+                    .abs()
+                    .partial_cmp(&(b - teto).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                taxas = vec![mais_perto];
+            }
         }
         if modo == "max" {
             taxas.into_iter().fold(f64::MIN, f64::max)
@@ -100,16 +176,13 @@ pub trait Compositor: Send + Sync {
     fn janelas_abertas(&self) -> Vec<(String, String)>;
 
     /// Lista todos os monitores ativos (não desativados).
-    #[allow(dead_code)]
     fn monitores(&self) -> Vec<MonitorInfo>;
 
     /// Aplica uma nova taxa de atualização (`hz`) a um monitor preservando resolução, posição,
-    /// escala, espelhamento e rotação.
-    #[allow(dead_code)]
+    /// escala, espelhamento e rotação, respeitando o teto do dono e gravando `taxa-atual.conf`.
     fn definir_taxa(&self, monitor: &MonitorInfo, hz: f64) -> bool;
 
     /// Retorna o ID numérico da área de trabalho ativa no momento (0 se indisponível).
-    #[allow(dead_code)]
     fn area_ativa(&self) -> i32;
 
     /// Escuta continuamente o fluxo de eventos do compositor (bloqueante; rodar em thread própria)
@@ -139,7 +212,6 @@ impl HyprlandCompositor {
                 return Some(candidata);
             }
         }
-        // Reserva caso HYPRLAND_INSTANCE_SIGNATURE não esteja no ambiente ou tenha mudado
         if let Ok(entradas) = fs::read_dir(&base) {
             for e in entradas.flatten() {
                 let p = e.path();
@@ -262,6 +334,11 @@ impl Compositor for HyprlandCompositor {
     }
 
     fn definir_taxa(&self, m: &MonitorInfo, hz: f64) -> bool {
+        // Trava de segurança: nunca aplicar uma taxa acima do teto configurado pelo dono no monitores.conf
+        let hz = match teto_do_dono(&m.nome) {
+            Some(teto) if teto > 0.0 && hz > teto + 0.5 => teto,
+            _ => hz,
+        };
         let mut regra = format!(
             "{},{}x{}@{:.2},{}x{},{}",
             m.nome,
@@ -278,6 +355,7 @@ impl Compositor for HyprlandCompositor {
         if m.transformacao != 0 {
             regra.push_str(&format!(",transform,{}", m.transformacao));
         }
+        lembrar_taxa(&m.nome, &regra);
         Self::pedir(&format!("keyword monitor {regra}")).is_some()
     }
 
@@ -302,7 +380,6 @@ impl Compositor for HyprlandCompositor {
                     };
                     match nome {
                         "openwindow" => {
-                            // Formato: ENDERECO,WORKSPACE,CLASSE,TITULO
                             let mut partes = dados.splitn(4, ',');
                             let end = partes.next().unwrap_or("").trim_start_matches("0x").to_string();
                             let _ws = partes.next();

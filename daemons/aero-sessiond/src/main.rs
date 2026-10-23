@@ -4,8 +4,9 @@
 //! 1. **`bateria`** (`bateria.py` / `aero-energia`): limitador inteligente de carga (`smart`, `fixo`,
 //!    `bypass`, `desligado`, `cheia_uma_vez`), modo de energia automático (`powerprofilesctl`) e
 //!    "salvar o momento" (hibernar/suspender em bateria crítica).
-//! 2. **`taxa`** (`taxa.py` / `aero-hz`): taxa de atualização adaptativa (máxima na tomada e em jogos,
-//!    60 Hz na bateria), falando com o compositor exclusivamente através da trait [`Compositor`].
+//! 2. **`taxa`** (`taxa.py` / `aero-hz`): taxa de atualização adaptativa (máxima até o teto do dono
+//!    em `monitores.conf` na tomada e em jogos, 60 Hz na bateria, gravando `taxa-atual.conf`),
+//!    falando com o compositor exclusivamente através da trait [`Compositor`].
 //! 3. **`icones`** (`icones.py --watch` / `aero-icones --watch`): troca o tema de ícones por área de
 //!    trabalho (`Aero-ws<N>` vs `Aero`) e dispara `icones.py --retint` quando as cores mudam.
 //!
@@ -24,7 +25,8 @@ mod taxa;
 use compositor::{Compositor, EventoCompositor, HyprlandCompositor};
 use std::env;
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -44,6 +46,57 @@ enum EventoSessao {
     FontesIconesMudaram,
     /// Evento vindo do compositor (janela abriu/fechou, monitor/config, workspace).
     Compositor(EventoCompositor),
+}
+
+/// Garante que apenas uma instância residente de `taxa.py`, `bateria.py` e `icones.py --watch`
+/// seja encerrada pelo PID exato lido de `/proc/<pid>/cmdline` (sem `pkill -f`).
+pub fn encerrar_ajudantes_python_antigos() {
+    let meu_pid = unsafe { libc::getpid() };
+    let Ok(entradas) = fs::read_dir("/proc") else {
+        return;
+    };
+    for e in entradas.flatten() {
+        let Some(nome) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = nome.parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid <= 1 || pid == meu_pid {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(e.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<&str> = cmdline
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .collect();
+        let Some(&prog) = args.first() else {
+            continue;
+        };
+        if !prog.contains("python") {
+            continue;
+        }
+        // Ignora chamadas rápidas de linha de comando (--status, --waybar, --alternar, --cheia)
+        if args
+            .iter()
+            .any(|a| matches!(*a, "--status" | "--waybar" | "--alternar" | "--cheia"))
+        {
+            continue;
+        }
+        let eh_ajudante_residente = args
+            .iter()
+            .any(|a| a.ends_with("/aero-shell/taxa.py") || a.ends_with("/aero-shell/bateria.py"))
+            || (args.iter().any(|a| a.ends_with("/aero-shell/icones.py"))
+                && args.contains(&"--watch"));
+        if eh_ajudante_residente {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
 }
 
 /// Abre um socket `AF_NETLINK` (`NETLINK_KOBJECT_UEVENT`) para receber eventos `power_supply`
@@ -114,7 +167,11 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
             libc::inotify_add_watch(
                 fd,
                 cstr.as_ptr(),
-                libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_MODIFY,
+                libc::IN_CLOSE_WRITE
+                    | libc::IN_MOVED_TO
+                    | libc::IN_CREATE
+                    | libc::IN_MODIFY
+                    | libc::IN_DELETE,
             )
         };
 
@@ -137,6 +194,7 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
             let mut pos = 0usize;
             let total = n as usize;
             let mut viu_energia = false;
+            let mut viu_tomada_sim = false;
             let mut viu_taxa = false;
             let mut viu_icones = false;
 
@@ -151,6 +209,7 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
                         if ev.wd == wd_aero {
                             match nome {
                                 "energia.json" => viu_energia = true,
+                                ".simulacao_tomada" => viu_tomada_sim = true,
                                 "taxa.json" => viu_taxa = true,
                                 "widgets.json" => viu_icones = true,
                                 _ => {}
@@ -166,6 +225,9 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
                 pos = nome_inicio + len;
             }
 
+            if viu_tomada_sim {
+                let _ = tx.send(EventoSessao::EnergiaMudou);
+            }
             if viu_energia {
                 let _ = tx.send(EventoSessao::ConfigEnergiaMudou);
             }
@@ -190,6 +252,25 @@ fn menor_prazo(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 }
 
 fn rodar_daemon() {
+    // Trava exclusiva para garantir que apenas UMA instância do aero-sessiond rode por vez
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let lock_path = format!("{xdg}/aero-sessiond.lock");
+    let Ok(lock_file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    else {
+        return;
+    };
+    let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return;
+    }
+
+    // No modo Rust, garante que nenhum taxa.py, bateria.py ou icones.py --watch fique rodando em paralelo
+    encerrar_ajudantes_python_antigos();
+
     let (tx, rx): (Sender<EventoSessao>, Receiver<EventoSessao>) = mpsc::channel();
 
     let janelas_iniciais = COMPOSITOR.janelas_abertas();
@@ -287,6 +368,7 @@ fn main() {
         "--alternar" => bateria::cmd_alternar(),
         "--cheia" => bateria::cmd_cheia(),
         "--hz-status" => taxa::cmd_status(&COMPOSITOR),
+        "--encerrar-python" => encerrar_ajudantes_python_antigos(),
         "--status" if prog == "aero-hz" => taxa::cmd_status(&COMPOSITOR),
         "--status" | "--battery-status" => bateria::cmd_status(),
         _ => rodar_daemon(),

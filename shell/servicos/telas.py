@@ -21,8 +21,26 @@ def taxas(m):
     return sorted({float(s[len(res):].removesuffix("Hz")) for s in m.get("availableModes", []) if s.startswith(res)})
 
 
+def teto_do_dono(nome):
+    """A taxa que o DONO escolheu para esse monitor no monitores.conf (Settings → Display). É o TETO: o
+    monitor anuncia modos que ele não aguenta direito (o Dell anuncia 180 Hz, mas o dono usa 144), e
+    passar dele pode deixar a tela sem imagem. None = monitor sem regra própria."""
+    try:
+        with open(os.path.expanduser("~/.config/hypr/monitores.conf")) as f:
+            for l in f:
+                l = l.strip()
+                if l.startswith(f"monitor={nome},") and "@" in l:
+                    return float(l.split(",")[1].split("@")[1].removesuffix("Hz"))
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def alvo(m, modo):
     t = taxas(m) or [m["refreshRate"]]
+    teto = teto_do_dono(m["name"])
+    if teto:
+        t = [hz for hz in t if hz <= teto + 0.5] or [min(t, key=lambda hz: abs(hz - teto))]
     return max(t) if modo == "max" else min(t, key=lambda hz: abs(hz - 60))
 
 

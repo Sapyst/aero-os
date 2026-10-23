@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Taxa de atualização adaptativa (tomada = máximo, bateria = 60 Hz, jogo = máximo).
+# Taxa de atualização adaptativa (tomada = máximo até o teto do monitores.conf, bateria = 60 Hz, jogo = máximo).
 # Sem argumentos (daemon): supervisionado pelo aero-supervise (aero-sessiond em Rust, com volta automática para Python).
 # Com --status: executa direto no aero-sessiond --hz-status (ou taxa.py --status como reserva).
 if [ "$1" = --status ]; then
@@ -9,4 +9,4 @@ if [ "$1" = --status ]; then
     exec python3 -I "$HOME/.local/share/aero-shell/taxa.py" "$@"
 fi
 exec "$HOME/.local/bin/aero-supervise" session "Session" "$HOME/.local/bin/aero-sessiond" \
-    "bash -c 'trap \"kill \$(jobs -p) 2>/dev/null\" EXIT TERM INT; python3 -I \"\$HOME/.local/share/aero-shell/bateria.py\" & python3 -I \"\$HOME/.local/share/aero-shell/taxa.py\" & python3 -I \"\$HOME/.local/share/aero-shell/icones.py\" --watch & wait'"
+    "bash -c 'trap \"kill \$(jobs -p) 2>/dev/null\" EXIT TERM INT; p=\$(pidof aero-sessiond) && [ -n \"\$p\" ] && kill \$p 2>/dev/null; \"\$HOME/.local/bin/aero-sessiond\" --encerrar-python 2>/dev/null; python3 -I \"\$HOME/.local/share/aero-shell/bateria.py\" & python3 -I \"\$HOME/.local/share/aero-shell/taxa.py\" & python3 -I \"\$HOME/.local/share/aero-shell/icones.py\" --watch & wait'"

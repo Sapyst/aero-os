@@ -4,6 +4,6 @@
 # a interface e o gerador (--auto, --retint, --status, etc.) continuam em Python sob demanda.
 if [ "$1" = --watch ]; then
     exec "$HOME/.local/bin/aero-supervise" session "Session" "$HOME/.local/bin/aero-sessiond" \
-        "bash -c 'trap \"kill \$(jobs -p) 2>/dev/null\" EXIT TERM INT; python3 -I \"\$HOME/.local/share/aero-shell/bateria.py\" & python3 -I \"\$HOME/.local/share/aero-shell/taxa.py\" & python3 -I \"\$HOME/.local/share/aero-shell/icones.py\" --watch & wait'"
+        "bash -c 'trap \"kill \$(jobs -p) 2>/dev/null\" EXIT TERM INT; p=\$(pidof aero-sessiond) && [ -n \"\$p\" ] && kill \$p 2>/dev/null; \"\$HOME/.local/bin/aero-sessiond\" --encerrar-python 2>/dev/null; python3 -I \"\$HOME/.local/share/aero-shell/bateria.py\" & python3 -I \"\$HOME/.local/share/aero-shell/taxa.py\" & python3 -I \"\$HOME/.local/share/aero-shell/icones.py\" --watch & wait'"
 fi
 exec python3 -I "$HOME/.local/share/aero-shell/icones.py" "$@"
