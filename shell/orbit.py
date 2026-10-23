@@ -1201,10 +1201,20 @@ class Orbita(nuvem.Nuvem):
                 cr.fill()
             a_txt = min(1.0, max(0.0, (m - 0.55) / 0.45)) * fundo
             if texto and a_txt > 0:
-                if getattr(self, "tudo", False):                   # Ctrl+A: everything selected
-                    cr.rectangle(cx - tw / 2 - 4, cy - 17, tw + 8, 34)
-                    cr.set_source_rgba(*RED, 0.32 * a_txt)
-                    cr.fill()
+                if getattr(self, "tudo", False):                   # Ctrl+A: the letters get a red outline
+                    lay = PangoCairo.create_layout(cr)
+                    lay.set_font_description(Pango.FontDescription.from_string(fonte))
+                    lay.set_text(texto, -1)
+                    lw, lh = lay.get_pixel_size()
+                    cr.new_path()
+                    cr.move_to(cx - lw / 2, cy - lh / 2)
+                    PangoCairo.layout_path(cr, lay)
+                    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+                    for largura, alfa in ((7, 0.12), (4.5, 0.25), (2.2, 0.95)):    # soft glow, then the line
+                        cr.set_source_rgba(*RED, alfa * a_txt)
+                        cr.set_line_width(largura)
+                        cr.stroke_preserve()
+                    cr.new_path()
                 self._texto_cor(cr, texto, cx, cy, fonte, FG, a_txt)
                 pre = texto[:self.cursor]
                 pw = self._texto_cor(cr, pre, -9999, -9999, fonte, FG, 0) if pre else 0
