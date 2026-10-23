@@ -221,4 +221,6 @@ Read [`install.md`](install.md), take what you like, and adapt paths and hardwar
 
 ## License
 
-MIT for everything written here (see `LICENSE`); `file-manager/` keeps its own MIT notice and `fonts/doto/` its OFL.
+[GPL-3.0-or-later](LICENSE) for everything written here: use it, change it, share it, as long as what you share stays
+open under the same terms. `file-manager/` keeps its upstream MIT notice and `fonts/doto/` its OFL.
+Releases before this change were MIT and stay MIT.
