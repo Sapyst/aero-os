@@ -509,8 +509,9 @@ class Orbita(nuvem.Nuvem):
     def _disparar(self, g):
         self._agendado = None
         p = {"consulta": self.consulta, "pasta": self.pasta, "filtro": self.filtro, "anel": list(self.anel)}
-        w = self.area.get_width() or self.get_default_size()[0] or 1920
-        h = self.area.get_height() or self.get_default_size()[1] or 1080
+        # the real size; before the first show the area measures 0 and the default size may be -1
+        w = next((v for v in (self.area.get_width(), self.get_default_size()[0]) if v > 200), 1920)
+        h = next((v for v in (self.area.get_height(), self.get_default_size()[1]) if v > 200), 1080)
         itens, voo = self.indice.itens, getattr(self, "_abrindo", False)
 
         def trabalho():
