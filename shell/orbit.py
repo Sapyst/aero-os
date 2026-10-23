@@ -216,7 +216,7 @@ class Indice:
 class Arquivo:
     __slots__ = ("path", "nome", "tipo", "mtime", "tam", "r", "x", "y", "cx", "cy", "alvo_x", "alvo_y", "vx", "vy",
                  "escala", "visivel", "lente", "ox", "oy", "atraso", "nasce", "filhos", "sup", "pedido",
-                 "grupo", "variantes", "pontos", "rank")
+                 "grupo", "variantes", "pontos", "rank", "parado")
 
     def __init__(self, path, eh_dir, mtime, tam, grupo=0):
         self.path, self.nome = path, NOME_RAIZ.get(path) or os.path.basename(path) or path
@@ -229,7 +229,7 @@ class Arquivo:
         self.escala, self.visivel, self.atraso = 1.0, 1.0, 0.0
         self.nasce = time.monotonic()
         self.filhos = grupo or None
-        self.sup, self.pedido, self.pontos = None, False, None
+        self.sup, self.pedido, self.pontos, self.parado = None, False, None, None
 
 
 # ---------- the heavy part (search, layout, filler), done in a thread: typing never stutters ----------
@@ -575,8 +575,62 @@ class Orbita(nuvem.Nuvem):
         if filhos is not None:
             b.filhos, b.pontos = filhos, None
         if pb is not None:
-            b.sup = pixbuf_superficie(pb)
+            b.sup = b.parado = pixbuf_superficie(pb)
         self.area.queue_draw()
+        return False
+
+    # ---------- GIFs: only the one under the pointer plays ----------
+
+    def gif_foco(self, b):
+        """Called every frame with the focused bubble. A GIF starts playing when it gets the focus and goes
+        back to its still thumbnail when it loses it (one animation decoded at a time: cheap)."""
+        atual = getattr(self, "gif_atual", None)
+        if b is atual:
+            return
+        if atual is not None:
+            atual.sup = atual.parado
+        self.gif_anim = None
+        if getattr(self, "gif_fonte", None):
+            GLib.source_remove(self.gif_fonte)
+            self.gif_fonte = None
+        eh_gif = b is not None and b.nome.casefold().endswith(".gif") and b.tam < 30_000_000
+        self.gif_atual = b if eh_gif else None
+        if not eh_gif:
+            return
+
+        def carregar():
+            try:
+                anim = GdkPixbuf.PixbufAnimation.new_from_file(b.path)
+            except GLib.Error:
+                return
+            GLib.idle_add(self._gif_pronto, b, anim)
+        threading.Thread(target=carregar, daemon=True).start()
+
+    def _gif_pronto(self, b, anim):
+        if b is not getattr(self, "gif_atual", None) or anim.is_static_image():
+            return False
+        self.gif_anim = anim.get_iter(None)
+        self._gif_quadro()
+        return False
+
+    def _gif_quadro(self):
+        self.gif_fonte = None
+        b, it = getattr(self, "gif_atual", None), getattr(self, "gif_anim", None)
+        if b is None or it is None or not self.get_visible() or self.t_fechar is not None:
+            return False
+        it.advance(None)
+        pb = it.get_pixbuf()
+        w, h = pb.get_width(), pb.get_height()
+        k = 240 / max(w, h)
+        b.sup = pixbuf_superficie(pb.scale_simple(max(1, int(w * k)), max(1, int(h * k)), GdkPixbuf.InterpType.BILINEAR)
+                                  if k < 1 else pb)
+        if self.peek is not None and self.peek[0] is b:          # the big preview plays too
+            k = 900 / max(w, h)
+            grande = pb.scale_simple(int(w * k), int(h * k), GdkPixbuf.InterpType.BILINEAR) if k < 1 else pb
+            self.peek = (b, pixbuf_superficie(grande), self.peek[2])
+        self.area.queue_draw()
+        atraso = it.get_delay_time()
+        self.gif_fonte = GLib.timeout_add(max(20, atraso if atraso > 0 else 100), self._gif_quadro)
         return False
 
     def semear_enfeites(self, w, h):
@@ -741,6 +795,7 @@ class Orbita(nuvem.Nuvem):
             foco = self.sel
         else:
             foco = self.foco
+        self.gif_foco(self.bolhas[foco] if foco is not None and 0 <= foco < len(self.bolhas) else None)
         ordem = sorted(range(len(self.bolhas)), key=lambda i: (i == foco, self.bolhas[i].r))
         for i in ordem:
             self.desenhar_bolha(cr, self.bolhas[i], agora, i == foco)
@@ -774,6 +829,7 @@ class Orbita(nuvem.Nuvem):
             cr.translate(x, y)
             cr.scale(esc, esc)
             cr.set_source_surface(sup, -sup.get_width() / 2, -sup.get_height() / 2)
+            cr.get_source().set_filter(cairo.FILTER_NEAREST if esc > 2 else cairo.FILTER_GOOD)   # pixel art stays crisp
             cr.paint_with_alpha(a)
             cr.restore()
             cr.new_path()
@@ -1043,6 +1099,7 @@ class Orbita(nuvem.Nuvem):
             cr.translate(cx, cy)
             cr.scale(esc, esc)
             cr.set_source_surface(conteudo, -conteudo.get_width() / 2, -conteudo.get_height() / 2)
+            cr.get_source().set_filter(cairo.FILTER_NEAREST if esc > 2 else cairo.FILTER_GOOD)
             cr.paint()
             cr.restore()
         elif isinstance(conteudo, list) and conteudo:
