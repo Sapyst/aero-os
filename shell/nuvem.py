@@ -27,6 +27,7 @@ from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, PangoCairo  # n
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import apps  # noqa: E402
+import campotexto  # noqa: E402
 
 USO = os.path.expanduser("~/.cache/aero-shell/menu-uso.json")
 FG = (0.925, 0.92, 0.91)
@@ -174,6 +175,9 @@ class Nuvem(Gtk.Window):
         self.set_child(self.area)
         self.bolhas, self.cache = [], {}
         self.busca = ""
+        # the search is a real text field (cursor, Ctrl+A with the red outline, Ctrl+C/X/V...): campotexto.py
+        self.campo = campotexto.CampoTexto(self._busca_mudou, limite=40)
+        self.campo.redesenhar = lambda: self.area.queue_draw()
         self.mouse = None
         self.sel = 0
         self.t_abrir = 0.0
@@ -512,9 +516,14 @@ class Nuvem(Gtk.Window):
         except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
             pass
 
+    def _busca_mudou(self):
+        self.busca = self.campo.texto
+        self.reorganizar()
+
     def abrir(self):
         self.ajustar_ao_monitor()
         self.busca = ""
+        self.campo.texto, self.campo.cursor, self.campo.tudo = "", 0, False
         self.carregar()
         self.enfeites = None                       # re-seeded around the new layout on the first frame
         for b in self.bolhas:                      # born at the centre: the spring throws them out to their place
@@ -735,9 +744,10 @@ class Nuvem(Gtk.Window):
             if i == foco:
                 self._etiqueta(cr, b.nome.upper(), x, y + r + 18, a)
         # the search line, written in dots at the top
-        if self.busca or (self.t_fechar is None and agora - self.t_abrir < 2.5):
-            texto = self.busca.upper() + "_" if self.busca else "TYPE TO SEARCH"
-            self._texto(cr, texto, w / 2, 80, "Doto Black 26", fundo * (1.0 if self.busca else 0.5))
+        if self.busca:
+            campotexto.desenhar(cr, self.campo, w / 2, 80, "Doto Black 26", fundo)
+        elif self.t_fechar is None and agora - self.t_abrir < 2.5:
+            self._texto(cr, "TYPE TO SEARCH", w / 2, 80, "Doto Black 26", fundo * 0.5)
 
     def _etiqueta(self, cr, s, x, y, alfa):
         """The focused app's name in dots on a small dark pill, always readable."""
@@ -795,14 +805,13 @@ class Nuvem(Gtk.Window):
         apps.gravar_lista("menu-fixados", fixados)
         texto = self.busca
         self.carregar()
-        self.busca = texto
+        self.busca = texto                          # (the text field keeps its text and cursor)
         self.reorganizar()
 
     def _tecla(self, _c, tecla, _cod, _mods):
         if tecla == Gdk.KEY_Escape:
             if self.busca:
-                self.busca = ""
-                self.reorganizar()
+                self.campo.limpar()
             else:
                 self.fechar()
             return True
@@ -810,18 +819,12 @@ class Nuvem(Gtk.Window):
             if 0 <= self.sel < len(self.bolhas):
                 self.abrir_app(self.bolhas[self.sel])
             return True
-        if tecla == Gdk.KEY_BackSpace:
-            self.busca = self.busca[:-1]
-            self.reorganizar()
+        ctrl = bool(_mods & Gdk.ModifierType.CONTROL_MASK)
+        if self.campo.tecla(tecla, ctrl, self.get_display()):     # typing, cursor, Ctrl+A/C/X/V...
             return True
         direcoes = {Gdk.KEY_Left: (-1, 0), Gdk.KEY_Right: (1, 0), Gdk.KEY_Up: (0, -1), Gdk.KEY_Down: (0, 1)}
-        if tecla in direcoes:
+        if tecla in direcoes:                                    # (with text, left/right moved the cursor)
             self.mover_selecao(*direcoes[tecla])
-            return True
-        u = Gdk.keyval_to_unicode(tecla)
-        if u and chr(u).isprintable() and len(self.busca) < 40:
-            self.busca += chr(u)
-            self.reorganizar()
             return True
         return False
 

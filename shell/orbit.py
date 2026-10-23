@@ -43,6 +43,7 @@ from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 import cairo  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import campotexto  # noqa: E402
 import liquido  # noqa: E402
 import visor  # noqa: E402
 import nuvem  # noqa: E402
@@ -488,7 +489,7 @@ class Orbita(nuvem.Nuvem):
         raiz.add_overlay(self.visor)
         raiz.add_overlay(self.area)
         self.vis = None
-        self.cursor, self.tudo, self.editando = 0, False, None
+        self.editando = None
         self.selecionados = []                    # middle-click: files picked for Ctrl+C (kept across folders)
         rolar = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         rolar.connect("scroll", self._rolar)
@@ -662,7 +663,8 @@ class Orbita(nuvem.Nuvem):
         """Go to a folder. manter=True keeps the search (a group bubble: its results, inside it)."""
         self.pasta = pasta
         if not manter:
-            self.consulta, self.cursor, self.tudo = "", 0, False
+            self.consulta = ""
+            self.campo.texto, self.campo.cursor, self.campo.tudo = "", 0, False
         self.atualizar(imediato=True)
 
     def abrir_item(self, b):
@@ -863,7 +865,8 @@ class Orbita(nuvem.Nuvem):
     def abrir(self):
         self.ajustar_ao_monitor()
         self.consulta, self.peek, self.foco, self.filtro = "", None, None, None
-        self.editando, self.cursor, self.tudo = None, 0, False
+        self.editando = None
+        self.campo.texto, self.campo.cursor, self.campo.tudo = "", 0, False
         self.anel = [0, ANEL_N]
         self.bolhas, self.enfeites = [], []
         self.t_abrir, self.t_fechar = time.monotonic(), None
@@ -1201,27 +1204,8 @@ class Orbita(nuvem.Nuvem):
                 cr.fill()
             a_txt = min(1.0, max(0.0, (m - 0.55) / 0.45)) * fundo
             if texto and a_txt > 0:
-                if getattr(self, "tudo", False):                   # Ctrl+A: the letters get a red outline
-                    lay = PangoCairo.create_layout(cr)
-                    lay.set_font_description(Pango.FontDescription.from_string(fonte))
-                    lay.set_text(texto, -1)
-                    lw, lh = lay.get_pixel_size()
-                    cr.new_path()
-                    cr.move_to(cx - lw / 2, cy - lh / 2)
-                    PangoCairo.layout_path(cr, lay)
-                    cr.set_line_join(cairo.LINE_JOIN_ROUND)
-                    for largura, alfa in ((7, 0.12), (4.5, 0.25), (2.2, 0.95)):    # soft glow, then the line
-                        cr.set_source_rgba(*RED, alfa * a_txt)
-                        cr.set_line_width(largura)
-                        cr.stroke_preserve()
-                    cr.new_path()
-                self._texto_cor(cr, texto, cx, cy, fonte, FG, a_txt)
-                pre = texto[:self.cursor]
-                pw = self._texto_cor(cr, pre, -9999, -9999, fonte, FG, 0) if pre else 0
                 piscar = 1.0 if int(agora * 1.6) % 2 == 0 else 0.25
-                cr.rectangle(cx - tw / 2 + pw + 1, cy - 14, 3, 28)
-                cr.set_source_rgba(*RED, a_txt * piscar)
-                cr.fill()
+                campotexto.desenhar(cr, self.campo, cx, cy, fonte, a_txt, piscar=piscar)
                 if self.t_fechar is None and not getattr(self, "_pisca", None):
                     def piscar_():                                  # one timer while there is text to blink
                         if self.consulta and self.t_fechar is None and self.get_visible():
@@ -1653,7 +1637,7 @@ class Orbita(nuvem.Nuvem):
         if tecla == Gdk.KEY_space and atual is not None and not self.consulta:
             self.espiar(atual)                             # with text typed, space is just a space
             return True
-        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.tudo:
+        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.campo.tudo:
             alvos = list(self.selecionados) or ([atual.path] if atual is not None else [])
             if alvos:
                 self.copiar_arquivos(alvos)
@@ -1670,7 +1654,7 @@ class Orbita(nuvem.Nuvem):
             if atual is not None:
                 self.abrir_item(atual)
             return True
-        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.tudo:
+        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.campo.tudo:
             if atual is not None:
                 self.acao("COPY", atual)
             return True
@@ -1755,80 +1739,17 @@ class Orbita(nuvem.Nuvem):
             GLib.idle_add(pronto)
         threading.Thread(target=trabalho, daemon=True).start()
 
-    def mudar_busca(self, texto, cursor):
-        self.consulta, self.cursor, self.tudo = texto[:60], max(0, min(len(texto[:60]), cursor)), False
+    def _busca_mudou(self):
+        self.consulta = self.campo.texto
         self.atualizar()
         self.animar()
 
+    def mudar_busca(self, texto, cursor):
+        self.campo.definir(texto, cursor)
+
     def editar_busca(self, tecla, ctrl, mods):
-        """The search box behaves like a normal text field: typing inserts at the cursor, Ctrl+A selects
-        all (then typing replaces it), Ctrl+C / X / V, Ctrl+Backspace deletes a word, left/right/Home/End
-        move the cursor. Returns True if the key was used."""
-        q, c = self.consulta, min(self.cursor, len(self.consulta))
-        if ctrl and tecla in (Gdk.KEY_a, Gdk.KEY_A):
-            if q:
-                self.tudo = True
-                self.area.queue_draw()
-            return True
-        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C, Gdk.KEY_x, Gdk.KEY_X) and self.tudo and q:
-            subprocess.Popen(["wl-copy", q], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if tecla in (Gdk.KEY_x, Gdk.KEY_X):
-                self.mudar_busca("", 0)
-            return True
-        if ctrl and tecla in (Gdk.KEY_v, Gdk.KEY_V):
-            def colado(cb, res):
-                try:
-                    t = cb.read_text_finish(res)
-                except GLib.Error:
-                    t = None
-                if t:
-                    t = t.strip().splitlines()[0] if t.strip() else ""
-                    if self.tudo:
-                        self.mudar_busca(t, len(t))
-                    else:
-                        cc = min(self.cursor, len(self.consulta))
-                        self.mudar_busca(self.consulta[:cc] + t + self.consulta[cc:], cc + len(t))
-            self.get_display().get_clipboard().read_text_async(None, colado)
-            return True
-        if tecla == Gdk.KEY_BackSpace and q:
-            if self.tudo:
-                self.mudar_busca("", 0)
-            elif ctrl:
-                k = c
-                while k > 0 and q[k - 1] == " ":
-                    k -= 1
-                while k > 0 and q[k - 1] != " ":
-                    k -= 1
-                self.mudar_busca(q[:k] + q[c:], k)
-            elif c > 0:
-                self.mudar_busca(q[:c - 1] + q[c:], c - 1)
-            return True
-        if tecla == Gdk.KEY_Delete and q:
-            self.mudar_busca("" if self.tudo else q[:c] + q[c + 1:], 0 if self.tudo else c)
-            return True
-        if q and tecla in (Gdk.KEY_Left, Gdk.KEY_Right, Gdk.KEY_Home, Gdk.KEY_End):
-            if tecla == Gdk.KEY_Home:
-                c = 0
-            elif tecla == Gdk.KEY_End:
-                c = len(q)
-            elif ctrl:                                     # Ctrl+arrows: jump a word
-                passo = -1 if tecla == Gdk.KEY_Left else 1
-                c += passo
-                while 0 < c < len(q) and q[c - (1 if passo < 0 else 0)] != " ":
-                    c += passo
-            else:
-                c += -1 if tecla == Gdk.KEY_Left else 1
-            self.cursor, self.tudo = max(0, min(len(q), c)), False
-            self.area.queue_draw()
-            return True
-        u = Gdk.keyval_to_unicode(tecla)
-        if u and chr(u).isprintable() and not ctrl:
-            if self.tudo:
-                self.mudar_busca(chr(u), 1)
-            else:
-                self.mudar_busca(q[:c] + chr(u) + q[c:], c + 1)
-            return True
-        return False
+        """The search box is the shared DotStyle text field (campotexto.py)."""
+        return self.campo.tecla(tecla, ctrl, self.get_display())
 
     def resolver(self, texto):
         t = texto.strip()
