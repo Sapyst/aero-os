@@ -2089,7 +2089,7 @@ class CentralRapida(Janelinha):
                               if saida else "No output", bool(saida and not saida.get("mute")), "som", "sub:som"),
             self.botao_grande("weather-clear-night-symbolic" if escuro else "weather-clear-symbolic",
                               "Dark mode", "On" if escuro else "Off", escuro,
-                              lambda: self.alternar_tema(not escuro)),     # um clique troca, outro desfaz
+                              self.alternar_tema),     # um clique troca, outro desfaz (lê o último pedido)
         ]
         for i, b in enumerate(blocos):
             grade.attach(b, i % 2, i // 2, 1, 1)
@@ -2251,15 +2251,141 @@ class CentralRapida(Janelinha):
         import comum
         comum.atualizar_painel(**kv)
 
-    def alternar_tema(self, escuro):
-        """Dark mode na mão (desliga o automático). Trocar o tema precisa regerar as cores: roda em thread.
-        Solid: a CASCATA começa já no clique (a Hestia troca as próprias cores na hora, as outras peças em
-        sequência); o hypr-tema faz o resto por trás."""
-        tema = "escuro" if escuro else "claro"
-        if visual_atual() == "Solid":
-            solido.cascata(tema, "hestia")
-        self.gravar_painel(TEMA_MODO=tema)
-        rodar(f"{self.BIN}/hypr-tema", timeout=90)
+    # ---------- a ONDA da troca claro/escuro: pronta ANTES do clique ----------
+    # Abrir a Hestia já deixa o onda_wallpaper.py --servir carregado e ESCONDIDO (custa só RAM enquanto a
+    # Hestia está aberta: sem superfície na tela, sem GL, sem CPU). No clique em Dark mode ele tira o print
+    # da tela e a onda sai do ponto do clique em ~50 ms. Fechar a Hestia dispensa o processo (se uma onda
+    # estiver no meio, ela termina antes de ele sair).
+    ONDA = os.path.expanduser("~/.local/share/aero-shell/onda_wallpaper.py")
+    _trava_alvo = threading.Lock()       # o tema pedido (dois cliques rápidos = troca e destroca)
+    _trava_onda = threading.Lock()       # um "ir" de cada vez conversando com a onda
+
+    def mostrar(self, zona_icone):
+        super().mostrar(zona_icone)
+        self._onda_preparar()
+
+    def fechar(self):
+        super().fechar()
+        self._onda_soltar()
+
+    def _onda_preparar(self):
+        import queue
+        p = getattr(self, "_onda", None)
+        if p is not None and p.poll() is None:
+            return
+        self._onda = None
+        if visual_atual() != "Solid":
+            return
+        try:
+            painel = self.ler_painel()
+        except Exception:
+            painel = {}
+        if str(painel.get("THEME_ANIM", "wave")).strip('"') != "wave":
+            return
+        ms = str(painel.get("THEME_ANIM_MS", "1000")).strip('"')
+        env = {k: v for k, v in os.environ.items() if k not in ("AERO_TEMA_ONDA", "AERO_TEMA_FASE")}
+        env.update(GDK_DISABLE="vulkan", GSK_RENDERER="gl", LD_PRELOAD="/usr/lib/libgtk4-layer-shell.so")
+        try:
+            with open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aero-tema-onda.log"), "a") as erros:
+                p = subprocess.Popen([sys.executable, self.ONDA, "--servir", "--ms", ms if ms.isdigit() else "1000"],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=erros, env=env,
+                                     text=True, bufsize=1)
+        except OSError:
+            return
+        p.respostas = queue.Queue()
+
+        def ler():                       # as respostas ("ocioso", "pronto"...) numa fila; e recolhe o processo
+            for linha in p.stdout:
+                p.respostas.put(linha.strip())
+            p.respostas.put("")
+            p.wait()
+        threading.Thread(target=ler, daemon=True).start()
+        self._onda = p
+
+    def _onda_soltar(self):
+        p, self._onda = getattr(self, "_onda", None), None
+        if p is None:
+            return
+        try:
+            p.stdin.write("sair\n")
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def _fila_tema(self):
+        import queue
+        if getattr(self, "_fila", None) is None:
+            self._fila = queue.Queue()
+            threading.Thread(target=self._trabalhar_tema, daemon=True).start()
+        return self._fila
+
+    def _trabalhar_tema(self):
+        """Os apps (hypr-tema em 2 fases), um pedido de cada vez e sem onda dentro de onda: preparar já no
+        clique (só escreve arquivos: invisível) e mostrar quando a onda congelou a tela (ou desistiu)."""
+        env = dict(os.environ, AERO_TEMA_ONDA="1")
+        while True:
+            tema, congelou = self._fila.get()
+            for fase in ("preparar", "mostrar"):
+                if fase == "mostrar":
+                    congelou.wait(2)
+                try:
+                    subprocess.run([f"{self.BIN}/hypr-tema", "--forcar"], env=dict(env, AERO_TEMA_FASE=fase),
+                                   capture_output=True, timeout=60)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            solido._diario(f"hestia apps {tema}")
+
+    def alternar_tema(self, escuro=None):
+        """Dark mode na mão (desliga o automático). Roda numa thread (ao_bloco).
+        escuro=None = o contrário do ÚLTIMO pedido. (Antes o botão guardava o estado de quando a Hestia foi
+        montada: um 2º clique antes de ela se remontar pedia o MESMO tema de novo e "não fazia nada".)
+        Solid: a onda (já carregada) congela a tela na hora e sai do clique; as peças do shell trocam por
+        baixo quando a frente chega nelas (a cascata) e os apps também. Um clique no meio de uma troca
+        recomeça a onda da tela como está: nada espera a anterior acabar."""
+        import queue
+        import time
+        with self._trava_alvo:
+            if escuro is None:
+                pedido = getattr(self, "_tema_pedido", None)
+                atual = pedido[0] == "escuro" if pedido and time.monotonic() - pedido[1] < 30 else solido.escuro_agora()
+                escuro = not atual
+            tema = "escuro" if escuro else "claro"
+            self._tema_pedido = (tema, time.monotonic())
+            solido._diario(f"hestia clique {tema}")
+            p = getattr(self, "_onda", None) if visual_atual() == "Solid" else None
+            if p is not None and p.poll() is None:
+                self._trava_onda.acquire()           # solta depois do "pronto" (abaixo)
+                try:
+                    while not p.respostas.empty():
+                        p.respostas.get_nowait()
+                    p.stdin.write(f"ir {tema} hestia\n")
+                    p.stdin.flush()
+                except (OSError, ValueError):
+                    self._trava_onda.release()
+                    p = None
+            else:
+                p = None
+            self.gravar_painel(TEMA_MODO=tema)
+            if visual_atual() != "Solid":
+                rodar(f"{self.BIN}/hypr-tema", timeout=90)
+                return
+            congelou = threading.Event()
+            self._fila_tema().put((tema, congelou))
+        resposta = ""
+        if p is not None:
+            try:
+                fim = time.monotonic() + 1.5
+                while resposta not in ("pronto", "pulou", "falhou"):
+                    resposta = p.respostas.get(timeout=max(0.01, fim - time.monotonic()))
+                    if resposta == "":
+                        break
+            except queue.Empty:
+                resposta = ""
+            finally:
+                self._trava_onda.release()
+        if resposta != "pronto":
+            solido.cascata(tema, "hestia")           # sem onda: a cascata de sempre, já
+        congelou.set()
 
     def agenda(self, titulo, chave_modo, modo_manual, horarios, painel, temperatura=False):
         """Subjanelinha de agenda: liga/desliga sozinho nos horários escolhidos (mesmo que o Settings)."""

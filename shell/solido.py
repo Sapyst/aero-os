@@ -104,7 +104,14 @@ def ler_cascata():
     return None
 
 
-def atraso_ms(peca, origem=None):
+def atraso_ms(peca, origem=None, c=None):
+    """ms depois do t0 em que esta peça começa a trocar. Com a onda (onda_wallpaper.py --servir), a cascata
+    traz "atrasos" por peça = quando a frente da onda chega nela (ordem pela distância do clique)."""
+    atrasos = (c or {}).get("atrasos")
+    if isinstance(atrasos, dict):
+        v = atrasos.get(peca, atrasos.get("outros", 0))
+        if isinstance(v, (int, float)):
+            return max(0, int(v))
     fila = [origem] + [p for p in ORDEM if p != origem] if origem in ORDEM else list(ORDEM)
     return fila.index(peca if peca in fila else "outros") * PASSO_MS
 
@@ -340,6 +347,7 @@ def vigiar(ao_mudar=None, peca="outros"):
     from gi.repository import Gio, GLib
     mon = Gio.File.new_for_path(ARQ_CORES).monitor_file(Gio.FileMonitorFlags.NONE, None)
     mon_c = Gio.File.new_for_path(ARQ_CASCATA).monitor_file(Gio.FileMonitorFlags.NONE, None)
+    mon_c.set_rate_limit(0)                    # 2ª troca logo depois da 1ª: o Gio segurava o aviso até 800 ms
     mon._cascata = mon_c                       # o chamador guarda só um monitor: o outro vai junto
     pendente = [None]
     estado = {"t0": None, "anim": None, "agendado": None}
@@ -370,6 +378,9 @@ def vigiar(ao_mudar=None, peca="outros"):
 
     def transicao():
         estado["agendado"] = None
+        if estado["anim"] is not None:         # trocou de novo no meio: parte da cor do meio do caminho
+            GLib.source_remove(estado["anim"])
+            estado["anim"] = None
         velho = _cache.get("esq") or esquema()
         recarregar()
         novo = esquema()
@@ -395,7 +406,7 @@ def vigiar(ao_mudar=None, peca="outros"):
         if c is None or c["t0"] == estado["t0"]:
             return
         estado["t0"] = c["t0"]
-        espera = c["t0"] * 1000 + atraso_ms(peca, c.get("origem")) - time.time() * 1000
+        espera = c["t0"] * 1000 + atraso_ms(peca, c.get("origem"), c) - time.time() * 1000
         if espera < -3000:                     # aviso velho (processo que acabou de abrir): ignora
             return
         if estado["agendado"] is not None:

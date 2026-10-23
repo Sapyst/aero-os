@@ -408,13 +408,15 @@ aplicar() {
         # se desfaz numa onda. No login (--loop) e dentro de uma troca que já tem onda, troca direto.
         # Solid: a CASCATA começa já (as peças do shell trocam as cores ao vivo, uma depois da outra) e a
         # onda só cobre o que sobra (apps, Hyprland), em duas fases (aero-tema-onda --cascata).
-        if [ "${VISUAL:-}" = Solid ] && [ -z "${AERO_TEMA_ONDA:-}" ] && [ -z "${SEM_ONDA:-}" ]; then
-            cascata_avisar "$tema"
-        fi
+        # (a cascata, com onda, é gravada pela própria onda no instante em que congela a tela; sem onda, o
+        # aero-tema-onda grava na hora. A Hestia nem chama por aqui: tem a onda dela, pronta antes do clique.)
         if [ -z "${AERO_TEMA_ONDA:-}" ] && [ -z "${SEM_ONDA:-}" ] && [ -x "$HOME/.local/bin/aero-tema-onda" ]; then
-            if [ "${VISUAL:-}" = Solid ]; then "$HOME/.local/bin/aero-tema-onda" --cascata "$0" --forcar
+            if [ "${VISUAL:-}" = Solid ]; then AERO_TEMA_ALVO=$tema "$HOME/.local/bin/aero-tema-onda" --cascata "$0" --forcar
             else "$HOME/.local/bin/aero-tema-onda" "$0" --forcar; fi
             return
+        fi
+        if [ "${VISUAL:-}" = Solid ] && [ -z "${AERO_TEMA_ONDA:-}" ] && [ -z "${SEM_ONDA:-}" ]; then
+            cascata_avisar "$tema"
         fi
         aplicar_tema "$tema"
     fi

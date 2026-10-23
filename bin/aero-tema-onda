@@ -11,13 +11,14 @@
 # Dentro de uma troca já com onda (AERO_TEMA_ONDA=1 herdado), só roda o comando: nada de onda dentro de onda.
 # painel.conf: THEME_ANIM=wave|none (padrão wave) e THEME_ANIM_MS=1000 (duração).
 #
-# --cascata (troca claro/escuro no Solid; o hypr-tema chama assim): as peças do shell já estão trocando as
-# cores AO VIVO, uma depois da outra (solido.cascata). Então a onda não pode congelar a tela no começo:
-#   1. o COMANDO roda com AERO_TEMA_FASE=preparar (só escreve arquivos) e, junto, a onda já carrega
-#      (Python + GTK levam ~0,4 s) sem mostrar nada (--esperar);
-#   2. quando a cascata termina (~0,6 s depois do clique), o print é tirado JÁ com o shell novo e fica
-#      parado por cima; por baixo, o COMANDO com AERO_TEMA_FASE=mostrar avisa os apps e o Hyprland;
-#   3. a onda revela: o que muda nela são só os apps (o shell já estava novo no print).
+# --cascata (troca claro/escuro no Solid pelo Settings, pelo horário...; o hypr-tema chama assim, com o
+# tema em AERO_TEMA_ALVO). A Hestia NÃO passa por aqui: ela deixa a onda carregada antes do clique (som.py).
+#   1. o COMANDO roda com AERO_TEMA_FASE=preparar (só escreve arquivos) e, junto, a onda carrega
+#      (onda_wallpaper.py --servir: Python + GTK, ~0,2 s) escondida;
+#   2. "ir": a onda tira o print, congela a tela e já começa do mouse; grava a CASCATA com o atraso de cada
+#      peça do shell (quando a frente chega nela) e escreve "pronto";
+#   3. por baixo, o COMANDO com AERO_TEMA_FASE=mostrar avisa os apps e o Hyprland enquanto a onda passa.
+# Sem onda (tela cheia, opção desligada, falha): a cascata de sempre (as peças trocam ao vivo, em ordem).
 PAINEL="$HOME/.config/hypr/painel.conf"
 LOG="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.log"
 CASCATA=0
@@ -34,6 +35,11 @@ if [ "$CASCATA" = 1 ]; then
     pid_prep=$!
 fi
 so_rodar() {
+    if [ "$CASCATA" = 1 ] && [ -n "${AERO_TEMA_ALVO:-}" ]; then   # as peças do shell trocam ao vivo, já
+        mkdir -p "$HOME/.cache/hypr-tema"
+        printf '{"tema": "%s", "t0": %s, "origem": ""}\n' "$AERO_TEMA_ALVO" "${EPOCHREALTIME/,/.}" \
+            > "$HOME/.cache/hypr-tema/cascata"
+    fi
     if [ -n "$pid_prep" ]; then          # cascata sem onda: termina a preparação e mostra direto
         wait "$pid_prep"; AERO_TEMA_FASE=mostrar "$@"; exit $?
     fi
@@ -45,6 +51,38 @@ anim="$(sed -n 's/^THEME_ANIM=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
 ms="$(sed -n 's/^THEME_ANIM_MS=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
 [[ "$ms" =~ ^[0-9]+$ ]] || ms=1000
 command -v grim >/dev/null && [ -n "${WAYLAND_DISPLAY:-}" ] || so_rodar "$@"
+
+if [ "$CASCATA" = 1 ]; then
+    [ -n "${AERO_TEMA_ALVO:-}" ] || so_rodar "$@"
+    exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.lock"
+    flock -w 5 8 || so_rodar "$@"
+    coproc ONDA { GDK_DISABLE=vulkan GSK_RENDERER=gl LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 \
+        "$HOME/.local/share/aero-shell/onda_wallpaper.py" --servir --ms "$ms" 2>>"$LOG"; }
+    pid_onda=$ONDA_PID
+    exec {LE}<&"${ONDA[0]}" {ESCREVE}>&"${ONDA[1]}"
+    falhou() {
+        marca "onda não rolou ($1): sem onda"; shift
+        kill "$pid_onda" 2>/dev/null
+        so_rodar "$@"
+    }
+    linha=""
+    read -r -t 4 linha <&"$LE" || linha=""
+    [ "$linha" = ocioso ] || falhou "${linha:-sem resposta}" "$@"
+    marca onda-carregada
+    { echo "ir $AERO_TEMA_ALVO" >&"$ESCREVE"; } 2>/dev/null
+    linha=""
+    read -r -t 3 linha <&"$LE" || linha=""
+    [ "$linha" = pronto ] || falhou "${linha:-sem resposta}" "$@"
+    marca onda-pronta                  # a tela congelou e a onda já começou: os apps trocam por baixo
+    wait "$pid_prep"; pid_prep=""
+    AERO_TEMA_FASE=mostrar "$@"
+    r=$?
+    marca tema-aplicado
+    { echo sair >&"$ESCREVE"; } 2>/dev/null
+    exec {ESCREVE}>&-
+    wait "$pid_onda" 2>/dev/null
+    exit $r
+fi
 
 # monitor em foco, tela cheia e mouse (o mesmo jeito do papel-de-parede)
 IFS=$'\t' read -r mon mx my < <(python3 -I - <<'PY' 2>>"$LOG"
@@ -69,48 +107,6 @@ print(mon["name"], round(x), round(y), sep="\t")
 PY
 )
 [ -n "${mon:-}" ] || so_rodar "$@"
-
-if [ "$CASCATA" = 1 ]; then
-    marca monitor
-    exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.lock"
-    flock -w 5 8 || so_rodar "$@"
-    print="${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.ppm"
-    coproc ONDA { GDK_DISABLE=vulkan GSK_RENDERER=gl LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 \
-        "$HOME/.local/share/aero-shell/onda_wallpaper.py" --revelar --esperar --novo - \
-        --monitor "$mon" --x "$mx" --y "$my" --ms "$ms" 2>>"$LOG"; }
-    pid_onda=$ONDA_PID
-    exec {LE}<&"${ONDA[0]}" {ESCREVE}>&"${ONDA[1]}"
-    falhou() {
-        marca "onda não rolou ($1): sem onda"; shift
-        kill "$pid_onda" 2>/dev/null; rm -f "$print"
-        so_rodar "$@"
-    }
-    linha=""
-    read -r -t 4 linha <&"$LE" || linha=""
-    [ "$linha" = carregado ] || { falhou "${linha:-sem resposta}" "$@"; }
-    marca onda-carregada
-    wait "$pid_prep"; pid_prep=""; preparado=1
-    marca preparado
-    # espera a cascata acabar (fim = t0 + a última peça + a transição dela; solido.ORDEM/PASSO_MS/FADE_MS)
-    t0=$(sed -n 's/.*"t0": *\([0-9.]*\).*/\1/p' "$HOME/.cache/hypr-tema/cascata" 2>/dev/null)
-    resta=$(awk -v t0="${t0:-0}" -v agora="${EPOCHREALTIME/,/.}" 'BEGIN { r = t0 + 0.66 - agora; printf "%.3f", (r > 0 && r < 2) ? r : 0 }')
-    [ "$resta" = 0.000 ] || sleep "$resta"
-    marca cascata-fim
-    grim -o "$mon" -t ppm "$print" 2>>"$LOG" || falhou grim "$@"
-    { echo "foto $print" >&"$ESCREVE"; } 2>/dev/null
-    linha=""
-    read -r -t 4 linha <&"$LE" || linha=""
-    rm -f "$print"
-    [ "$linha" = pronto ] || falhou "${linha:-sem resposta}" "$@"
-    marca onda-pronta
-    AERO_TEMA_FASE=mostrar "$@"
-    r=$?
-    marca tema-aplicado
-    sleep 0.2                  # os apps terminam de redesenhar com o visual novo
-    { echo ir >&"$ESCREVE"; } 2>/dev/null
-    wait "$pid_onda" 2>/dev/null
-    exit $r
-fi
 
 echo "$(date +%T.%3N) inicio" >> "$LOG"
 exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-tema-onda.lock"
