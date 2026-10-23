@@ -33,6 +33,17 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import apps  # noqa: E402
+import solido  # noqa: E402
+
+SOLIDO = solido.ativo()
+CSS_SOLIDO = """
+popover.solid-pop > contents { background: none; box-shadow: none; border: none; padding: 0; }
+popover.solid-pop .menu-bandeja { background-color: @solid_surface_container; color: @solid_on_surface;
+  border-radius: %dpx; padding: 6px; }
+popover.solid-pop .menu-bandeja button { border-radius: 999px; min-height: 36px; padding: 0 14px; }
+popover.solid-pop .menu-bandeja button:hover { background-color: alpha(@solid_on_surface, 0.08); }
+popover.solid-pop .menu-bandeja separator { background: none; min-height: 2px; }
+"""
 
 LARGURA_ICONE = 30                     # tem que bater com o CSS da waybar (#custom-espaco-bandeja.nX)
 TAMANHO_ICONE = 18
@@ -438,10 +449,36 @@ class Bandeja(Gtk.ApplicationWindow):
             else:
                 b.connect("clicked", lambda _b, i=ident: (pop.popdown(), self.clicar_menu(item, caminho_menu, i)))
             lista.append(b)
-        pop.set_child(lista)
+        if SOLIDO:                    # Solid: o menu escorre do ícone num metaball (o mesmo solido.metaball)
+            raiz = Gtk.Overlay()
+            raiz.set_child(lista)
+            pop.add_css_class("solid-pop")
+            pop.set_child(raiz)
+            raiz.connect("map", lambda r: GLib.idle_add(self._abrir_solido, r, lista))
+        else:
+            pop.set_child(lista)
         pop.set_parent(ancora)
         pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
         pop.popup()
+
+    def _abrir_solido(self, raiz, lista):
+        import solido
+        r = solido.raio()
+        lista.set_opacity(0.0)
+
+        def quadro(t):
+            ok, b = lista.compute_bounds(raiz)
+            if not ok:
+                return [], []
+            w, h = b.get_width(), b.get_height()
+            e = 1 - (1 - t) ** 3
+            lista.set_opacity(solido.suave(0.7, 1.0, t))
+            mw, mh = 10 + (w / 2 - 10) * e, 10 + (h / 2 - 10) * e
+            cy = 8 + (h / 2 - 8) * e
+            gotas = [(w / 2, -2.0, 9 * (1 - e) + 2)] if e < 0.9 else []
+            return gotas, [(w / 2, cy, mw, mh, min(mw, mh, 10 + (min(r, 18) - 10) * e))]
+        solido.metaball(raiz, 0.34, quadro, solido.rgb("surface_container"), lambda: lista.set_opacity(1.0), k=20.0)
+        return False
 
     def clicar_menu(self, item, caminho_menu, ident):
         self.bus.call(item.servico, caminho_menu, "com.canonical.dbusmenu", "Event",
@@ -462,6 +499,13 @@ class App(Adw.Application):    # Adw = acompanha o claro/escuro do sistema (doc 
         # em todas as janelas, e aqui precisamos desligar (senão o desfoque cobre a barra embaixo).
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+        if SOLIDO:
+            solido.aplicar_css()
+            prov_s = Gtk.CssProvider()
+            prov_s.load_from_string(CSS_SOLIDO % min(solido.raio(), 18))
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov_s,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_USER + 2)
+            self._vigia_cores = solido.vigiar()
         janela = Bandeja(self)
         janela.present()
         self.hold()
