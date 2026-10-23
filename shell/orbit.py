@@ -27,8 +27,10 @@ import random
 import subprocess
 import sys
 import threading
+import shutil
 import time
 import types
+import urllib.parse
 
 import gi
 
@@ -486,6 +488,8 @@ class Orbita(nuvem.Nuvem):
         raiz.add_overlay(self.visor)
         raiz.add_overlay(self.area)
         self.vis = None
+        self.cursor, self.tudo, self.editando = 0, False, None
+        self.selecionados = []                    # middle-click: files picked for Ctrl+C (kept across folders)
         rolar = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         rolar.connect("scroll", self._rolar)
         self.area.add_controller(rolar)
@@ -658,7 +662,7 @@ class Orbita(nuvem.Nuvem):
         """Go to a folder. manter=True keeps the search (a group bubble: its results, inside it)."""
         self.pasta = pasta
         if not manter:
-            self.consulta = ""
+            self.consulta, self.cursor, self.tudo = "", 0, False
         self.atualizar(imediato=True)
 
     def abrir_item(self, b):
@@ -724,8 +728,8 @@ class Orbita(nuvem.Nuvem):
         w, h = self.area.get_width() or 1920, self.area.get_height() or 1080
         cx, cy = self._centro()
         tam = self.visor.tamanho or (420, 420)
-        s = min(w * 0.84 / tam[0], (h - 260) / tam[1])
-        return [cx, cy - 22, tam[0] * s / 2, tam[1] * s / 2]
+        s = min(w * 0.84 / tam[0], (h - 300) / tam[1])
+        return [cx, cy - 34, tam[0] * s / 2, tam[1] * s / 2]
 
     def visor_janela(self, agora):
         """This frame's window (cx, cy, half_w, half_h, corner), morphing from the bubble; None when gone."""
@@ -859,7 +863,7 @@ class Orbita(nuvem.Nuvem):
     def abrir(self):
         self.ajustar_ao_monitor()
         self.consulta, self.peek, self.foco, self.filtro = "", None, None, None
-        self.editando = None
+        self.editando, self.cursor, self.tudo = None, 0, False
         self.anel = [0, ANEL_N]
         self.bolhas, self.enfeites = [], []
         self.t_abrir, self.t_fechar = time.monotonic(), None
@@ -896,7 +900,8 @@ class Orbita(nuvem.Nuvem):
                     or (self.peek is not None and agora - self.peek[2] < 0.5)
                     or (self.vis is not None and (agora - self.vis["t0"] < 0.6 or self.vis["fechando"] is not None
                                                   or self.vis.get("mexendo")))
-                    or (getattr(self, "aviso", None) and agora - self.aviso[1] < 1.6))
+                    or (getattr(self, "aviso", None) and agora - self.aviso[1] < 1.6)
+                    or getattr(self, "_caixa_mexendo", False))
             if vivo:
                 GLib.idle_add(lambda: (self.animar(), False)[1])
         return r
@@ -958,8 +963,9 @@ class Orbita(nuvem.Nuvem):
             fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
         if abs(self.veu.get_opacity() - fundo) > 0.01:
             self.veu.set_opacity(fundo)
-        self.desenhar_anel(cr, w, h, fundo)
-        self.desenhar_guias(cr, w, h, fundo)
+        if self.vis is None:
+            self.desenhar_anel(cr, w, h, fundo)
+            self.desenhar_guias(cr, w, h, fundo)
         liq = self.liquido.ok
         if self.bolhas and not liq:
             self.desenhar_enfeites(cr, w, h, agora, fundo)
@@ -982,11 +988,12 @@ class Orbita(nuvem.Nuvem):
             self.desenhar_bolha(cr, self.bolhas[i], agora, i == foco)
         if foco is not None and 0 <= foco < len(self.bolhas) and self.t_fechar is None:
             self.desenhar_satelites(cr, self.bolhas[foco], agora)
+        self.desenhar_centro(cr, w, h, fundo, agora)
         if liq:
             self.formas_liquidas(agora, foco, fundo)
-        self.desenhar_centro(cr, w, h, fundo, agora)
         self.desenhar_caminho(cr, w, h, fundo)
-        self.desenhar_chips(cr, w, h, fundo)
+        if self.vis is None:                             # the viewer owns the screen: no chips under it
+            self.desenhar_chips(cr, w, h, fundo)
         if self.peek is not None:
             self.desenhar_peek(cr, w, h, agora)
         if self.vis is not None:
@@ -1026,7 +1033,7 @@ class Orbita(nuvem.Nuvem):
             bx, by, br, _a = self._onde(self.peek[0], agora)
             R = min(self.area.get_width(), self.area.get_height()) * 0.3
             formas.append((bx + (cx - bx) * pk, by + (cy - by) * pk, br + (R - br) * pk))
-        janelas = []
+        janelas = [self.caixa_jan] if getattr(self, "caixa_jan", None) else []
         jan = self.visor_janela(agora)
         if jan is not None:
             janelas.append(jan)
@@ -1091,6 +1098,12 @@ class Orbita(nuvem.Nuvem):
                 glifo, cor = self.glifo(b)
                 self._texto_cor(cr, glifo, x, y, f"Doto Black {max(8, int(r * (0.42 if len(glifo) > 2 else 0.6)))}",
                                 cor, a)
+        if b.path in self.selecionados:                         # picked with the middle click
+            cr.new_path()
+            cr.arc(x, y, r + 5, 0, 2 * math.pi)
+            cr.set_source_rgba(*RED, 0.9 * a)
+            cr.set_line_width(2.4)
+            cr.stroke()
         if b.variantes and r > 14:                              # same name, other formats: +N
             bx, by = x + r * 0.72, y - r * 0.72
             cr.new_path()
@@ -1160,37 +1173,61 @@ class Orbita(nuvem.Nuvem):
             self.zonas.append(("acao", (nome, b), sx, sy, 23))
 
     def desenhar_centro(self, cr, w, h, fundo, agora):
+        """No placeholder: the middle is empty until you type. Then a dot appears there and opens into a
+        liquid text box (a window of the liquid layer) with the text, the cursor and the result count."""
         cx, cy = self._centro()
-        g = cairo.RadialGradient(cx, cy, 0, cx, cy, BURACO)
-        g.add_color_stop_rgba(0, *FG, 0.07 * fundo)
-        g.add_color_stop_rgba(1, *FG, 0.0)
-        cr.set_source(g)
-        cr.arc(cx, cy, BURACO, 0, 2 * math.pi)
-        cr.fill()
-        texto = self.consulta.upper() if self.consulta else "SEARCH"
-        tam = 54 if len(texto) <= 8 else 40 if len(texto) <= 14 else 28
-        tw = self._texto_cor(cr, texto, cx, cy, f"Doto Black {tam}", FG, fundo * (1 if self.consulta else 0.32))
-        piscar = 1.0 if int(agora * 1.6) % 2 == 0 or not self.consulta else 0.25
-        cr.rectangle(cx + tw / 2 + 8, cy - tam * 0.42, 5, tam * 0.84)
-        cr.set_source_rgba(*RED, fundo * piscar)
-        cr.fill()
-        if self.consulta and self.t_fechar is None and not getattr(self, "_pisca", None):
-            def piscar_():                                          # one timer while there is text to blink
-                if self.consulta and self.t_fechar is None and self.get_visible():
-                    self.area.queue_draw()
-                    return True
-                self._pisca = None
-                return False
-            self._pisca = GLib.timeout_add(620, piscar_)
-        if self.consulta and not self.indice.pronto:
-            info = "INDEXING …"
+        fonte = "Doto Black 30"
+        texto = self.consulta.upper()
+        tw = self._texto_cor(cr, texto or " ", -9999, -9999, fonte, FG, 0) if texto else 0
+        ligado = bool(self.consulta) and self.vis is None
+        m, larg = getattr(self, "_caixa", (0.0, 70.0))
+        m += ((1.0 if ligado else 0.0) - m) * 0.28
+        larg += (max(70.0, tw / 2 + 36) - larg) * 0.35
+        if not ligado and m < 0.02:
+            m = 0.0
+        self._caixa = (m, larg)
+        self._caixa_mexendo = abs((1.0 if ligado else 0.0) - m) > 0.01
+        if m <= 0.0:
+            self.caixa_jan = None
         else:
-            onde = exibir(self.pasta)
-            info = f"{len(self.bolhas)} {'FILES' if self.consulta else 'ITEMS'} · {onde}"
+            hw, hh = 7 + (larg - 7) * m, 7 + (31 - 7) * m
+            self.caixa_jan = (cx, cy, hw, hh, hh)
+            if not self.liquido.ok:
+                cr.new_path()
+                cr.arc(cx - hw + hh, cy, hh, math.pi / 2, 3 * math.pi / 2)
+                cr.arc(cx + hw - hh, cy, hh, -math.pi / 2, math.pi / 2)
+                cr.close_path()
+                cr.set_source_rgba(*FUNDO_BOLHA, 0.95 * fundo)
+                cr.fill()
+            a_txt = min(1.0, max(0.0, (m - 0.55) / 0.45)) * fundo
+            if texto and a_txt > 0:
+                if getattr(self, "tudo", False):                   # Ctrl+A: everything selected
+                    cr.rectangle(cx - tw / 2 - 4, cy - 17, tw + 8, 34)
+                    cr.set_source_rgba(*RED, 0.32 * a_txt)
+                    cr.fill()
+                self._texto_cor(cr, texto, cx, cy, fonte, FG, a_txt)
+                pre = texto[:self.cursor]
+                pw = self._texto_cor(cr, pre, -9999, -9999, fonte, FG, 0) if pre else 0
+                piscar = 1.0 if int(agora * 1.6) % 2 == 0 else 0.25
+                cr.rectangle(cx - tw / 2 + pw + 1, cy - 14, 3, 28)
+                cr.set_source_rgba(*RED, a_txt * piscar)
+                cr.fill()
+                if self.t_fechar is None and not getattr(self, "_pisca", None):
+                    def piscar_():                                  # one timer while there is text to blink
+                        if self.consulta and self.t_fechar is None and self.get_visible():
+                            self.area.queue_draw()
+                            return True
+                        self._pisca = None
+                        return False
+                    self._pisca = GLib.timeout_add(620, piscar_)
+                info = "INDEXING …" if not self.indice.pronto else f"{len(self.bolhas)} FILES · {exibir(self.pasta)}"
+                self._texto_cor(cr, info.upper(), cx, cy + hh + 18, "Doto Black 11", FG, 0.42 * a_txt)
         aviso = getattr(self, "aviso", None)
         if aviso and agora - aviso[1] < 1.6:
-            info = aviso[0]
-        self._texto_cor(cr, info.upper(), cx, cy + tam * 0.5 + 26, "Doto Black 12", FG, 0.42 * fundo)
+            self._texto_cor(cr, aviso[0], cx, cy + 66, "Doto Black 12", RED, 0.8 * fundo)
+        elif self.selecionados and not ligado and self.vis is None:
+            self._texto_cor(cr, f"{len(self.selecionados)} PICKED · CTRL+C COPY · ESC CLEAR", cx, cy,
+                            "Doto Black 12", RED, 0.85 * fundo)
 
     def desenhar_guias(self, cr, w, h, fundo):
         """The rings (faint dotted ellipses) and the name of each slice that has something in it."""
@@ -1508,6 +1545,14 @@ class Orbita(nuvem.Nuvem):
                 self.animar()
             return
         i = self.bolha_em(x, y)
+        if i is not None and g.get_current_button() == 2:     # middle click: pick / unpick this file
+            p = self.bolhas[i].path
+            if p in self.selecionados:
+                self.selecionados.remove(p)
+            else:
+                self.selecionados.append(p)
+            self.area.queue_draw()
+            return
         if i is None:
             self.fechar()
         elif g.get_current_button() == 1:
@@ -1588,13 +1633,25 @@ class Orbita(nuvem.Nuvem):
                 self.peek = None
                 self.animar()
             elif self.consulta:
-                self.consulta = ""
-                self.atualizar()
+                self.mudar_busca("", 0)
+            elif self.selecionados:
+                self.selecionados = []
+                self.area.queue_draw()
             else:
                 self.fechar()
             return True
-        if tecla == Gdk.KEY_space and atual is not None:
-            self.espiar(atual)
+        if tecla == Gdk.KEY_space and atual is not None and not self.consulta:
+            self.espiar(atual)                             # with text typed, space is just a space
+            return True
+        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.tudo:
+            alvos = list(self.selecionados) or ([atual.path] if atual is not None else [])
+            if alvos:
+                self.copiar_arquivos(alvos)
+            return True
+        if ctrl and tecla in (Gdk.KEY_v, Gdk.KEY_V) and not self.consulta:
+            self.colar_arquivos()
+            return True
+        if self.editar_busca(tecla, ctrl, mods):
             return True
         if self.peek is not None:
             self.peek = None
@@ -1603,15 +1660,12 @@ class Orbita(nuvem.Nuvem):
             if atual is not None:
                 self.abrir_item(atual)
             return True
-        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C):
+        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C) and not self.tudo:
             if atual is not None:
                 self.acao("COPY", atual)
             return True
         if tecla == Gdk.KEY_BackSpace:
-            if self.consulta:
-                self.consulta = self.consulta[:-1]
-                self.atualizar()
-            elif self.pasta in RAIZES[1:]:
+            if self.pasta in RAIZES[1:]:
                 self.ir_para(CASA)                       # D: lives next to your folders
             elif self.pasta != "/":
                 self.ir_para(os.path.dirname(self.pasta.rstrip("/")) or "/")
@@ -1623,15 +1677,146 @@ class Orbita(nuvem.Nuvem):
             self.animar()
             return True
         direcoes = {Gdk.KEY_Left: (-1, 0), Gdk.KEY_Right: (1, 0), Gdk.KEY_Up: (0, -1), Gdk.KEY_Down: (0, 1)}
-        if tecla in direcoes:
+        if tecla in direcoes:                              # (with text, left/right moved the cursor above)
             self.foco = None
             self.mover_selecao(*direcoes[tecla])
             self.animar()
             return True
+        return False
+
+    # ---------- copy / paste files ----------
+
+    def copiar_arquivos(self, caminhos):
+        """Puts the files on the system clipboard as a file list (text/uri-list): Ctrl+V here or in any
+        file manager pastes copies of them."""
+        uris = "\r\n".join("file://" + urllib.parse.quote(p) for p in caminhos) + "\r\n"
+        try:
+            subprocess.run(["wl-copy", "-t", "text/uri-list"], input=uris.encode(), timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return
+        self.aviso = (f"{len(caminhos)} COPIED · CTRL+V IN ANY FOLDER", time.monotonic())
+        self.selecionados = []
+        self.animar()
+
+    def colar_arquivos(self):
+        """Ctrl+V: copies of the files on the clipboard into the current folder (name (copy).ext when taken)."""
+        try:
+            r = subprocess.run(["wl-paste", "-n", "-t", "text/uri-list"], capture_output=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return
+        fontes = [urllib.parse.unquote(u[7:]) for u in r.stdout.decode(errors="replace").split()
+                  if u.startswith("file://")]
+        fontes = [f for f in fontes if os.path.exists(f)]
+        if not fontes:
+            self.aviso = ("NOTHING TO PASTE", time.monotonic())
+            self.animar()
+            return
+        destino = self.pasta
+        self.aviso = (f"PASTING {len(fontes)} …", time.monotonic())
+        self.animar()
+
+        def livre(nome):
+            base, ext = os.path.splitext(nome)
+            alvo, n = os.path.join(destino, nome), 1
+            while os.path.exists(alvo):
+                alvo = os.path.join(destino, f"{base} (copy{'' if n == 1 else ' ' + str(n)}){ext}")
+                n += 1
+            return alvo
+
+        def trabalho():
+            feitos = 0
+            for f in fontes:
+                try:
+                    alvo = livre(os.path.basename(f.rstrip("/")))
+                    if os.path.isdir(f):
+                        shutil.copytree(f, alvo, symlinks=True)
+                    else:
+                        shutil.copy2(f, alvo)
+                    feitos += 1
+                except OSError:
+                    continue
+            def pronto():
+                self.aviso = (f"{feitos} PASTED" if feitos == len(fontes) else f"{feitos}/{len(fontes)} PASTED",
+                              time.monotonic())
+                if self.pasta == destino:
+                    self.atualizar(imediato=True)
+                self.animar()
+                return False
+            GLib.idle_add(pronto)
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def mudar_busca(self, texto, cursor):
+        self.consulta, self.cursor, self.tudo = texto[:60], max(0, min(len(texto[:60]), cursor)), False
+        self.atualizar()
+        self.animar()
+
+    def editar_busca(self, tecla, ctrl, mods):
+        """The search box behaves like a normal text field: typing inserts at the cursor, Ctrl+A selects
+        all (then typing replaces it), Ctrl+C / X / V, Ctrl+Backspace deletes a word, left/right/Home/End
+        move the cursor. Returns True if the key was used."""
+        q, c = self.consulta, min(self.cursor, len(self.consulta))
+        if ctrl and tecla in (Gdk.KEY_a, Gdk.KEY_A):
+            if q:
+                self.tudo = True
+                self.area.queue_draw()
+            return True
+        if ctrl and tecla in (Gdk.KEY_c, Gdk.KEY_C, Gdk.KEY_x, Gdk.KEY_X) and self.tudo and q:
+            subprocess.Popen(["wl-copy", q], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if tecla in (Gdk.KEY_x, Gdk.KEY_X):
+                self.mudar_busca("", 0)
+            return True
+        if ctrl and tecla in (Gdk.KEY_v, Gdk.KEY_V):
+            def colado(cb, res):
+                try:
+                    t = cb.read_text_finish(res)
+                except GLib.Error:
+                    t = None
+                if t:
+                    t = t.strip().splitlines()[0] if t.strip() else ""
+                    if self.tudo:
+                        self.mudar_busca(t, len(t))
+                    else:
+                        cc = min(self.cursor, len(self.consulta))
+                        self.mudar_busca(self.consulta[:cc] + t + self.consulta[cc:], cc + len(t))
+            self.get_display().get_clipboard().read_text_async(None, colado)
+            return True
+        if tecla == Gdk.KEY_BackSpace and q:
+            if self.tudo:
+                self.mudar_busca("", 0)
+            elif ctrl:
+                k = c
+                while k > 0 and q[k - 1] == " ":
+                    k -= 1
+                while k > 0 and q[k - 1] != " ":
+                    k -= 1
+                self.mudar_busca(q[:k] + q[c:], k)
+            elif c > 0:
+                self.mudar_busca(q[:c - 1] + q[c:], c - 1)
+            return True
+        if tecla == Gdk.KEY_Delete and q:
+            self.mudar_busca("" if self.tudo else q[:c] + q[c + 1:], 0 if self.tudo else c)
+            return True
+        if q and tecla in (Gdk.KEY_Left, Gdk.KEY_Right, Gdk.KEY_Home, Gdk.KEY_End):
+            if tecla == Gdk.KEY_Home:
+                c = 0
+            elif tecla == Gdk.KEY_End:
+                c = len(q)
+            elif ctrl:                                     # Ctrl+arrows: jump a word
+                passo = -1 if tecla == Gdk.KEY_Left else 1
+                c += passo
+                while 0 < c < len(q) and q[c - (1 if passo < 0 else 0)] != " ":
+                    c += passo
+            else:
+                c += -1 if tecla == Gdk.KEY_Left else 1
+            self.cursor, self.tudo = max(0, min(len(q), c)), False
+            self.area.queue_draw()
+            return True
         u = Gdk.keyval_to_unicode(tecla)
-        if u and chr(u).isprintable() and not ctrl and len(self.consulta) < 40:
-            self.consulta += chr(u)
-            self.atualizar()
+        if u and chr(u).isprintable() and not ctrl:
+            if self.tudo:
+                self.mudar_busca(chr(u), 1)
+            else:
+                self.mudar_busca(q[:c] + chr(u) + q[c:], c + 1)
             return True
         return False
 
