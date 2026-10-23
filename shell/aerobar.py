@@ -568,7 +568,7 @@ class Barra(Gtk.Window):
         self.gota = GotaSolida() if SOLIDO else Gota()
         if SOLIDO:                                # paleta nova (wallpaper, claro/escuro): só redesenha
             self._vigia_cores = solido.vigiar(lambda: (self.redesenhar(), self.gota.area.queue_draw()))
-        self.calendario = Calendario()
+        self.calendario = CalendarioSolido() if SOLIDO else Calendario()
         # hypr-botoes (the click watcher) sends SIGUSR1 when a click lands outside an open popup:
         # in Hyprland an invisible layer can't catch clicks, so this is how "click outside closes" works
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
@@ -1314,6 +1314,109 @@ class Calendario(Gtk.Window):
                 nw = texto(cr, None, num, 0, 0, "Doto Black 15", cor_num, medir=True)
                 texto(cr, None, num, cx - nw / 2, cy, "Doto Black 15", cor_num, a_num * k)
         cr.restore()
+
+
+class CalendarioSolido(Calendario):
+    """Solid: o mês em Material — superfície tonal, números em Inter, hoje num círculo da primária. Abre
+    como uma gaveta que ESCORRE da ilha do relógio: o painel nasce grudado na borda da ilha e desce,
+    preso por um pescoço líquido (solido.pescoco, em cairo); fecha se recolhendo pra dentro da ilha."""
+
+    GAP = 10                                   # o pescoço: da borda da ilha até o painel
+    ENTRA, SAI = 0.42, 0.28
+
+    def __init__(self):
+        super().__init__()
+        self.altura += self.GAP
+        self.area.set_content_height(self.altura)
+        prov = Gtk.CssProvider()                   # a janela não pinta nada: o painel é todo desenhado aqui
+        prov.load_from_string(".aerobar-gota { background: none; background-color: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def alternar(self, modulo):
+        if self.get_visible() and not self.saindo:
+            self.esconder()
+            return
+        hoje = time.localtime()
+        self.ano, self.mes = hoje.tm_year, hoje.tm_mon
+        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA - 3)      # encosta na borda de baixo da ilha
+        self.t0, self.saindo = time.monotonic(), False
+        self.set_visible(True)
+        self.present()
+        self.animar()
+
+    def _quadro(self, *_):
+        e = time.monotonic() - self.t0
+        self.area.queue_draw()
+        if self.saindo and e > self.SAI:
+            self.tique = None
+            self.set_visible(False)
+            return GLib.SOURCE_REMOVE
+        if not self.saindo and e > self.ENTRA:
+            self.tique = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def _clique(self, _g, _n, x, y):
+        if self.GAP <= y < 50 + self.GAP:
+            if x < 60:
+                self.mudar_mes(-1)
+            elif x > self.largura - 60:
+                self.mudar_mes(1)
+
+    def desenhar(self, _a, cr, w, h):
+        import calendar
+        t = time.monotonic() - self.t0
+        if self.saindo:
+            k = min(1.0, t / self.SAI)
+            e, alfa = 1 - k * k, 1 - solido.suave(0.0, 0.4, k)
+        else:
+            k = min(1.0, t / self.ENTRA)
+            e, alfa = 1 - (1 - k) ** 3, solido.suave(0.5, 1.0, k)
+        sup = cor_s("surface_container")
+        ph = h - self.GAP
+        pw, phh = 64 + (w - 64) * e, 18 + (ph - 18) * e
+        topo = self.GAP * e
+        x0 = (w - pw) / 2
+        cr.set_source_rgb(*sup)
+        pilula(cr, x0, topo, pw, phh, min(solido.raio(), phh / 2, pw / 2))
+        cr.fill()
+        solido.pescoco(cr, w / 2, 0, topo, 34, 42, self.GAP + 6)              # a gaveta continua presa à ilha
+        if alfa <= 0.01:
+            return
+        cr.push_group()
+        cr.translate(0, self.GAP)
+        on, dim, prim = cor_s("on_surface"), cor_s("on_surface_variant"), cor_s("primary")
+        titulo = time.strftime("%B %Y", (self.ano, self.mes, 1, 0, 0, 0, 0, 1, -1))
+        tw = texto_s(cr, titulo, 0, 0, 16, on, Pango.Weight.SEMIBOLD, medir=True)
+        texto_s(cr, titulo, w / 2 - tw / 2, 30, 16, on, Pango.Weight.SEMIBOLD)
+        for gx, cp in ((30, 0xF0141), (w - 30, 0xF0142)):                     # ‹ › (Material chevrons)
+            cr.set_source_rgb(*cor_s("surface_container_highest"))
+            cr.arc(gx, 30, 15, 0, 2 * math.pi)
+            cr.fill()
+            glifo_s(cr, cp, gx, 30, on, px=18)
+        for i, nome in enumerate(("M", "T", "W", "T", "F", "S", "S")):
+            nw = texto_s(cr, nome, 0, 0, 12, dim, medir=True)
+            texto_s(cr, nome, 18 + i * self.PASSO + self.PASSO / 2 - nw / 2, 60, 12, dim)
+        hoje = time.localtime()
+        for j, semana in enumerate(calendar.Calendar(0).monthdayscalendar(self.ano, self.mes)):
+            for i, dia in enumerate(semana):
+                if not dia:
+                    continue
+                cx = 18 + i * self.PASSO + self.PASSO / 2
+                cy = self.TOPO_GRADE + j * self.PASSO + self.PASSO / 2
+                eh_hoje = (self.ano, self.mes, dia) == (hoje.tm_year, hoje.tm_mon, hoje.tm_mday)
+                if eh_hoje:
+                    cr.set_source_rgb(*prim)
+                    cr.arc(cx, cy, 19, 0, 2 * math.pi)
+                    cr.fill()
+                cor = cor_s("on_primary") if eh_hoje else (dim if i >= 5 else on)
+                num = str(dia)
+                nw = texto_s(cr, num, 0, 0, 14, cor, Pango.Weight.SEMIBOLD if eh_hoje else Pango.Weight.NORMAL,
+                             medir=True)
+                texto_s(cr, num, cx - nw / 2, cy, 14, cor, Pango.Weight.SEMIBOLD if eh_hoje else Pango.Weight.NORMAL)
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(alfa)
 
 
 class Gota(Gtk.Window):
