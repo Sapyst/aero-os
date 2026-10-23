@@ -64,6 +64,13 @@ import visor  # noqa: E402
 import visitas  # noqa: E402
 import nuvem  # noqa: E402
 from nuvem import FG, RED, empacotar, pop, suave  # noqa: E402
+import solido  # noqa: E402
+
+# Solid: as bolhas são o metaball CHAPADO (liquido.CampoSolido: união líquida, sem meio-tom nem brilho),
+# o véu é a superfície tonal, o texto é Inter (nada de Doto) e o destaque é a primária da paleta.
+SOLIDO = solido.ativo()
+if SOLIDO:
+    FG, RED = solido.rgb("on_surface"), solido.rgb("primary")
 
 CASA = os.path.expanduser("~")
 DADOS = os.environ.get("AERO_DADOS", "/mnt/d")          # the data drive (shown as "D:" next to your folders)
@@ -1087,7 +1094,11 @@ class Orbita(nuvem.Nuvem):
         # the dark veil is a CSS box under the drawing (painted by the GPU, faded with set_opacity), not a
         # full-screen cairo paint every frame
         prov = Gtk.CssProvider()
-        prov.load_from_string(".orbit-veu { background-color: rgba(5, 5, 6, 0.84); }")
+        if SOLIDO:
+            sr, sg, sb = (round(c * 255) for c in solido.rgb("surface"))
+            prov.load_from_string(".orbit-veu { background-color: rgba(%d, %d, %d, 0.97); }" % (sr, sg, sb))
+        else:
+            prov.load_from_string(".orbit-veu { background-color: rgba(5, 5, 6, 0.84); }")
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
         self.veu = Gtk.Box(hexpand=True, vexpand=True, can_target=False)
         self.veu.add_css_class("orbit-veu")
@@ -1096,7 +1107,8 @@ class Orbita(nuvem.Nuvem):
         raiz.set_child(self.veu)
         # the liquid layer (GPU): bubbles are drops that pour in, join with necks, and the halftone around
         # them. Content (thumbnails, text) is drawn on top by cairo. Without GL it stays off (old drawing).
-        self.liquido = liquido.CampoLiquido()
+        self.liquido = (liquido.CampoSolido(cor=solido.rgb("surface_container_high"), k=16.0) if SOLIDO
+                        else liquido.CampoLiquido())
         raiz.add_overlay(self.liquido)
         # the media viewer paints inside its liquid window (visor.py); input still goes through self.area
         self.visor = visor.Visor()
@@ -2407,6 +2419,8 @@ class Orbita(nuvem.Nuvem):
 
     def _texto_cor(self, cr, s, x, y, fonte, cor, alfa):
         """Centred text (x, y = its centre). Returns the width."""
+        if SOLIDO and fonte.startswith("Doto Black"):            # Solid: texto normal, não de pontos
+            fonte = "Inter Semi-Bold" + fonte[len("Doto Black"):]
         cr.new_path()
         cache = self.__dict__.setdefault("_layouts", {})
         item = cache.get((s, fonte))
