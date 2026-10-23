@@ -500,7 +500,9 @@ class Barra(Gtk.Window):
         Camada.set_margin(self, Camada.Edge.TOP, TOPO)
         Camada.set_margin(self, Camada.Edge.LEFT, LADO)
         Camada.set_margin(self, Camada.Edge.RIGHT, LADO)
-        Camada.set_exclusive_zone(self, ALTURA)             # windows start under the bar, not under the glow room
+        # windows start under the bar, not under the glow room (Solid: right at the islands' bottom edge, so a
+        # panel opening under an island touches it and can grow out of it with a liquid neck)
+        Camada.set_exclusive_zone(self, ALTURA - 3 if SOLIDO else ALTURA)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
         self.set_default_size(-1, ALTURA + VAZAO)
         self.area = Gtk.DrawingArea(content_height=ALTURA + VAZAO, hexpand=True)
@@ -562,6 +564,7 @@ class Barra(Gtk.Window):
         mov.connect("leave", lambda *_: self.mudar_sobre(None))
         self.area.add_controller(mov)
 
+        self.molas_s, self.gotas_s, self.tique_s, self.ultimo_s, self._anotado_s = {}, [], None, None, None
         self.gota = GotaSolida() if SOLIDO else Gota()
         if SOLIDO:                                # paleta nova (wallpaper, claro/escuro): só redesenha
             self._vigia_cores = solido.vigiar(lambda: (self.redesenhar(), self.gota.area.queue_draw()))
@@ -610,6 +613,41 @@ class Barra(Gtk.Window):
 
     def visiveis(self, lista):
         return [m for m in lista if m.nome not in CFG["hide"]]
+
+    # ---------- Solid: molas, gotas e onde estão as ilhas ----------
+    def animar_solido(self):
+        if self.tique_s is None:
+            self.ultimo_s = None
+            self.tique_s = self.area.add_tick_callback(self._quadro_solido)
+
+    def _quadro_solido(self, _w, relogio):
+        agora = relogio.get_frame_time() / 1e6
+        dt = 1 / 60 if self.ultimo_s is None else min(0.05, agora - self.ultimo_s)
+        self.ultimo_s = agora
+        mexe = False
+        for mx, mw in self.molas_s.values():
+            mexe = mx.passo(dt) | mw.passo(dt) | mexe
+        self.area.queue_draw()
+        if not mexe and not self.gotas_s:
+            self.tique_s = None                      # parada: nenhum timer
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def anotar_solido(self, ilhas):
+        """~/.cache/aero-shell/aerobar-solido.json: ilhas e ícones (alvo, em pixels da tela) pros painéis
+        que nascem da barra. Reescrito só quando muda."""
+        icones = {m.nome: round(LADO + m.x + m.w / 2) for m in self.esquerda + self.centro + self.direita if m.w > 0}
+        alvo = [[round(LADO + a), round(LADO + b_)] for a, b_ in ilhas_solidas(self)]
+        dados = {"ilhas": alvo, "icones": icones, "base": TOPO + ALTURA - 3}
+        if dados == self._anotado_s:
+            return
+        self._anotado_s = dados
+        try:
+            with open(solido.ARQ_BARRA + ".tmp", "w") as f:
+                json.dump(dados, f)
+            os.replace(solido.ARQ_BARRA + ".tmp", solido.ARQ_BARRA)
+        except OSError:
+            pass
 
     def larg_de(self, m, cr):
         return largura_solida(self, m, cr) if SOLIDO else m.largura(cr)
@@ -1629,7 +1667,7 @@ def desenhar_modulo_solido(b, m, cr, x):
 
 
 def ilhas_solidas(b):
-    """As três ilhas (esquerda, centro, direita) como (x0, x1) — só as que têm algo visível."""
+    """As três ilhas (esquerda, centro, direita) como (x0, x1) no LAYOUT FINAL (alvo das molas)."""
     out = []
     for lista in (b.esquerda, b.centro, b.direita):
         vis = [m for m in b.visiveis(lista) if m.w > 0]
@@ -1638,23 +1676,110 @@ def ilhas_solidas(b):
     return out
 
 
+ENTRA_S, SAI_S = 0.5, 0.55            # s: a gota de um ícone novo subindo pra ilha / a de um que saiu caindo
+PONTE_S = 46                           # px: ilhas mais perto que isso se puxam com uma ponte líquida
+
+
+def _molas(b, m):
+    """As molas (x, largura) de um módulo; criadas paradas no lugar certo (sem animar no 1º quadro)."""
+    if m.nome not in b.molas_s:
+        b.molas_s[m.nome] = (solido.Mola(m.x), solido.Mola(m.w))
+    return b.molas_s[m.nome]
+
+
 def desenhar_barra_solida(b, cr, w):
+    """As ilhas Material. Tudo que muda de tamanho anda em MOLAS (criticamente amortecidas): um ícone
+    chegando abre espaço e entra como uma gota que sobe e se funde na ilha; um que sai cai como gota, com
+    o pescoço afinando até romper. Ilhas próximas se puxam com uma ponte líquida. Parado, nenhum timer."""
     b.medir(cr, w)
     y0, ph = 3, ALTURA - 6
-    cr.set_source_rgb(*cor_s("surface_container"))
-    b.gota.ilhas = ilhas_solidas(b)
-    for x0, x1 in b.gota.ilhas:
+    agora = time.monotonic()
+    primeira = not b.molas_s
+    mexe = False
+    grupos = []
+    for lista in (b.esquerda, b.centro, b.direita):
+        partes = []
+        for m in b.visiveis(lista):
+            mx, mw = _molas(b, m)
+            alvo_w = m.w if m.w > 0 else 0.0
+            if mw.alvo <= 0.5 < alvo_w:                                   # chegou: nasce no lugar (largura 0)
+                mx.x = mx.alvo = m.x + m.w / 2
+                mx.v = 0.0
+                if not primeira:
+                    b.gotas_s.append(("entra", m.nome, agora))             # ...e entra como gota
+            elif not primeira and alvo_w <= 0.5 < mw.alvo:               # saiu: cai como gota
+                b.gotas_s.append(("sai", (mx.x + mw.x / 2), agora))
+            if m.w > 0:
+                mx.alvo = m.x
+            mw.alvo = alvo_w
+            if mx.x != mx.alvo or mw.x != mw.alvo:
+                mexe = True
+            if mw.x > 0.5:
+                partes.append((m, mx.x, mw.x))
+        if partes:
+            grupos.append(partes)
+    b.gotas_s = [g for g in b.gotas_s if agora - g[2] < (ENTRA_S if g[0] == "entra" else SAI_S)]
+    if mexe or b.gotas_s:
+        b.animar_solido()
+    sup = cor_s("surface_container")
+    cr.set_source_rgb(*sup)
+    ilhas = []
+    for partes in grupos:
+        x0 = min(x for _m, x, _w in partes) - 2
+        x1 = max(x + ww for _m, x, ww in partes) + 2
+        ilhas.append((x0, x1))
         pilula(cr, x0, y0, x1 - x0, ph)
         cr.fill()
+    for (_a, xa), (xb, _b) in zip(ilhas, ilhas[1:]):                    # ilhas perto: a ponte líquida
+        solido.ponte(cr, xa, xb, y0, ph, PONTE_S)
+    b.gota.ilhas = ilhas
+    borda = y0 + ph
+    for tipo, quem, t0 in b.gotas_s:                                    # as gotas (mesma cor da ilha)
+        if tipo == "entra":
+            par = b.molas_s.get(quem)
+            if not par:
+                continue
+            cx = par[0].x + par[1].x / 2
+            k = solido.suave(0.0, 1.0, (agora - t0) / ENTRA_S)
+            e = 1 - (1 - k) ** 3
+            r = 4 + 5 * e
+            cy = (ALTURA + VAZAO - 6) + (ALTURA / 2 - (ALTURA + VAZAO - 6)) * e
+        else:
+            cx = quem
+            k = (agora - t0) / SAI_S
+            e = k * k
+            r = 9 - 5 * e
+            cy = ALTURA / 2 + ((ALTURA + VAZAO - 5) - ALTURA / 2) * e
+        alfa = 1.0 if tipo == "entra" else 1 - solido.suave(0.55, 1.0, k)
+        cr.set_source_rgba(*sup, alfa)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.fill()
+        if cy - r > borda - 1:                                            # fora da ilha: o pescoço
+            solido.pescoco(cr, cx, borda, cy - r, 9, r * 0.8, 15)
+    b.anotar_solido(ilhas)
     on = cor_s("on_surface")
-    for m in b.visiveis(b.esquerda + b.centro + b.direita):
-        if m.w <= 0:
-            continue
-        if m is b.sobre and CFG["hover"] and not isinstance(m, EspacoBandeja):    # a "state layer" do Material
-            pilula(cr, m.x + 1, y0 + 3, m.w - 2, ph - 6)
-            cr.set_source_rgba(*on, 0.09)
-            cr.fill()
-        desenhar_modulo_solido(b, m, cr, m.x)
+    for partes in grupos:
+        for m, x, ww in partes:
+            if m is b.sobre and CFG["hover"] and not isinstance(m, EspacoBandeja):   # a "state layer" do Material
+                pilula(cr, x + 1, y0 + 3, ww - 2, ph - 6)
+                cr.set_source_rgba(*on, 0.09)
+                cr.fill()
+            entrada = next((agora - g[2] for g in b.gotas_s if g[0] == "entra" and g[1] == m.nome), None)
+            alfa_ = 1.0 if entrada is None else solido.suave(0.45, 1.0, entrada / ENTRA_S)
+            if m.w == 0:                                                  # saindo: some enquanto encolhe
+                alfa_ = min(alfa_, max(0.0, ww / 30 - 0.2))
+            if alfa_ <= 0.01:
+                continue
+            cr.save()
+            cr.rectangle(x, 0, ww, ALTURA)                                # encolhendo: o conteúdo não vaza
+            cr.clip()
+            if alfa_ < 0.99:
+                cr.push_group()
+            desenhar_modulo_solido(b, m, cr, x)
+            if alfa_ < 0.99:
+                cr.pop_group_to_source()
+                cr.paint_with_alpha(alfa_)
+            cr.restore()
 
 
 def texto_dica_solida(b, m):
@@ -1799,21 +1924,9 @@ class GotaSolida(Gtk.Window):
         cr.set_source_rgb(*cor_s("surface_container"))
         pilula(cr, self.cx - hw, topo, 2 * hw, 2 * hh)
         cr.fill()
-        g = topo - borda
-        if g < self.PESCOCO:                                    # o pescoço líquido: afina até se soltar
-            s_ = 1 - max(0.0, g) / self.PESCOCO
-            a, b = self.limites
-            nb = max(2.0, min(6 + 8 * s_, self.cx - a, b - self.cx))   # largura na ilha
-            np_ = min(hw - 1, 6 + 6 * s_)                       # largura na pílula
-            nm = max(0.0, 7.5 * s_ ** 1.1 - 0.8)                # a cintura (afina até romper)
-            if nm > 0.2:
-                y1 = topo + min(hh, 4)
-                cr.move_to(self.cx - nb, borda - 2)
-                cr.curve_to(self.cx - nb * 0.55, borda + g * 0.4, self.cx - nm, y1 - g * 0.55, self.cx - np_, y1)
-                cr.line_to(self.cx + np_, y1)
-                cr.curve_to(self.cx + nm, y1 - g * 0.55, self.cx + nb * 0.55, borda + g * 0.4, self.cx + nb, borda - 2)
-                cr.close_path()
-                cr.fill()
+        a, b = self.limites                                     # o pescoço líquido (solido.pescoco)
+        solido.pescoco(cr, self.cx, borda, topo, max(2.0, min(14.0, self.cx - a, b - self.cx)),
+                       min(hw - 1, 12.0), self.PESCOCO)
         if alfa_txt > 0.01:
             lay = PangoCairo.create_layout(cr)
             lay.set_font_description(Pango.FontDescription.from_string("Inter Medium 9.5"))

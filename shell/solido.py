@@ -11,6 +11,9 @@ solido.py — o visual "Solid": formas chapadas e sólidas no estilo do Pixel (M
   vigiar(f)          a paleta mudou (wallpaper novo, claro/escuro): relê, recarrega o CSS e chama f()
   metaball(...)      uma animação de metaball chapado (liquido.CampoSolido) que só existe enquanto anima
   suave/ease         curvas de animação (smoothstep; "emphasized decelerate" do Material)
+  Mola               mola criticamente amortecida (tamanhos/posições que mudam: sem tween linear, sem pulo)
+  pescoco/ponte      o pescoço líquido em cairo (borda -> gota; pílula <-> pílula) pra quem não usa GL
+  barra()            onde estão as ilhas e os ícones da AeroBar (a AeroBar grava; os painéis nascem dali)
 
 Como a paleta nasce (a ideia do Material You, sem a biblioteca do Google):
   1) a SEMENTE é a cor que o sistema já tira do wallpaper (COR_DESTAQUE_WALL, gravada pelo
@@ -299,6 +302,77 @@ def enfatizado(t):
     return 3 * (1 - u) ** 2 * u * 0.7 + 3 * (1 - u) * u * u + u ** 3
 
 
+class Mola:
+    """Uma mola CRITICAMENTE AMORTECIDA (chega no alvo o mais rápido possível sem passar dele, sem
+    tremer): solução exata x(t) = alvo + (c1 + c2·t)·e^(-ω·t), então qualquer dt é estável.
+    omega ~ 2π / tempo de assentar. .passo(dt) devolve True enquanto ainda se mexe."""
+    def __init__(self, valor=0.0, omega=17.0):
+        self.x, self.v, self.alvo, self.w = float(valor), 0.0, float(valor), omega
+
+    def passo(self, dt):
+        d = self.x - self.alvo
+        if abs(d) < 0.05 and abs(self.v) < 0.5:
+            self.x, self.v = self.alvo, 0.0
+            return False
+        e = math.exp(-self.w * dt)
+        c2 = self.v + self.w * d
+        self.x = self.alvo + (d + c2 * dt) * e
+        self.v = (c2 - self.w * (d + c2 * dt)) * e
+        return True
+
+    @property
+    def parada(self):
+        return self.x == self.alvo and self.v == 0.0
+
+
+def pescoco(cr, cx, y_borda, y_alvo, larg_borda, larg_alvo, alcance):
+    """O pescoço líquido (em cairo, pra quem não usa GL) entre uma BORDA horizontal em y_borda e uma forma
+    cujo lado mais perto está em y_alvo (abaixo ou acima da borda). Afina com a distância e some (rompe)
+    em `alcance`. Só monta o caminho e preenche com a cor atual do cr. Devolve True se desenhou."""
+    d = 1.0 if y_alvo >= y_borda else -1.0
+    g = (y_alvo - y_borda) * d
+    if g >= alcance:
+        return False
+    s_ = 1 - max(0.0, g) / alcance
+    nb = larg_borda * (0.5 + 0.5 * s_)
+    np_ = larg_alvo * (0.5 + 0.5 * s_)
+    nm = max(0.0, min(nb, np_) * s_ ** 1.1 - 0.8)                # a cintura: afina até romper
+    if nm <= 0.2:
+        return False
+    y0, y1 = y_borda - 2 * d, y_alvo + 3 * d
+    cr.move_to(cx - nb, y0)
+    cr.curve_to(cx - nb * 0.55, y_borda + g * 0.4 * d, cx - nm, y1 - g * 0.55 * d, cx - np_, y1)
+    cr.line_to(cx + np_, y1)
+    cr.curve_to(cx + nm, y1 - g * 0.55 * d, cx + nb * 0.55, y_borda + g * 0.4 * d, cx + nb, y0)
+    cr.close_path()
+    cr.fill()
+    return True
+
+
+def ponte(cr, xa, xb, y0, h, alcance):
+    """A ponte líquida (cairo) entre duas pílulas na mesma linha: a da esquerda termina em xa, a da direita
+    começa em xb (y0 = topo, h = altura das duas). Perto, uma cintura as une; longe, ela afina e rompe."""
+    g = xb - xa
+    if g >= alcance:
+        return False
+    s_ = 1 - max(0.0, g) / alcance
+    cy, r = y0 + h / 2, h / 2
+    meia = max(0.0, r * s_ ** 1.2 - 0.6)                         # meia altura da cintura
+    if meia <= 0.2:
+        return False
+    a, b = xa - r * 0.75, xb + r * 0.75                           # entra um pouco nas pontas redondas
+    m = (xa + xb) / 2
+    cr.move_to(a, y0 + 1)
+    cr.curve_to(a + (m - a) * 0.6, y0 + 1, m - g * 0.2, cy - meia, m, cy - meia)
+    cr.curve_to(m + g * 0.2, cy - meia, b - (b - m) * 0.6, y0 + 1, b, y0 + 1)
+    cr.line_to(b, y0 + h - 1)
+    cr.curve_to(b - (b - m) * 0.6, y0 + h - 1, m + g * 0.2, cy + meia, m, cy + meia)
+    cr.curve_to(m - g * 0.2, cy + meia, a + (m - a) * 0.6, y0 + h - 1, a, y0 + h - 1)
+    cr.close_path()
+    cr.fill()
+    return True
+
+
 def metaball(overlay, dur, quadro, cor, fim=None, k=22.0, abaixo_de=None):
     """Uma animação de metaball CHAPADO por cima do overlay (Gtk.Overlay), só enquanto anima.
     quadro(t) -> (gotas [(x, y, r)], caixas [(cx, cy, meia_l, meia_a, canto)]) em pixels lógicos do overlay,
@@ -403,6 +477,21 @@ headerbar {{ box-shadow: none; }}
 def vars_shell(escuro):
     e = esquema(escuro)
     return "\n".join(f"SOLID_{k.upper()}={v}" for k, v in e.items() if k != "dark")
+
+
+# ---------- a AeroBar conta onde estão as ilhas e os ícones ----------
+ARQ_BARRA = os.path.join(H, ".cache/aero-shell/aerobar-solido.json")
+
+
+def barra():
+    """{"ilhas": [[x0, x1], ...], "icones": {nome: x}, "base": y da borda de baixo das ilhas} em pixels da
+    tela, ou {} se a AeroBar (Solid) não gravou. Os painéis que nascem da barra usam isso."""
+    try:
+        with open(ARQ_BARRA) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 # ---------- o wallpaper padrão ----------
