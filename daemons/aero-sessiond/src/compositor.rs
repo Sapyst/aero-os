@@ -1,0 +1,353 @@
+//! Camada de abstração do compositor (`trait Compositor`).
+//!
+//! Por que este módulo existe separado?
+//! Hoje o Aero OS roda sobre o Hyprland, mas no futuro próximo vai rodar sobre o compositor
+//! próprio (**Daimon**). Toda conversa com o compositor (listar janelas abertas para detectar
+//! jogos, listar monitores e trocar a taxa de atualização em Hz, descobrir o workspace ativo
+//! e escutar eventos de janela/monitor/workspace) fica isolada atrás da trait [`Compositor`].
+//!
+//! Quando o Daimon assumir, basta criar `DaimonCompositor` implementando [`Compositor`]
+//! (falando com o socket do `daimonctl`) sem tocar em uma linha sequer de `bateria.rs`,
+//! `taxa.rs` ou `icones.rs`.
+
+use serde::Deserialize;
+use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::thread;
+use std::time::Duration;
+
+/// Eventos emitidos pelo compositor que interessam ao `aero-sessiond`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum EventoCompositor {
+    /// Uma janela foi aberta: `(endereco_sem_0x, classe)`.
+    JanelaAberta { endereco: String, classe: String },
+    /// Uma janela foi fechada: `endereco_sem_0x`.
+    JanelaFechada { endereco: String },
+    /// Configuração recarregada (`configreloaded`) ou monitor conectado (`monitoradded`/`monitoraddedv2`).
+    MonitoresOuConfigMudaram,
+    /// Usuário trocou para a área de trabalho `id` (`workspacev2`).
+    WorkspaceMudou(i32),
+}
+
+/// Dados de um monitor conectado e ativo, independentes do compositor.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct MonitorInfo {
+    pub nome: String,
+    pub largura: i32,
+    pub altura: i32,
+    pub x: i32,
+    pub y: i32,
+    pub escala: f64,
+    pub taxa_atual: f64,
+    pub modos_disponiveis: Vec<String>,
+    pub espelho_de: Option<String>,
+    pub transformacao: i32,
+}
+
+impl MonitorInfo {
+    /// Extrai todas as taxas de atualização (Hz) disponíveis na resolução atual do monitor,
+    /// ordenadas da menor para a maior (mesma lógica de `servicos/telas.py::taxas`).
+    #[allow(dead_code)]
+    pub fn taxas_na_resolucao(&self) -> Vec<f64> {
+        let prefixo = format!("{}x{}@", self.largura, self.altura);
+        let mut taxas: Vec<f64> = Vec::new();
+        for modo in &self.modos_disponiveis {
+            if let Some(resto) = modo.strip_prefix(&prefixo) {
+                let limpo = resto.strip_suffix("Hz").unwrap_or(resto);
+                if let Ok(hz) = limpo.parse::<f64>()
+                    && !taxas.iter().any(|&x| (x - hz).abs() < 0.005)
+                {
+                    taxas.push(hz);
+                }
+            }
+        }
+        taxas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        taxas
+    }
+
+    /// Calcula a taxa-alvo para o modo pedido (`"max"` = maior disponível; `"60"` = mais próxima de 60 Hz).
+    #[allow(dead_code)]
+    pub fn taxa_alvo(&self, modo: &str) -> f64 {
+        let taxas = self.taxas_na_resolucao();
+        if taxas.is_empty() {
+            return self.taxa_atual;
+        }
+        if modo == "max" {
+            taxas.into_iter().fold(f64::MIN, f64::max)
+        } else {
+            taxas
+                .into_iter()
+                .min_by(|a, b| {
+                    (a - 60.0)
+                        .abs()
+                        .partial_cmp(&(b - 60.0).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(self.taxa_atual)
+        }
+    }
+}
+
+/// Contrato abstrato de comunicação com o compositor da sessão.
+pub trait Compositor: Send + Sync {
+    /// Lista todas as janelas abertas no momento como pares `(endereco_sem_0x, classe)`.
+    fn janelas_abertas(&self) -> Vec<(String, String)>;
+
+    /// Lista todos os monitores ativos (não desativados).
+    #[allow(dead_code)]
+    fn monitores(&self) -> Vec<MonitorInfo>;
+
+    /// Aplica uma nova taxa de atualização (`hz`) a um monitor preservando resolução, posição,
+    /// escala, espelhamento e rotação.
+    #[allow(dead_code)]
+    fn definir_taxa(&self, monitor: &MonitorInfo, hz: f64) -> bool;
+
+    /// Retorna o ID numérico da área de trabalho ativa no momento (0 se indisponível).
+    #[allow(dead_code)]
+    fn area_ativa(&self) -> i32;
+
+    /// Escuta continuamente o fluxo de eventos do compositor (bloqueante; rodar em thread própria)
+    /// e envia cada [`EventoCompositor`] relevante através da função `enviar`.
+    fn escutar_eventos(&self, enviar: Box<dyn Fn(EventoCompositor) + Send>);
+}
+
+/// Implementação de [`Compositor`] para o Hyprland usando os sockets Unix nativos
+/// (`.socket.sock` para comandos/JSON e `.socket2.sock` para eventos em tempo real,
+/// sem criar processos `hyprctl`).
+#[derive(Default, Clone)]
+pub struct HyprlandCompositor;
+
+impl HyprlandCompositor {
+    /// Descobre a pasta da instância atual do Hyprland em `$XDG_RUNTIME_DIR/hypr/<assinatura>`.
+    fn pasta_socket() -> Option<PathBuf> {
+        let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+            let uid = unsafe { libc::getuid() };
+            format!("/run/user/{uid}")
+        });
+        let base = PathBuf::from(xdg).join("hypr");
+        if let Ok(sig) = env::var("HYPRLAND_INSTANCE_SIGNATURE")
+            && !sig.is_empty()
+        {
+            let candidata = base.join(&sig);
+            if candidata.join(".socket.sock").exists() {
+                return Some(candidata);
+            }
+        }
+        // Reserva caso HYPRLAND_INSTANCE_SIGNATURE não esteja no ambiente ou tenha mudado
+        if let Ok(entradas) = fs::read_dir(&base) {
+            for e in entradas.flatten() {
+                let p = e.path();
+                if p.join(".socket.sock").exists() {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// Envia um comando ao `.socket.sock` do Hyprland e devolve a resposta em texto.
+    fn pedir(cmd: &str) -> Option<String> {
+        let sock = Self::pasta_socket()?.join(".socket.sock");
+        let mut stream = UnixStream::connect(sock).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        stream.write_all(cmd.as_bytes()).ok()?;
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).ok()?;
+        Some(resp)
+    }
+}
+
+#[derive(Deserialize)]
+struct HyprClient {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    class: String,
+}
+
+#[derive(Deserialize)]
+struct HyprMonitor {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    width: i32,
+    #[serde(default)]
+    height: i32,
+    #[serde(default)]
+    x: i32,
+    #[serde(default)]
+    y: i32,
+    #[serde(default = "escala_padrao")]
+    scale: f64,
+    #[serde(rename = "refreshRate", default)]
+    refresh_rate: f64,
+    #[serde(rename = "availableModes", default)]
+    available_modes: Vec<String>,
+    #[serde(rename = "mirrorOf", default)]
+    mirror_of: Option<String>,
+    #[serde(default)]
+    transform: i32,
+    #[serde(default)]
+    disabled: bool,
+}
+
+fn escala_padrao() -> f64 {
+    1.0
+}
+
+#[derive(Deserialize)]
+struct HyprWorkspace {
+    #[serde(default)]
+    id: i32,
+}
+
+/// Formata a escala como o `:g` do Python (ex.: `1.0` -> `"1"`, `1.25` -> `"1.25"`).
+fn formatar_escala(escala: f64) -> String {
+    let s = format!("{escala:.4}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() {
+        "1".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+impl Compositor for HyprlandCompositor {
+    fn janelas_abertas(&self) -> Vec<(String, String)> {
+        let Some(txt) = Self::pedir("j/clients") else {
+            return Vec::new();
+        };
+        let Ok(clientes) = serde_json::from_str::<Vec<HyprClient>>(&txt) else {
+            return Vec::new();
+        };
+        clientes
+            .into_iter()
+            .map(|c| {
+                let end = c.address.strip_prefix("0x").unwrap_or(&c.address).to_string();
+                (end, c.class)
+            })
+            .collect()
+    }
+
+    fn monitores(&self) -> Vec<MonitorInfo> {
+        let Some(txt) = Self::pedir("j/monitors all") else {
+            return Vec::new();
+        };
+        let Ok(lista) = serde_json::from_str::<Vec<HyprMonitor>>(&txt) else {
+            return Vec::new();
+        };
+        lista
+            .into_iter()
+            .filter(|m| !m.disabled)
+            .map(|m| MonitorInfo {
+                nome: m.name,
+                largura: m.width,
+                altura: m.height,
+                x: m.x,
+                y: m.y,
+                escala: m.scale,
+                taxa_atual: m.refresh_rate,
+                modos_disponiveis: m.available_modes,
+                espelho_de: m.mirror_of.filter(|s| !s.is_empty() && s != "none"),
+                transformacao: m.transform,
+            })
+            .collect()
+    }
+
+    fn definir_taxa(&self, m: &MonitorInfo, hz: f64) -> bool {
+        let mut regra = format!(
+            "{},{}x{}@{:.2},{}x{},{}",
+            m.nome,
+            m.largura,
+            m.altura,
+            hz,
+            m.x,
+            m.y,
+            formatar_escala(m.escala)
+        );
+        if let Some(ref espelho) = m.espelho_de {
+            regra.push_str(&format!(",mirror,{espelho}"));
+        }
+        if m.transformacao != 0 {
+            regra.push_str(&format!(",transform,{}", m.transformacao));
+        }
+        Self::pedir(&format!("keyword monitor {regra}")).is_some()
+    }
+
+    fn area_ativa(&self) -> i32 {
+        let Some(txt) = Self::pedir("j/activeworkspace") else {
+            return 0;
+        };
+        serde_json::from_str::<HyprWorkspace>(&txt)
+            .map(|w| w.id)
+            .unwrap_or(0)
+    }
+
+    fn escutar_eventos(&self, enviar: Box<dyn Fn(EventoCompositor) + Send>) {
+        loop {
+            if let Some(pasta) = Self::pasta_socket()
+                && let Ok(stream) = UnixStream::connect(pasta.join(".socket2.sock"))
+            {
+                let leitor = BufReader::new(stream);
+                for linha in leitor.lines().map_while(Result::ok) {
+                    let Some((nome, dados)) = linha.split_once(">>") else {
+                        continue;
+                    };
+                    match nome {
+                        "openwindow" => {
+                            // Formato: ENDERECO,WORKSPACE,CLASSE,TITULO
+                            let mut partes = dados.splitn(4, ',');
+                            let end = partes.next().unwrap_or("").trim_start_matches("0x").to_string();
+                            let _ws = partes.next();
+                            let classe = partes.next().unwrap_or("").to_string();
+                            if !end.is_empty() {
+                                enviar(EventoCompositor::JanelaAberta {
+                                    endereco: end,
+                                    classe,
+                                });
+                            }
+                        }
+                        "closewindow" => {
+                            let end = dados.trim().trim_start_matches("0x").to_string();
+                            if !end.is_empty() {
+                                enviar(EventoCompositor::JanelaFechada { endereco: end });
+                            }
+                        }
+                        "configreloaded" | "monitoradded" | "monitoraddedv2" => {
+                            enviar(EventoCompositor::MonitoresOuConfigMudaram);
+                        }
+                        "workspacev2" => {
+                            if let Some(id_str) = dados.split(',').next()
+                                && let Ok(id) = id_str.trim().parse::<i32>()
+                            {
+                                enviar(EventoCompositor::WorkspaceMudou(id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+/// Inicia uma thread dedicada para escutar eventos do compositor e enviá-los ao canal principal.
+pub fn iniciar_escuta<M, F>(compositor: &'static dyn Compositor, tx: Sender<M>, mapear: F)
+where
+    M: Send + 'static,
+    F: Fn(EventoCompositor) -> M + Send + 'static,
+{
+    thread::spawn(move || {
+        compositor.escutar_eventos(Box::new(move |ev| {
+            let _ = tx.send(mapear(ev));
+        }));
+    });
+}

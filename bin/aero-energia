@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Energia inteligente: limitador de carga, bypass, salvar o momento, modo de energia automático.
+# Sem argumentos (daemon): supervisionado pelo aero-supervise (aero-sessiond em Rust, com volta automática para bateria.py).
+# Com argumentos (--waybar, --alternar, --cheia, --status): executa direto no aero-sessiond (ou bateria.py como reserva).
+if [ $# -gt 0 ]; then
+    if [ -x "$HOME/.local/bin/aero-sessiond" ]; then
+        exec "$HOME/.local/bin/aero-sessiond" "$@"
+    fi
+    exec python3 -I "$HOME/.local/share/aero-shell/bateria.py" "$@"
+fi
+exec "$HOME/.local/bin/aero-supervise" session "Session" "$HOME/.local/bin/aero-sessiond" \
+    "python3 -I $HOME/.local/share/aero-shell/bateria.py"
