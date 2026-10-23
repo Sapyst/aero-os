@@ -128,7 +128,51 @@ void main() {
 """ % {"MAX": MAX}
 
 
+# Solid (visual Solid, Material): a mesma união líquida (smin) das formas, mas CHAPADA — uma cor só, sem
+# meio-tom, sem brilho, sem óleo. É o metaball das animações do Solid: um bloco nascendo do botão com um
+# "pescoço" líquido, um cartão se soltando do sino... Só existe durante a animação (quem usa tira do overlay).
+CORPO_SOLIDO = """
+uniform vec2 res;
+uniform float esc;
+uniform int n;
+uniform vec3 b[%(MAX)d];
+uniform int nr;
+uniform vec4 rr[4];
+uniform float rc[4];
+uniform float k;
+uniform float geral;
+uniform vec4 cor_solida;   // rgb + alfa (não pré-multiplicado)
+out vec4 cor;
+
+float smin(float a, float c, float kk) {
+  float h = max(kk - abs(a - c), 0.) / kk;
+  return min(a, c) - h * h * kk * .25;
+}
+float caixa(vec2 p, vec4 r, float c) {
+  vec2 q = abs(p - r.xy) - (r.zw - c);
+  return length(max(q, 0.)) + min(max(q.x, q.y), 0.) - c;
+}
+void main() {
+  vec2 p = vec2(gl_FragCoord.x, res.y - gl_FragCoord.y) / esc;
+  float d = 1e5;
+  for (int i = 0; i < %(MAX)d; i++) {
+    if (i >= n) break;
+    vec3 s = b[i];
+    if (s.z > .3) d = smin(d, length(p - s.xy) - s.z, k);
+  }
+  for (int i = 0; i < 4; i++) {
+    if (i >= nr) break;
+    d = smin(d, caixa(p, rr[i], rc[i]), k);
+  }
+  float a = (1. - smoothstep(-.75 / esc, .75 / esc, d)) * cor_solida.a * geral;
+  cor = vec4(cor_solida.rgb * a, a);
+}
+""" % {"MAX": MAX}
+
+
 class CampoLiquido(Gtk.GLArea):
+    corpo = CORPO
+
     def __init__(self, k=16.0, celula=13.0, alcance=64.0):
         super().__init__(hexpand=True, vexpand=True, can_target=False, has_depth_buffer=False)
         self.set_auto_render(False)
@@ -156,7 +200,7 @@ class CampoLiquido(Gtk.GLArea):
             es = self.get_context().get_use_es()
             topo = "#version 300 es\nprecision highp float;\n" if es else "#version 330 core\n"
             vs = topo + "in vec2 pos; void main() { gl_Position = vec4(pos, 0., 1.); }"
-            self.prog = self._programa(vs, topo + CORPO)
+            self.prog = self._programa(vs, topo + self.corpo)
             gen = _gl("glGenVertexArrays", None, GLsizei, ctypes.POINTER(GLuint))
             bind_vao = _gl("glBindVertexArray", None, GLuint)
             vao, vbo = GLuint(), GLuint()
@@ -174,7 +218,9 @@ class CampoLiquido(Gtk.GLArea):
             self.vao = vao
             uni = _gl("glGetUniformLocation", GLint, GLuint, ctypes.c_char_p)
             self.u = {nome: uni(self.prog, nome.encode()) for nome in
-                      ("res", "esc", "n", "b", "k", "celula", "alcance", "geral", "t", "nr", "rr", "rc")}
+                      ("res", "esc", "n", "b", "k", "celula", "alcance", "geral", "t", "nr", "rr", "rc",
+                       "cor_solida")}
+            self.f_4f = _gl("glUniform4f", None, GLint, GLfloat, GLfloat, GLfloat, GLfloat)
             self.f_use = _gl("glUseProgram", None, GLuint)
             self.f_vao = bind_vao
             self.f_2f = _gl("glUniform2f", None, GLint, GLfloat, GLfloat)
@@ -242,8 +288,20 @@ class CampoLiquido(Gtk.GLArea):
         self.f_1f(self.u["alcance"], self.alcance)
         self.f_1f(self.u["geral"], self.geral)
         self.f_1f(self.u["t"], (time.monotonic() % 1000.0))
+        if self.u["cor_solida"] >= 0:
+            self.f_4f(self.u["cor_solida"], *self.cor)
         self.f_draw(TRIANGLE_STRIP, 0, 4)
         return True
+
+
+class CampoSolido(CampoLiquido):
+    """O metaball chapado do Solid: CampoSolido(cor=(r, g, b), k=22). .formas(gotas, geral, janelas) como no
+    CampoLiquido. Feito pra viver só durante uma animação: quem cria tira do overlay quando ela acaba."""
+    corpo = CORPO_SOLIDO
+
+    def __init__(self, cor=(0.2, 0.2, 0.2), alfa=1.0, k=22.0):
+        super().__init__(k=k)
+        self.cor = (*cor[:3], alfa)
 
 
 def gotas_de_nascimento(x, y, r, idade, semente):

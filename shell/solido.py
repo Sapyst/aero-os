@@ -8,6 +8,9 @@ solido.py — o visual "Solid": formas chapadas e sólidas no estilo do Pixel (M
   raio()             o raio dos cantos do sistema (RAIO_CANTOS do painel.conf; 24 se não tiver)
   css_shell()        o CSS GTK das peças do shell no Solid (cores com nome + classes .solid-*)
   aplicar_css()      carrega o css_shell() no display (uma vez por processo)
+  vigiar(f)          a paleta mudou (wallpaper novo, claro/escuro): relê, recarrega o CSS e chama f()
+  metaball(...)      uma animação de metaball chapado (liquido.CampoSolido) que só existe enquanto anima
+  suave/ease         curvas de animação (smoothstep; "emphasized decelerate" do Material)
 
 Como a paleta nasce (a ideia do Material You, sem a biblioteca do Google):
   1) a SEMENTE é a cor que o sistema já tira do wallpaper (COR_DESTAQUE_WALL, gravada pelo
@@ -228,11 +231,11 @@ def css_shell(esq=None):
 """
 
 
-_css_ok = [False]
+_provedor = [None]
 
 
 def aplicar_css(prioridade_extra=2):
-    if _css_ok[0]:
+    if _provedor[0] is not None:
         return
     import gi
     gi.require_version("Gtk", "4.0")
@@ -241,7 +244,110 @@ def aplicar_css(prioridade_extra=2):
     p.load_from_string(css_shell())
     Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), p,
                                               Gtk.STYLE_PROVIDER_PRIORITY_USER + prioridade_extra)
-    _css_ok[0] = True
+    _provedor[0] = p
+
+
+ARQ_CORES = os.path.join(H, ".cache/hypr-tema/cores")      # o hypr-tema reescreve a cada troca de cor/tema
+
+
+def vigiar(ao_mudar=None):
+    """Vigia a troca de cores (inotify, zero custo parado). Ao mudar: relê a paleta, recarrega o CSS do
+    shell (se aplicar_css() foi usado) e chama ao_mudar(). Guarde o retorno (o monitor) num atributo."""
+    from gi.repository import Gio, GLib
+    mon = Gio.File.new_for_path(ARQ_CORES).monitor_file(Gio.FileMonitorFlags.NONE, None)
+    pendente = [None]
+
+    def ir():
+        pendente[0] = None
+        recarregar()
+        if _provedor[0] is not None:
+            _provedor[0].load_from_string(css_shell())
+        if ao_mudar:
+            ao_mudar()
+        return False
+
+    def mudou(*_):
+        if pendente[0] is None:
+            pendente[0] = GLib.timeout_add(150, ir)
+    mon.connect("changed", mudou)
+    return mon
+
+
+# ---------- movimento ----------
+
+def suave(a, b, x):
+    if x <= a:
+        return 0.0
+    if x >= b:
+        return 1.0
+    t = (x - a) / (b - a)
+    return t * t * (3 - 2 * t)
+
+
+def enfatizado(t):
+    """O "emphasized decelerate" do Material 3 (cubic-bezier .05 .7 .1 1): sai rápido, assenta macio."""
+    t = max(0.0, min(1.0, t))
+    lo, hi = 0.0, 1.0
+    for _ in range(22):                       # acha u com x(u) = t na bezier (0,0)(.05,.7)(.1,1)(1,1)
+        u = (lo + hi) / 2
+        x = 3 * (1 - u) ** 2 * u * 0.05 + 3 * (1 - u) * u * u * 0.1 + u ** 3
+        lo, hi = (u, hi) if x < t else (lo, u)
+    u = (lo + hi) / 2
+    return 3 * (1 - u) ** 2 * u * 0.7 + 3 * (1 - u) * u * u + u ** 3
+
+
+def metaball(overlay, dur, quadro, cor, fim=None, k=22.0, abaixo_de=None):
+    """Uma animação de metaball CHAPADO por cima do overlay (Gtk.Overlay), só enquanto anima.
+    quadro(t) -> (gotas [(x, y, r)], caixas [(cx, cy, meia_l, meia_a, canto)]) em pixels lógicos do overlay,
+    t de 0 a 1. Quando t chega a 1 a GLArea sai do overlay (sem GL parado) e fim() é chamado.
+    Sem OpenGL: nada é desenhado e fim() vem no tempo certo do mesmo jeito. Devolve um objeto com .parar().
+    abaixo_de: um overlay que deve ficar POR CIMA do metaball (o texto, por exemplo)."""
+    from gi.repository import GLib
+    from liquido import CampoSolido
+    campo = CampoSolido(cor=cor, k=k)
+    if abaixo_de is not None and abaixo_de.get_parent() is overlay:
+        campo.insert_before(overlay, abaixo_de)
+    else:
+        overlay.add_overlay(campo)
+    estado = {"t0": None, "vivo": True}
+
+    def acabar():
+        if estado["vivo"]:
+            estado["vivo"] = False
+            if campo.get_parent() is overlay:
+                overlay.remove_overlay(campo)
+            if fim:
+                fim()
+
+    def tique(_w, relogio):
+        if not estado["vivo"]:
+            return GLib.SOURCE_REMOVE
+        agora = relogio.get_frame_time() / 1e6
+        if estado["t0"] is None:
+            estado["t0"] = agora
+        t = min(1.0, (agora - estado["t0"]) / max(0.01, dur))
+        gotas, caixas = quadro(t)
+        campo.formas(list(gotas), 1.0, list(caixas))
+        if t >= 1.0:
+            GLib.idle_add(lambda: acabar() and False)
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+    campo.add_tick_callback(tique)
+
+    class _Anim:
+        """parar(): interrompe (a GLArea sai na hora); com chamar_fim=True, chama o fim() também."""
+        def parar(self_, chamar_fim=False):
+            if chamar_fim:
+                return acabar()
+            if estado["vivo"]:
+                estado["vivo"] = False
+                if campo.get_parent() is overlay:
+                    overlay.remove_overlay(campo)
+
+        @property
+        def vivo(self_):
+            return estado["vivo"]
+    return _Anim()
 
 
 def css_gtk(escuro):

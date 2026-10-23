@@ -17,6 +17,11 @@ Data comes from the system directly (no polling loop for what can be followed):
   notifications                Hermes (com.aero.Hermes) every 2 s
 
 Its layer is "aerobar"; the tray (bandeja.py) and Hermes read ~/.config/aero/aerobar.json to line up with it.
+
+No visual Solid (solido.py) a mesma barra vira Material: três ilhas em pílula (surface container), ícones
+Material (os "md" da Nerd Font), texto normal em Inter, áreas de trabalho como pontinhos com a ativa em pílula,
+bateria deitada estilo Pixel e a dica de hover numa pílula sólida que nasce do ícone num metaball. As cores
+vêm da paleta tonal e mudam ao vivo (solido.vigiar). No DotStyle continua tudo em pontos.
 """
 import json
 import math
@@ -37,6 +42,11 @@ gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import solido  # noqa: E402
+
+SOLIDO = solido.ativo()          # visual Solid: a barra Material (lido ao iniciar; trocar de visual reinicia a barra)
 
 H = os.path.expanduser("~")
 BIN = os.path.join(H, ".local/bin")
@@ -552,7 +562,9 @@ class Barra(Gtk.Window):
         mov.connect("leave", lambda *_: self.mudar_sobre(None))
         self.area.add_controller(mov)
 
-        self.gota = Gota()
+        self.gota = GotaSolida() if SOLIDO else Gota()
+        if SOLIDO:                                # paleta nova (wallpaper, claro/escuro): só redesenha
+            self._vigia_cores = solido.vigiar(lambda: (self.redesenhar(), self.gota.area.queue_draw()))
         self.calendario = Calendario()
         # hypr-botoes (the click watcher) sends SIGUSR1 when a click lands outside an open popup:
         # in Hyprland an invisible layer can't catch clicks, so this is how "click outside closes" works
@@ -599,28 +611,33 @@ class Barra(Gtk.Window):
     def visiveis(self, lista):
         return [m for m in lista if m.nome not in CFG["hide"]]
 
+    def larg_de(self, m, cr):
+        return largura_solida(self, m, cr) if SOLIDO else m.largura(cr)
+
     def medir(self, cr, w):
         def larg(lista):
-            return sum(m.largura(cr) for m in lista)
+            return sum(self.larg_de(m, cr) for m in lista)
         for m in self.esquerda + self.centro + self.direita:
             m.x, m.w = 0, 0
         esq, cen, dir_ = self.visiveis(self.esquerda), self.visiveis(self.centro), self.visiveis(self.direita)
         ce, de = larg(cen), larg(dir_)
         x = 6
         for m in esq:
-            m.x, m.w = x, m.largura(cr)
+            m.x, m.w = x, self.larg_de(m, cr)
             x += m.w
         x = w / 2 - ce / 2                                    # the clock: exact middle, always
         for m in cen:
-            m.x, m.w = x, m.largura(cr)
+            m.x, m.w = x, self.larg_de(m, cr)
             x += m.w
         x = w - 6 - de
         for m in dir_:
-            m.x, m.w = x, m.largura(cr)
+            m.x, m.w = x, self.larg_de(m, cr)
             x += m.w
         self.anotar_sino(w)
 
     def desenhar(self, _area, cr, w, h):
+        if SOLIDO:
+            return desenhar_barra_solida(self, cr, w)
         h = ALTURA                                            # below it is only room for the glow
         r = min(CFG["radius"], h / 2)
         if CFG["background"] != "none" or CFG["outline"]:
@@ -735,7 +752,10 @@ class Barra(Gtk.Window):
             if getattr(self, "_dica_id", None):
                 GLib.source_remove(self._dica_id)
                 self._dica_id = None
-            if m is not None and m.nome == "ultrasu":
+            if m is not None and SOLIDO and m.nome not in ("workspaces", "tray"):
+                self.gota.esconder()
+                self._dica_id = GLib.timeout_add(380, lambda mm=m: self._mostrar_dica(mm))
+            elif m is not None and m.nome == "ultrasu":
                 mins = minutos_ultrasu(self.ultrasu)
                 texto_ = f"{mins // 60}H {mins % 60:02d}M" if mins is not None else "CLOSED"
                 cor = cor_ultrasu(mins) or DIM
@@ -750,7 +770,7 @@ class Barra(Gtk.Window):
         self._dica_id = None
         if m is not self.sobre:
             return False
-        texto_ = self.texto_dica(m)
+        texto_ = texto_dica_solida(self, m) if SOLIDO else self.texto_dica(m)
         if texto_:
             self.gota.mostrar(texto_, ESCURA["FG"], m.x + m.w / 2, self.largura_tela())
         return False
@@ -815,7 +835,8 @@ class Barra(Gtk.Window):
         self.cada(2, self.ler_notificacoes)
         self.cada(10, self.ler_rede)
         self.cada(15, self.ler_ultrasu)
-        self.cada(3, self.ler_papel)              # per-workspace wallpapers change on switch: cheap check
+        if not SOLIDO:                            # o contraste automático (wallpaper sob a barra) é só do DotStyle
+            self.cada(3, self.ler_papel)          # per-workspace wallpapers change on switch: cheap check
         threading.Thread(target=self.ouvir_hyprland, daemon=True).start()
         threading.Thread(target=self.ouvir_pactl, daemon=True).start()
         self.ouvir_perfil()
@@ -970,7 +991,7 @@ class Barra(Gtk.Window):
                 self.bat_dica += " · power saver"
         except ValueError:
             self.bat_dica = f"{self.bat_nivel}%"
-        if self.carregando and self.pulso is None:
+        if self.carregando and self.pulso is None and not SOLIDO:
             self.pulso = self.area.add_tick_callback(self._pulso)
         self.redesenhar()
 
@@ -1437,6 +1458,370 @@ class Gota(Gtk.Window):
             cr.set_source_rgba(*self.cor, a)
             cr.arc(x, yy, raio, 0, 2 * math.pi)
             cr.fill()
+
+
+# ---------- visual Solid (Material) ----------
+# Ícones Material: os "md" (Material Design Icons) da Nerd Font, desenhados como texto (sem arquivos).
+F_ICONES_S = "FiraCode Nerd Font Propo"
+GLIFOS_S = {"vol_alto": 0xF057E, "vol_medio": 0xF0580, "vol_baixo": 0xF057F, "mudo": 0xF0581,
+            "wifi": (0xF092F, 0xF091F, 0xF0922, 0xF0925, 0xF0928), "wifi_off": 0xF05AA,
+            "bt": 0xF00AF, "bt_off": 0xF00B2, "bt_con": 0xF00B1, "sino": 0xF009A, "sino_off": 0xF009B,
+            "gear": 0xF0493, "shield": 0xF0498, "central": 0xF062E, "min": 0xF05B0}
+GL_S, PAD_S = 16, 7                  # tamanho do ícone (px) e o respiro de cada lado
+WS_PILULA, WS_PONTO, WS_GAP = 20, 8, 6
+
+
+def _layout_s(cr, s, fonte, px, peso=None):
+    lay = PangoCairo.create_layout(cr)
+    fd = Pango.FontDescription.from_string(fonte)
+    fd.set_absolute_size(px * Pango.SCALE)
+    if peso is not None:
+        fd.set_weight(peso)
+    lay.set_font_description(fd)
+    lay.set_text(s, -1)
+    return lay
+
+
+def texto_s(cr, s, x, y_meio, px, cor, peso=Pango.Weight.MEDIUM, alfa=1.0, medir=False):
+    lay = _layout_s(cr, s, "Inter", px, peso)
+    w, h = lay.get_pixel_size()
+    if not medir:
+        cr.set_source_rgba(*cor, alfa)
+        cr.move_to(x, y_meio - h / 2)
+        PangoCairo.show_layout(cr, lay)
+    return w
+
+
+def glifo_s(cr, cp, cx, cy, cor, alfa=1.0, px=GL_S):
+    """Um ícone Material centrado (pela tinta, não pela linha do texto) em cx, cy."""
+    lay = _layout_s(cr, chr(cp), F_ICONES_S, px)
+    tinta, _ = lay.get_pixel_extents()
+    cr.set_source_rgba(*cor, alfa)
+    cr.move_to(cx - tinta.x - tinta.width / 2, cy - tinta.y - tinta.height / 2)
+    PangoCairo.show_layout(cr, lay)
+
+
+def pilula(cr, x, y, w, h, r=None):
+    r = min(h / 2, w / 2) if r is None else min(r, h / 2, w / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def cor_s(nome):
+    return solido.rgb(nome)
+
+
+def glifo_do_modulo(b, m):
+    """(código do ícone, papel da cor, alfa) dos módulos que são só um ícone."""
+    n = m.nome
+    if n == "vol":
+        g = "mudo" if b.mudo else "vol_alto" if b.volume >= 60 else "vol_medio" if b.volume >= 25 else "vol_baixo"
+        return GLIFOS_S[g], "on_surface", 0.6 if b.mudo else 1.0
+    if n == "wifi":
+        return (GLIFOS_S["wifi"][max(0, min(4, b.wifi_nivel))], "on_surface", 1.0) if b.wifi_nivel else \
+            (GLIFOS_S["wifi_off"], "on_surface_variant", 0.7)
+    if n == "bt":
+        if b.bt_conectados:
+            return GLIFOS_S["bt_con"], "on_surface", 1.0
+        return (GLIFOS_S["bt"], "on_surface", 1.0) if b.bt_ligado else (GLIFOS_S["bt_off"], "on_surface_variant", 0.7)
+    if n == "ultrasu":
+        mins = minutos_ultrasu(b.ultrasu)
+        if mins is None:
+            return GLIFOS_S["shield"], "on_surface_variant", 0.6
+        return GLIFOS_S["shield"], "primary" if mins > 7 * 60 else "tertiary" if mins > 3 * 60 else "error", 1.0
+    if n == "bell":
+        return (GLIFOS_S["sino_off"], "on_surface_variant", 0.8) if b.dnd else (GLIFOS_S["sino"], "on_surface", 1.0)
+    if n in ("gear", "central", "min"):
+        return GLIFOS_S[n], "on_surface", 1.0
+    return None
+
+
+def largura_solida(b, m, cr):
+    if isinstance(m, Workspaces):
+        return 2 * 8 + WS_PILULA + 4 * WS_PONTO + 4 * WS_GAP
+    if isinstance(m, Minimizados):
+        m.visivel = b.minimizados > 0
+        return 0 if not b.minimizados else \
+            PAD_S + GL_S + 4 + texto_s(cr, str(b.minimizados), 0, 0, 12, (1, 1, 1), medir=True) + PAD_S
+    if isinstance(m, Relogio):
+        hora = time.strftime("%H:%M")
+        w = PAD_S + 2 + texto_s(cr, hora, 0, 0, 14, (1, 1, 1), Pango.Weight.SEMIBOLD, medir=True) + PAD_S + 2
+        if CFG["date"]:
+            w += 8 + texto_s(cr, time.strftime("%a, %b %d"), 0, 0, 12, (1, 1, 1), Pango.Weight.NORMAL, medir=True)
+        return w
+    if isinstance(m, Idioma):
+        return PAD_S + texto_s(cr, b.idioma, 0, 0, 12, (1, 1, 1), Pango.Weight.SEMIBOLD, medir=True) + PAD_S
+    if isinstance(m, Bateria):
+        return PAD_S + 22 + 6 + texto_s(cr, str(b.bat_nivel), 0, 0, 12, (1, 1, 1), medir=True) + PAD_S
+    if isinstance(m, EspacoBandeja):
+        return m.largura(cr)
+    return PAD_S + GL_S + PAD_S
+
+
+def desenhar_modulo_solido(b, m, cr, x):
+    cy = ALTURA / 2
+    fg, dim = cor_s("on_surface"), cor_s("on_surface_variant")
+    if isinstance(m, Workspaces):
+        xx, m.casas = x + 8, []
+        for k in range(5):
+            n = k + 1
+            if n == b.ws_ativo:
+                pilula(cr, xx, cy - 4, WS_PILULA, 8)
+                cr.set_source_rgb(*cor_s("primary"))
+                cr.fill()
+                m.casas.append((xx, xx + WS_PILULA))
+                xx += WS_PILULA + WS_GAP
+            else:
+                usado = n in b.ws_usados
+                cr.arc(xx + WS_PONTO / 2, cy, 4 if usado else 3, 0, 2 * math.pi)
+                cr.set_source_rgba(*dim, 1.0 if usado else 0.4)
+                cr.fill()
+                m.casas.append((xx, xx + WS_PONTO))
+                xx += WS_PONTO + WS_GAP
+    elif isinstance(m, Minimizados):
+        glifo_s(cr, GLIFOS_S["min"], x + PAD_S + GL_S / 2, cy, fg)
+        texto_s(cr, str(b.minimizados), x + PAD_S + GL_S + 4, cy, 12, fg)
+    elif isinstance(m, Relogio):
+        w = texto_s(cr, time.strftime("%H:%M"), x + PAD_S + 2, cy, 14, fg, Pango.Weight.SEMIBOLD)
+        if CFG["date"]:
+            texto_s(cr, time.strftime("%a, %b %d"), x + PAD_S + 2 + w + 8, cy, 12, dim, Pango.Weight.NORMAL)
+    elif isinstance(m, Idioma):
+        texto_s(cr, b.idioma, x + PAD_S, cy, 12, fg, Pango.Weight.SEMIBOLD)
+    elif isinstance(m, Bateria):
+        bx, by, bw, bh = x + PAD_S, cy - 5.5, 20, 11            # a bateria deitada do Pixel: corpo + nível
+        pilula(cr, bx, by, bw, bh, 3.5)
+        cr.set_source_rgba(*fg, 0.28)
+        cr.fill()
+        cr.rectangle(bx + bw + 0.5, cy - 2.5, 1.8, 5)
+        cr.fill()
+        if b.bat_nivel <= 12 and not b.na_tomada:
+            papel = "error"
+        elif b.na_tomada:
+            papel = "primary"
+        elif b.perfil == "power-saver":
+            papel = "tertiary"
+        else:
+            papel = "on_surface"
+        cr.save()
+        pilula(cr, bx, by, bw, bh, 3.5)
+        cr.clip()
+        cr.rectangle(bx, by, bw * max(0.04, min(1.0, b.bat_nivel / 100)), bh)
+        cr.set_source_rgb(*cor_s(papel))
+        cr.fill()
+        cr.restore()
+        texto_s(cr, str(b.bat_nivel), bx + 22 + 6, cy, 12, cor_s("primary") if b.na_tomada else fg)
+    elif isinstance(m, EspacoBandeja):
+        pass
+    else:
+        g = glifo_do_modulo(b, m)
+        if g:
+            cp, papel, alfa = g
+            gx = x + PAD_S + GL_S / 2
+            glifo_s(cr, cp, gx, cy, cor_s(papel), alfa)
+            if m.nome == "bell" and b.nao_lidas and not b.dnd:       # não lidas: um ponto do erro, como no Pixel
+                cr.arc(gx + 6, cy - 6, 3.5, 0, 2 * math.pi)
+                cr.set_source_rgb(*cor_s("error"))
+                cr.fill()
+
+
+def ilhas_solidas(b):
+    """As três ilhas (esquerda, centro, direita) como (x0, x1) — só as que têm algo visível."""
+    out = []
+    for lista in (b.esquerda, b.centro, b.direita):
+        vis = [m for m in b.visiveis(lista) if m.w > 0]
+        if vis:
+            out.append((min(m.x for m in vis) - 2, max(m.x + m.w for m in vis) + 2))
+    return out
+
+
+def desenhar_barra_solida(b, cr, w):
+    b.medir(cr, w)
+    y0, ph = 3, ALTURA - 6
+    cr.set_source_rgb(*cor_s("surface_container"))
+    b.gota.ilhas = ilhas_solidas(b)
+    for x0, x1 in b.gota.ilhas:
+        pilula(cr, x0, y0, x1 - x0, ph)
+        cr.fill()
+    on = cor_s("on_surface")
+    for m in b.visiveis(b.esquerda + b.centro + b.direita):
+        if m.w <= 0:
+            continue
+        if m is b.sobre and CFG["hover"] and not isinstance(m, EspacoBandeja):    # a "state layer" do Material
+            pilula(cr, m.x + 1, y0 + 3, m.w - 2, ph - 6)
+            cr.set_source_rgba(*on, 0.09)
+            cr.fill()
+        desenhar_modulo_solido(b, m, cr, m.x)
+
+
+def texto_dica_solida(b, m):
+    n = m.nome
+    if n == "ultrasu":
+        mins = minutos_ultrasu(b.ultrasu)
+        return f"Admin mode · {mins // 60}h {mins % 60:02d}m left" if mins is not None else "Admin mode off"
+    textos = {"vol": f"Volume {b.volume}%" + (" · muted" if b.mudo else ""),
+              "wifi": b.wifi_nome or "Offline",
+              "bt": (f"Bluetooth · {b.bt_conectados} connected" if b.bt_conectados else
+                     "Bluetooth on" if b.bt_ligado else "Bluetooth off"),
+              "bat": b.bat_dica or f"{b.bat_nivel}%", "lang": f"Keyboard · {b.idioma}",
+              "min": f"{b.minimizados} minimized", "bell": "Hermes" + (" · Do not disturb" if b.dnd else ""),
+              "gear": "Settings", "central": "Hestia", "clock": time.strftime("%A, %B %d")}
+    return textos.get(n, m.dica)
+
+
+def _clique_workspaces_solido(self, botao, x):
+    for k, (a, b_) in enumerate(getattr(self, "casas", [])):
+        if a - WS_GAP / 2 <= x < b_ + WS_GAP / 2 and botao == 1:
+            lancar(f"hyprctl dispatch workspace {k + 1}")
+            return
+
+
+if SOLIDO:
+    Workspaces.clique = _clique_workspaces_solido
+
+
+class GotaSolida(Gtk.Window):
+    """A dica do Solid: uma pílula sólida (a cor da ilha da barra) que nasce do ícone num METABALL — uma gota
+    escorre da borda de baixo da ilha, estica num pescoço líquido que afina e se solta, virando a pílula com
+    o texto. Desenhada em cairo (a barra roda no renderizador cairo: abrir OpenGL aqui custaria ~100 MB de
+    RAM pra sempre); o pescoço é o "conector gosmento" clássico: duas curvas que afinam com a distância.
+    Só anima na entrada/saída; parada, é uma pílula. Mesma interface da Gota: mostrar(...) e esconder()."""
+
+    MAX_W, ALT = 320, 30
+    SOBE = 8                    # a camada começa 8 px DENTRO da barra: a gota nasce na borda da ilha
+    GAP = 12                    # distância final entre a ilha e a pílula
+    PESCOCO = 11                # até essa distância o pescoço existe (depois se solta: GAP é maior)
+    ENTRA, SAI, ESPERA = 0.38, 0.2, 1.5
+
+    def __init__(self):
+        super().__init__(decorated=False)
+        Camada.init_for_window(self)
+        Camada.set_layer(self, Camada.Layer.OVERLAY)
+        Camada.set_namespace(self, "aerobar-gota")
+        Camada.set_anchor(self, Camada.Edge.TOP, True)
+        Camada.set_anchor(self, Camada.Edge.LEFT, True)
+        Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
+        Camada.set_exclusive_zone(self, -1)
+        Camada.set_margin(self, Camada.Edge.TOP, TOPO + ALTURA - self.SOBE)
+        self.add_css_class("aerobar-gota")
+        prov = Gtk.CssProvider()
+        prov.load_from_string(".aerobar-gota { background: none; background-color: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.W, self.H = self.MAX_W, self.SOBE - 3 + self.GAP + self.ALT + 4
+        self.area = Gtk.DrawingArea(content_width=self.W, content_height=self.H)
+        self.area.set_draw_func(self.desenhar)
+        self.set_child(self.area)
+        self.set_default_size(self.W, self.H)
+        self.set_size_request(self.W, self.H)
+        self.connect("realize", self._sem_entrada)
+        self.ilhas = []
+        self.texto, self.entrando, self.t, self.t0, self.tique = "", True, 1.0, None, None
+        self.cx, self.bw, self.limites = 0.0, 0.0, (-1e9, 1e9)
+        self._fechar_id = None
+
+    def _sem_entrada(self, *_):
+        import cairo
+        if self.get_surface() is not None:
+            self.get_surface().set_input_region(cairo.Region())
+
+    def mostrar(self, texto_, _cor, centro_x, tela_w=None):
+        if not texto_:
+            return
+        lay = self.area.create_pango_layout(texto_)
+        lay.set_font_description(Pango.FontDescription.from_string("Inter Medium 9.5"))
+        tw = lay.get_pixel_size()[0]
+        self.bw = min(self.MAX_W - 8, tw + 28)
+        meio = LADO + centro_x
+        tela_w = tela_w or (meio * 2)
+        esq = int(round(min(max(0, meio - self.W / 2), max(0, tela_w - self.W))))
+        Camada.set_margin(self, Camada.Edge.LEFT, esq)
+        self.cx = min(max(self.bw / 2 + 2, meio - esq), self.W - self.bw / 2 - 2)
+        lim = next(((a, b) for a, b in self.ilhas if a <= centro_x <= b), None)
+        r = (ALTURA - 6) / 2                                    # só a parte reta da borda de baixo da ilha
+        self.limites = (lim[0] + r + LADO - esq, lim[1] - r + LADO - esq) if lim else (-1e9, 1e9)
+        if self._fechar_id:
+            GLib.source_remove(self._fechar_id)
+            self._fechar_id = None
+        self.texto = texto_
+        if not self.get_visible():
+            self.set_visible(True)
+        self._animar(True)
+
+    def esconder(self):
+        if self.get_visible() and self.texto and (self.entrando or self.tique):
+            if not self.entrando:
+                return
+            self._animar(False)
+
+    def _animar(self, entrando):
+        self.entrando, self.t0 = entrando, None
+        self.t = 0.0
+        self.area.queue_draw()
+        if self.tique is None:
+            self.tique = self.area.add_tick_callback(self._quadro)
+
+    def _quadro(self, _w, relogio):
+        agora = relogio.get_frame_time() / 1e6
+        if self.t0 is None:
+            self.t0 = agora
+        self.t = min(1.0, (agora - self.t0) / (self.ENTRA if self.entrando else self.SAI))
+        self.area.queue_draw()
+        if self.t < 1.0:
+            return GLib.SOURCE_CONTINUE
+        self.tique = None
+        if not self.entrando:
+            self.texto = ""
+            self._fechar_id = GLib.timeout_add(int(self.ESPERA * 1000), self._fechar)
+        return GLib.SOURCE_REMOVE
+
+    def _fechar(self):
+        self._fechar_id = None
+        if not self.texto:
+            self.set_visible(False)
+        return GLib.SOURCE_REMOVE
+
+    def desenhar(self, _a, cr, w, h):
+        if not self.texto:
+            return
+        if self.entrando:
+            e, alfa_txt = solido.enfatizado(self.t), solido.suave(0.55, 1.0, self.t)
+        else:
+            e, alfa_txt = 1 - self.t * self.t, 1 - solido.suave(0.0, 0.35, self.t)
+        borda = self.SOBE - 3                                   # a borda de baixo da ilha (y, dentro da camada)
+        topo_fim = borda + self.GAP
+        hh = 5 + (self.ALT / 2 - 5) * e
+        hw = 7 + (self.bw / 2 - 7) * e
+        topo = borda - 4 + (topo_fim + 4 - borda) * e           # a gota começa grudada na borda
+        cr.set_source_rgb(*cor_s("surface_container"))
+        pilula(cr, self.cx - hw, topo, 2 * hw, 2 * hh)
+        cr.fill()
+        g = topo - borda
+        if g < self.PESCOCO:                                    # o pescoço líquido: afina até se soltar
+            s_ = 1 - max(0.0, g) / self.PESCOCO
+            a, b = self.limites
+            nb = max(2.0, min(6 + 8 * s_, self.cx - a, b - self.cx))   # largura na ilha
+            np_ = min(hw - 1, 6 + 6 * s_)                       # largura na pílula
+            nm = max(0.0, 7.5 * s_ ** 1.1 - 0.8)                # a cintura (afina até romper)
+            if nm > 0.2:
+                y1 = topo + min(hh, 4)
+                cr.move_to(self.cx - nb, borda - 2)
+                cr.curve_to(self.cx - nb * 0.55, borda + g * 0.4, self.cx - nm, y1 - g * 0.55, self.cx - np_, y1)
+                cr.line_to(self.cx + np_, y1)
+                cr.curve_to(self.cx + nm, y1 - g * 0.55, self.cx + nb * 0.55, borda + g * 0.4, self.cx + nb, borda - 2)
+                cr.close_path()
+                cr.fill()
+        if alfa_txt > 0.01:
+            lay = PangoCairo.create_layout(cr)
+            lay.set_font_description(Pango.FontDescription.from_string("Inter Medium 9.5"))
+            lay.set_text(self.texto, -1)
+            tw, th = lay.get_pixel_size()
+            cr.set_source_rgba(*cor_s("on_surface"), alfa_txt)
+            cr.move_to(self.cx - tw / 2, topo + hh - th / 2)
+            PangoCairo.show_layout(cr, lay)
 
 
 class App(Gtk.Application):
