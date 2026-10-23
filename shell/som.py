@@ -16,6 +16,11 @@ Comandos (o ~/.local/bin/som manda pelo D-Bus pro programa já aberto):
 
 Também mora aqui a central de notificações (sininho da barra, doc 25): é o mesmo tipo de janelinha.
 
+No visual Solid (solido.py): cartões chapados nas superfícies tonais, blocos em pílula (ligado = primária),
+sliders Material (trilha grossa + alça em barra), e as janelinhas NASCEM do ícone da barra num metaball:
+uma gota sai do ponto do ícone e se espalha no formato dos cartões (liquido.CampoSolido, só durante a
+animação); ao fechar, os cartões se recolhem de volta pro ícone.
+
 Peças do GTK:
 - As janelinhas são CAMADAS (layer-shell), como a barra: ficam por cima e não viram "janela".
 - Pra fechar ao clicar fora, existe uma camada transparente do tamanho da tela atrás da janelinha
@@ -51,6 +56,8 @@ def app_instalado(app):
         return Gio.DesktopAppInfo.new(app.removesuffix(".desktop") + ".desktop") is not None
     except TypeError:          # PyGObject: construtor devolveu NULL = não instalado
         return False
+
+import solido  # noqa: E402
 
 LARGURA = 340
 BACKLIGHT = "/sys/class/backlight/amdgpu_bl1"
@@ -186,6 +193,41 @@ def gap():
         return int(hyprctl_json("getoption", "general:gaps_out")["custom"].split()[0])
     except (TypeError, KeyError, ValueError, IndexError):
         return 12
+
+
+# ---- Solid (Material): vale só em janelas com a classe "solid" (as cores @solid_* vêm do solido.css_shell) ----
+CSS_SOLIDO = """
+window.solid .cartao-som, window.solid .central > .player, window.solid .central > .controles {
+    background-color: @solid_surface_container; color: @solid_on_surface; box-shadow: none; border: none;
+    border-radius: %(r)dpx; }
+window.solid .central > .controles { padding: 18px; }
+window.osd.solid .pilula { background-color: @solid_surface_container; color: @solid_on_surface; box-shadow: none; }
+window.osd.solid .pilula label, window.osd.solid .pilula image { color: @solid_on_surface; }
+window.osd.solid .pilula levelbar trough { min-height: 12px; background: @solid_surface_container_highest; }
+window.osd.solid .pilula levelbar block.filled { background: @solid_primary; }
+window.solid .cartao-som .titulo { opacity: 1; color: @solid_primary; font-weight: 600; letter-spacing: 0.04em; }
+window.solid .cartao-som row { border-radius: 999px; padding: 8px 12px; }
+window.solid .cartao-som row:hover { background-color: alpha(@solid_on_surface, 0.08); }
+window.solid .cartao-som .marcado { color: @solid_primary; }
+window.solid .cartao-som separator { background: none; min-height: 0; }
+window.solid button.flat, window.solid .cartao-som button { border-radius: 999px; }
+window.solid button.flat:hover { background-color: alpha(@solid_on_surface, 0.08); }
+window.solid .central button.bloco { border-radius: 999px; min-height: 58px; padding: 6px 10px 6px 18px; border: none;
+    background-color: @solid_surface_container_highest; color: @solid_on_surface; box-shadow: none; }
+window.solid .central button.bloco:hover { background-color: mix(@solid_surface_container_highest, @solid_on_surface, 0.08); }
+window.solid .central button.bloco:active { background-color: mix(@solid_surface_container_highest, @solid_on_surface, 0.12); }
+window.solid .central button.bloco.ligado { background-color: @solid_primary; color: @solid_on_primary; }
+window.solid .central button.bloco.ligado:hover { background-color: mix(@solid_primary, @solid_on_primary, 0.08); }
+window.solid .central .bloco-titulo { font-weight: 600; }
+window.solid .central .bloco-estado { opacity: 0.8; font-size: 12px; }
+window.solid .central .chip { background-color: @solid_secondary_container; color: @solid_on_secondary_container; }
+window.solid .central .redes { background-color: @solid_surface_container_high; border-radius: %(r2)dpx; padding: 10px; }
+window.solid .central button.rede { border-radius: 999px; padding: 8px 12px; }
+window.solid .central button.rede:hover, window.solid .central button.perfil:hover, window.solid .central button.seta:hover {
+    background-color: alpha(currentColor, 0.10); }
+window.solid .central button.desligar { background-color: @solid_surface_container_highest; min-width: 36px; min-height: 36px; }
+window.solid .central button.desligar.ligado { background-color: @solid_primary; color: @solid_on_primary; }
+"""
 
 
 class Pegador(Gtk.Window):
@@ -403,7 +445,92 @@ class Janelinha(Gtk.Window):
                 formas.append((r.get_x(), r.get_y(), r.get_width(), r.get_height(), 26))
         return formas
 
+    # ---------- Solid: nascer do ícone num metaball ----------
+    def _com_solido(self):
+        """Solid: o conteúdo vai pra dentro de um Overlay (o metaball passa por cima só enquanto anima)."""
+        if getattr(self, "raiz_s", None) is None:
+            self.raiz_s = Gtk.Overlay()
+        if self.get_child() is not self.raiz_s:
+            self.set_child(None)
+            if self.cartao.get_parent() is not None:
+                self.cartao.get_parent().remove(self.cartao)
+            self.raiz_s.set_child(self.cartao)
+            self.set_child(self.raiz_s)
+
+    def _cartoes_solidos(self):
+        """Os cartões (x, y, w, h) nas coordenadas do overlay: a central tem dois, os outros um."""
+        cartoes = [self.cartao]
+        if self.cartao.has_css_class("central"):
+            cartoes, filho = [], self.cartao.get_first_child()
+            while filho is not None:
+                if filho.get_visible():
+                    cartoes.append(filho)
+                filho = filho.get_next_sibling()
+        out = []
+        for c in cartoes:
+            ok, r = c.compute_bounds(self.raiz_s)
+            if ok and r.get_width() > 4 and r.get_height() > 4:
+                out.append((r.get_x(), r.get_y(), r.get_width(), r.get_height()))
+        return out[:3]
+
+    def _ponto_do_icone(self):
+        """Onde o ícone que abriu a janelinha está, nas coordenadas dela (a gota nasce ali, na borda de cima)."""
+        largura = self.get_width() or LARGURA
+        try:
+            mon = next((m for m in hyprctl_json("monitors") or [] if m.get("focused")), None)
+            tela = int(mon["width"] / mon["scale"]) if mon else 2560
+        except (TypeError, KeyError, ZeroDivisionError):
+            tela = 2560
+        x_janela = tela - Camada.get_margin(self, Camada.Edge.RIGHT) - largura
+        meio = (self.zona_icone[0] + self.zona_icone[1]) / 2 if self.zona_icone != (0, 0) else x_janela + largura - 40
+        return min(max(12.0, meio - x_janela), largura - 12.0)
+
+    def _metaball(self, abrindo, depois=None):
+        if getattr(self, "_anim_s", None) is not None:
+            self._anim_s.parar()
+            self._anim_s = None
+        ix = self._ponto_do_icone()
+        r = solido.raio()
+        self.cartao.set_opacity(0.0 if abrindo else 1.0)
+
+        def quadro(t):
+            if abrindo:
+                self.cartao.set_opacity(solido.suave(0.7, 1.0, t))
+            else:
+                self.cartao.set_opacity(1 - solido.suave(0.0, 0.25, t))
+            caixas = []
+            for i, (x, y, w, h) in enumerate(self._cartoes_solidos()):
+                local = max(0.0, min(1.0, (t - i * 0.12) / (1 - i * 0.12))) if abrindo else t
+                e = 1 - (1 - local) ** 3 if abrindo else 1 - local * local * (3 - 2 * local)
+                cx, cy = ix + (x + w / 2 - ix) * e, 6 + (y + h / 2 - 6) * e
+                mw, mh = 9 + (w / 2 - 9) * e, 9 + (h / 2 - 9) * e
+                caixas.append((cx, cy, mw, mh, min(mw, mh, 9 + (r - 9) * e)))
+            e0 = 1 - (1 - t) ** 3 if abrindo else 1 - t
+            gotas = [(ix, -2.0, 12 * (1 - e0) + 3)] if e0 < 0.95 else []     # a gota presa na borda (o ícone)
+            return gotas, caixas[:4]
+
+        def fim():
+            self._anim_s = None
+            self.cartao.set_opacity(1.0 if abrindo else 0.0)
+            if depois:
+                depois()
+        self._anim_s = solido.metaball(self.raiz_s, 0.48 if abrindo else 0.26, quadro,
+                                       solido.rgb("surface_container"), fim, k=26.0)
+
     def fechar(self):
+        if self.has_css_class("solid") and self.get_visible() and getattr(self, "raiz_s", None) is not None \
+                and not getattr(self, "_fechando_s", False):
+            self._fechando_s = True              # o metaball recolhe os cartões pro ícone; depois some
+            self.pegador.set_visible(False)
+            Janelinha.abertas.discard(self)
+            self._entrada = None
+
+            def sumir():
+                self._fechando_s = False
+                self.set_visible(False)
+                self.cartao.set_opacity(1.0)
+            self._metaball(False, sumir)
+            return
         self.pegador.set_visible(False)
         Janelinha.abertas.discard(self)
         self._entrada = None              # (central) a região de entrada é refeita ao reabrir
@@ -436,10 +563,17 @@ class Janelinha(Gtk.Window):
         self.zona_icone = zona_icone
         # DotStyle: o tema de pontos (dotstyle-janelinhas.css) vale enquanto a janela tem a classe "dots",
         # e o conteúdo ganha o campo vivo de meio-tom em volta (campo.py)
+        solido_ = visual_atual() == "Solid"
         if visual_atual() == "DotStyle":
             self.add_css_class("dots")
             self._com_campo(True)
             self.campo.abrir()
+        elif solido_:
+            self.remove_css_class("dots")
+            self.add_css_class("solid")
+            self._com_solido()
+            fechando_s = getattr(self, "_fechando_s", False)      # reabriu no meio do recolher: nasce de novo
+            self._fechando_s = False
         else:
             self.remove_css_class("dots")
             self._com_campo(False)
@@ -448,7 +582,10 @@ class Janelinha(Gtk.Window):
             GLib.source_remove(self._saida)
             self._saida = None
         self.pegador.present()
+        ja_visivel = self.get_visible()
         self.present()
+        if solido_ and (not ja_visivel or fechando_s):
+            self._metaball(True)
         Janelinha.abertas.add(self)     # o vigia de cliques (hypr-botoes) avisa a cada clique (doc 33)
 
     def clique_fora(self):
@@ -1992,6 +2129,8 @@ class Osd(Gtk.Window):
     def __init__(self):
         super().__init__()
         self.add_css_class("osd")
+        if visual_atual() == "Solid":
+            self.add_css_class("solid")
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.OVERLAY)
         Camada.set_namespace(self, "osd")
@@ -2059,6 +2198,14 @@ class App(Adw.Application):     # Adw = usa o estilo do libadwaita (cores certas
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provedor,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
         carregar_dicas_dotstyle()
+        if visual_atual() == "Solid":                    # Solid: as cores @solid_* + o CSS das janelas "solid"
+            solido.aplicar_css()
+            prov_s = Gtk.CssProvider()
+            r = solido.raio()
+            prov_s.load_from_string(CSS_SOLIDO % {"r": r, "r2": max(12, r - 8)})
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), prov_s,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_USER + 3)
+            self._vigia_cores = solido.vigiar()          # paleta nova: o CSS recarrega sozinho
         pontos = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dotstyle-janelinhas.css")
         if os.path.exists(pontos):                       # DotStyle (só age em janelas com a classe "dots")
             prov_dots = Gtk.CssProvider()

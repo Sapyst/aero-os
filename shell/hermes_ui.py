@@ -10,6 +10,10 @@ hermes_ui.py — what Hermes puts on the screen: the cards and the dot wave.
   when you leave fullscreen.
 
 Everything visual comes from the settings (hermes.PADRAO): style, colours, fonts, sizes, timings.
+
+No visual Solid (solido.py) os cartões são Material: superfície tonal chapada, texto normal, botões em
+pílula; cada cartão novo CAI DO SINO num metaball (uma gota sai do sino, estica e vira o cartão) e, ao
+sair, se recolhe de volta. Sem a onda de pontos. A GLArea do metaball só existe durante a animação.
 """
 import math
 import os
@@ -26,6 +30,29 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import hermes_dots as hd  # noqa: E402
+import solido  # noqa: E402
+
+SOLIDO = solido.ativo()          # lido ao iniciar (trocar de visual reinicia o processo do som/Hermes)
+
+CSS_SOLIDO = """
+window.hermes-cartoes { background: none; background-color: transparent; box-shadow: none; }
+.hermes-solido { background-color: @solid_surface_container_high; color: @solid_on_surface; border-radius: %(r)dpx;
+  border: none; box-shadow: none; padding: 14px 14px 14px 16px; }
+.hermes-solido.critica { background-color: @solid_error_container; color: @solid_on_error_container; }
+.hermes-solido .hermes-app { font-size: 12px; font-weight: 500; color: @solid_on_surface_variant; }
+.hermes-solido .hermes-hora { font-size: 12px; color: @solid_on_surface_variant; }
+.hermes-solido .hermes-titulo { font-size: 14px; font-weight: 600; color: @solid_on_surface; }
+.hermes-solido .hermes-corpo { font-size: 13px; color: @solid_on_surface_variant; }
+.hermes-solido.critica .hermes-titulo, .hermes-solido.critica .hermes-corpo { color: @solid_on_error_container; }
+.hermes-solido button.hermes-fechar { min-width: 26px; min-height: 26px; padding: 0; border-radius: 999px;
+  background: none; box-shadow: none; color: @solid_on_surface_variant; }
+.hermes-solido button.hermes-fechar:hover { background-color: alpha(@solid_on_surface, 0.10); }
+.hermes-solido button.hermes-acao { border-radius: 999px; min-height: 34px; padding: 0 16px; border: none;
+  box-shadow: none; background-color: @solid_secondary_container; color: @solid_on_secondary_container; font-weight: 600; }
+.hermes-solido button.hermes-acao:hover { background-color: mix(@solid_secondary_container, @solid_on_secondary_container, 0.08); }
+.hermes-solido levelbar trough { min-height: 8px; border-radius: 999px; background: @solid_surface_container_highest; }
+.hermes-solido levelbar block.filled { border-radius: 999px; background: @solid_primary; }
+"""
 
 PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
 
@@ -331,6 +358,71 @@ def imagem_da_notificacao(n, tamanho=36):
     return None
 
 
+def montar_cartao_solido(n, config, ao_clicar, ao_acao, ao_fechar):
+    """Solid: um cartão Material (sem pontos). Texto sem markup, menos o corpo (já limpo pelo hermes)."""
+    caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    caixa.add_css_class("hermes-solido")
+    if n.urgencia == 2:
+        caixa.add_css_class("critica")
+    caixa.set_size_request(config["width"], -1)
+    topo = Gtk.Box(spacing=6)
+    nome = Gtk.Label(label=n.app if len(n.app) <= 32 else n.app[:31] + "…", xalign=0, use_markup=False)
+    nome.add_css_class("hermes-app")
+    topo.append(nome)
+    hora = Gtk.Label(label="· " + time.strftime("%H:%M", time.localtime(n.criada)), xalign=0, hexpand=True)
+    hora.add_css_class("hermes-hora")
+    topo.append(hora)
+    fechar = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Dismiss")
+    fechar.add_css_class("hermes-fechar")
+    fechar.connect("clicked", lambda *_: ao_fechar(n.id))
+    topo.append(fechar)
+    caixa.append(topo)
+    meio = Gtk.Box(spacing=12)
+    if config["icons"]:
+        img = imagem_da_notificacao(n, 40)
+        if img is not None:
+            img.set_valign(Gtk.Align.START)
+            meio.append(img)
+    textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+    colunas = max(12, int((config["width"] - 30 - (52 if config["icons"] else 0)) / 8.2))
+    if n.titulo:
+        t = Gtk.Label(label=n.titulo, xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=2,
+                      ellipsize=Pango.EllipsizeMode.END, use_markup=False, max_width_chars=colunas,
+                      natural_wrap_mode=Gtk.NaturalWrapMode.WORD)
+        t.add_css_class("hermes-titulo")
+        textos.append(t)
+    if n.corpo:
+        c = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=4,
+                      ellipsize=Pango.EllipsizeMode.END, max_width_chars=colunas,
+                      natural_wrap_mode=Gtk.NaturalWrapMode.WORD)
+        c.set_markup(n.corpo)
+        c.add_css_class("hermes-corpo")
+        textos.append(c)
+    meio.append(textos)
+    caixa.append(meio)
+    if n.valor is not None:
+        caixa.append(Gtk.LevelBar(min_value=0, max_value=100, value=max(0, min(100, n.valor))))
+    botoes = [(k, t) for k, t in n.acoes if k != "default" and t]
+    if botoes:
+        linha = Gtk.Box(spacing=8, margin_top=2)
+        for k, t in botoes[:3]:
+            b = Gtk.Button(label=t)
+            b.add_css_class("hermes-acao")
+            b.connect("clicked", lambda *_, k=k: ao_acao(n.id, k))
+            linha.append(b)
+        caixa.append(linha)
+    clique = Gtk.GestureClick(button=0)
+
+    def soltou(g, _n, _x, _y):
+        if g.get_current_button() == 3:
+            ao_fechar(n.id)
+        else:
+            ao_clicar(n.id)
+    clique.connect("released", soltou)
+    caixa.add_controller(clique)
+    return caixa
+
+
 def montar_cartao(n, config, ao_clicar, ao_acao, ao_fechar, claro=False):
     """One DotStyle card (hermes_dots.CartaoDots): dot outline that assembles, app name and time in dot
     letters, a red dot to dismiss, hover bounce. Text widgets never use markup except the body, which
@@ -411,7 +503,12 @@ class Cartoes(Gtk.Window):
         Camada.set_namespace(self, "hermes")
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
         self.pilha = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=config["gap"])
-        self.set_child(self.pilha)
+        if SOLIDO:                         # Solid: o metaball passa por cima da pilha enquanto anima
+            self.raiz_s = Gtk.Overlay()
+            self.raiz_s.set_child(self.pilha)
+            self.set_child(self.raiz_s)
+        else:
+            self.set_child(self.pilha)
         self.widgets = {}
         self.ancorar()
 
@@ -431,12 +528,18 @@ class Cartoes(Gtk.Window):
                 Camada.set_margin(self, Camada.Edge.RIGHT,
                                   int(max(self.config["margin"], sino["w"] - sino["x"] - 30)))
         self.de_baixo = v == "bottom"
+        if SOLIDO:              # Solid: a camada encosta na barra/borda e a margem vira espaço interno, pra
+            borda = Camada.Edge.TOP if v == "top" else Camada.Edge.BOTTOM     # gota ter onde escorrer
+            Camada.set_margin(self, borda, 0)
+            self.pilha.set_margin_top(self.config["margin"] if v == "top" else 0)
+            self.pilha.set_margin_bottom(self.config["margin"] if v == "bottom" else 0)
 
     def mostrar(self, n):
         velho = self.widgets.pop(n.id, None)
-        novo = montar_cartao(n, self.config, lambda i: self.servico.acionar(i),
-                             lambda i, k: self.servico.acionar(i, k), lambda i: self.servico.fechar(i),
-                             claro="claro" in self.servico.modos)
+        fabrica = montar_cartao_solido if SOLIDO else montar_cartao
+        extra = {} if SOLIDO else {"claro": "claro" in self.servico.modos}
+        novo = fabrica(n, self.config, lambda i: self.servico.acionar(i),
+                       lambda i, k: self.servico.acionar(i, k), lambda i: self.servico.fechar(i), **extra)
         if velho is not None:
             self.pilha.insert_child_after(novo, velho)
             self.pilha.remove(velho)
@@ -449,6 +552,52 @@ class Cartoes(Gtk.Window):
         while len(self.widgets) > self.config["max_visible"]:
             self._sumir(self.widgets.pop(min(self.widgets)))
         self.set_visible(True)
+        if SOLIDO and velho is None:
+            self._metaball(novo, True)
+
+    # ---------- Solid: o cartão cai do sino ----------
+    def _x_do_sino(self):
+        """O sino nas coordenadas desta janela (a gota nasce ali, na borda de cima); sem sino: o meio."""
+        larg = self.get_width() or self.config["width"]
+        sino = lugar_do_sino()
+        if not sino or not Camada.get_anchor(self, Camada.Edge.RIGHT):
+            return larg / 2
+        x_janela = sino["w"] - Camada.get_margin(self, Camada.Edge.RIGHT) - larg
+        return min(max(14.0, sino["x"] - x_janela), larg - 14.0)
+
+    def _metaball(self, cartao, entrando, depois=None):
+        anterior = getattr(cartao, "_anim_s", None)
+        if anterior is not None:
+            anterior.parar()
+        ix, r = self._x_do_sino(), solido.raio()
+        cartao.set_opacity(0.0 if entrando else 1.0)
+        de_cima = not self.de_baixo
+
+        def quadro(t):
+            ok, b = cartao.compute_bounds(self.raiz_s)
+            if not ok or b.get_width() < 4:
+                return [], []
+            x, y, w, h = b.get_x(), b.get_y(), b.get_width(), b.get_height()
+            if entrando:
+                e = solido.enfatizado(t)
+                cartao.set_opacity(solido.suave(0.7, 1.0, t))
+            else:
+                e = 1 - t * t * (3 - 2 * t)
+                cartao.set_opacity(1 - solido.suave(0.0, 0.3, t))
+            oy = -2.0 if de_cima else (self.get_height() or (y + h)) + 2
+            cx, cy = ix + (x + w / 2 - ix) * e, oy + (y + h / 2 - oy) * e
+            mw, mh = 10 + (w / 2 - 10) * e, 10 + (h / 2 - 10) * e
+            gotas = [(ix, oy, 12 * (1 - e) + 2)] if e < 0.9 else []      # a gota ainda presa no sino
+            return gotas, [(cx, cy, mw, mh, min(mw, mh, 10 + (r - 10) * e))]
+
+        def fim():
+            cartao._anim_s = None
+            cartao.set_opacity(1.0 if entrando else 0.0)
+            if depois:
+                depois()
+        cartao._anim_s = solido.metaball(self.raiz_s, 0.46 if entrando else 0.26, quadro,
+                                         solido.rgb("error_container" if cartao.has_css_class("critica")
+                                                    else "surface_container_high"), fim, k=24.0)
 
     def tirar(self, id_):
         w = self.widgets.pop(id_, None)
@@ -462,7 +611,9 @@ class Cartoes(Gtk.Window):
                 self.pilha.remove(w)
             if not self.widgets and self.pilha.get_first_child() is None:
                 self.set_visible(False)
-        if hasattr(w, "sair"):
+        if SOLIDO and w.get_mapped():
+            self._metaball(w, False, fim)
+        elif hasattr(w, "sair"):
             w.sair(fim)
         else:
             fim()
@@ -542,6 +693,10 @@ class HermesUI:
             ouvir_hyprland(self.hyprland)
 
     def aplicar_css(self):
+        if SOLIDO:
+            solido.aplicar_css()
+            self.provedor.load_from_string(CSS_SOLIDO % {"r": solido.raio()})
+            return
         self.provedor.load_from_string(css_do_tema(self.config, "claro" in self.servico.modos))
 
     def _segurar(self, n):
@@ -563,7 +718,7 @@ class HermesUI:
             return
         cheia = self._cheia
         self._cheia = False
-        if ev == "show" and n.onda:
+        if ev == "show" and n.onda and not SOLIDO:       # Solid: sem a onda de pontos (o cartão cai do sino)
             self.onda.soltar(urgente=n.urgencia == 2, sobre_tela_cheia=cheia)
         if cheia and self.config["fullscreen"] == "hold" and n.urgencia < 2:
             self.guardadas = [x for x in self.guardadas if x.id != n.id] + [n]

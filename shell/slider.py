@@ -238,9 +238,50 @@ class SliderFluido(Gtk.DrawingArea):
         cr.set_source_rgb(0.95, 0.945, 0.935)
         cr.fill()
 
+    def _em_solido(self):
+        raiz = self.get_root()
+        return raiz is not None and raiz.has_css_class("solid")
+
+    def desenhar_solido(self, cr, w, h):
+        """Solid (Material 3): trilha grossa em pílula — a parte cheia na primária, o resto no tom de
+        superfície mais alto — e a alça é uma barrinha vertical com um vão de cada lado."""
+        import solido
+        prim = solido.rgb("primary") if self.ativo else solido.rgb("outline")
+        vazio = solido.rgb("surface_container_highest")
+        cy, t = h / 2, 8.0
+        alca = 2.0 + 1.0 * self.crescer
+        x0, x1 = alca + 1, w - alca - 1
+        f = (self.mostrado - self.min) / max(1e-6, self.max - self.min)
+        xb = x0 + f * (x1 - x0)
+        vao = 5.0
+
+        def pilula(a, b, r_esq, r_dir):
+            if b - a < 1:
+                return
+            cr.new_sub_path()
+            cr.arc(a + r_esq, cy - t + r_esq, r_esq, math.pi, 1.5 * math.pi)
+            cr.arc(b - r_dir, cy - t + r_dir, r_dir, 1.5 * math.pi, 2 * math.pi)
+            cr.arc(b - r_dir, cy + t - r_dir, r_dir, 0, 0.5 * math.pi)
+            cr.arc(a + r_esq, cy + t - r_esq, r_esq, 0.5 * math.pi, math.pi)
+            cr.close_path()
+        pilula(x0, xb - vao, min(t, max(1, (xb - vao - x0) / 2)), 3)          # cheio
+        cr.set_source_rgb(*prim)
+        cr.fill()
+        pilula(xb + vao, x1, 3, min(t, max(1, (x1 - xb - vao) / 2)))          # vazio
+        cr.set_source_rgb(*vazio)
+        cr.fill()
+        cr.new_sub_path()                                                    # a alça
+        cr.arc(xb, cy - h / 2 + alca + 1, alca, math.pi, 2 * math.pi)
+        cr.arc(xb, cy + h / 2 - alca - 1, alca, 0, math.pi)
+        cr.close_path()
+        cr.set_source_rgb(*prim)
+        cr.fill()
+
     def desenhar(self, _a, cr, w, h):
         if self._em_pontos():
             return self.desenhar_pontos(cr, w, h)
+        if self._em_solido():
+            return self.desenhar_solido(cr, w, h)
         cor_texto = self.get_color()
         acc = tinta.cor(self, "destaque")[:3] if self.ativo else (0.6, 0.6, 0.62)   # = destaque do menu
         r = self.ALTURA / 2
