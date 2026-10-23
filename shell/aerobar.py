@@ -565,6 +565,7 @@ class Barra(Gtk.Window):
         self.area.add_controller(mov)
 
         self.molas_s, self.gotas_s, self.tique_s, self.ultimo_s, self._anotado_s = {}, [], None, None, None
+        self.ws_gotas, self.ws_antes = [], None   # Solid: gotas dos workspaces que nascem/somem
         self.gota = GotaSolida() if SOLIDO else Gota()
         if SOLIDO:                                # paleta nova (wallpaper, claro/escuro): só redesenha
             self._vigia_cores = solido.vigiar(lambda: (self.redesenhar(), self.gota.area.queue_draw()))
@@ -628,7 +629,7 @@ class Barra(Gtk.Window):
         for mx, mw in self.molas_s.values():
             mexe = mx.passo(dt) | mw.passo(dt) | mexe
         self.area.queue_draw()
-        if not mexe and not self.gotas_s:
+        if not mexe and not self.gotas_s and not self.ws_gotas:
             self.tique_s = None                      # parada: nenhum timer
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
@@ -1703,26 +1704,121 @@ def largura_solida(b, m, cr):
     return PAD_S + GL_S + PAD_S
 
 
+WS_GOTA_S = 0.42          # s: a gota de um workspace que nasce (cai no ponto) / some (escorre e solta)
+
+
+def _ws_mola(b, chave, valor, omega):
+    """Molas dos workspaces moram junto das da barra (b.molas_s, em pares) pra andarem no mesmo tique."""
+    if chave not in b.molas_s:
+        b.molas_s[chave] = (solido.Mola(valor, omega), solido.Mola(0.0))
+    return b.molas_s[chave][0]
+
+
+def desenhar_workspaces_solido(b, m, cr, x, cy, dim):
+    """Os 5 workspaces: pontos + a pílula primária do ativo. Trocar de workspace é um METABALL em molas
+    criticamente amortecidas: a frente da pílula (mola rápida) dispara pro ponto novo e a traseira (mola
+    lenta) fica pra trás — primeiro ela ESTICA, depois um pescoço líquido (solido.ponte) liga as duas e
+    afina, e a traseira chega e se funde na pílula nova. Trocas seguidas só mudam o alvo das molas (a
+    velocidade continua: retoma suave do meio). Workspace que nasce cai como gota no ponto; o que some
+    escorre pra baixo e solta. Tudo cairo, formas sólidas; parado não há tique (as molas param sozinhas)."""
+    agora = time.monotonic()
+    primeira = b.ws_antes is None
+    # larguras ALVO de cada casa (o ativo é largo) -> centros do layout final (alvo das molas e dos cliques)
+    alvos, xx, m.casas = [], 8.0, []
+    for k in range(5):
+        lw = WS_PILULA if k + 1 == b.ws_ativo else WS_PONTO
+        alvos.append(xx + lw / 2)
+        m.casas.append((x + xx, x + xx + lw))
+        xx += lw + WS_GAP
+    # larguras ATUAIS (molas) -> centros de agora (os pontos abrem espaço pra pílula, suave)
+    centros, xx = [], 8.0
+    for k in range(5):
+        lw_alvo = WS_PILULA if k + 1 == b.ws_ativo else WS_PONTO
+        mola = _ws_mola(b, f"ws:larg{k}", lw_alvo, 20.0)
+        mola.alvo = lw_alvo
+        lw = mola.x
+        centros.append(xx + lw / 2)
+        xx += lw + WS_GAP
+    # nível de "usado" de cada ponto (raio 3->4, alfa 0.4->1) + as gotas de quem nasce/some
+    usados = {n for n in b.ws_usados if 1 <= n <= 5}
+    if not primeira:
+        for n in usados - b.ws_antes:
+            b.ws_gotas = [g for g in b.ws_gotas if g[1] != n - 1] + [("entra", n - 1, agora)]
+        for n in b.ws_antes - usados:
+            b.ws_gotas = [g for g in b.ws_gotas if g[1] != n - 1] + [("sai", n - 1, agora)]
+    b.ws_antes = set(usados)
+    b.ws_gotas = [g for g in b.ws_gotas if agora - g[2] < WS_GOTA_S]
+    for k in range(5):
+        u = _ws_mola(b, f"ws:uso{k}", 1.0 if k + 1 in usados else 0.0, 12.0)
+        u.alvo = 1.0 if k + 1 in usados else 0.0
+        gota = next((g for g in b.ws_gotas if g[1] == k), None)
+        if gota and gota[0] == "entra":                     # o ponto só "enche" quando a gota chega
+            u_vis = u.x * solido.suave(0.55, 1.0, (agora - gota[2]) / WS_GOTA_S)
+        else:
+            u_vis = u.x
+        r = 3 + u_vis
+        px = x + centros[k]
+        cr.set_source_rgba(*dim, 0.4 + 0.6 * u_vis)
+        cr.arc(px, cy, r, 0, 2 * math.pi)
+        cr.fill()
+        if gota:                                            # a gota: cai de cima / escorre pra baixo
+            t = (agora - gota[2]) / WS_GOTA_S
+            if gota[0] == "entra":
+                e = 1 - (1 - min(1.0, t)) ** 3
+                rg = 2.2 + 0.8 * e
+                gy = (cy - 10) + 10 * e
+                cr.set_source_rgba(*dim, 0.5 + 0.5 * e)
+                cr.arc(px, gy, rg, 0, 2 * math.pi)
+                cr.fill()
+                if gy + rg < cy - r:                         # ainda acima: o pescoço puxando pro ponto
+                    solido.pescoco(cr, px, cy - r + 0.5, gy + rg, 2.6, rg * 0.8, 7)
+            else:
+                e = min(1.0, t) ** 2
+                rg = 3.2 - 1.4 * e
+                gy = cy + 11 * e
+                cr.set_source_rgba(*dim, 0.9 * (1 - solido.suave(0.5, 1.0, t)))
+                cr.arc(px, gy, rg, 0, 2 * math.pi)
+                cr.fill()
+                if gy - rg > cy + r:                         # já saiu do ponto: o pescoço afina e solta
+                    solido.pescoco(cr, px, cy + r - 0.5, gy - rg, 2.6, rg * 0.8, 7)
+    # a pílula: frente rápida, traseira lenta (as duas criticamente amortecidas, sem passar do alvo)
+    k_at = min(4, max(0, b.ws_ativo - 1))
+    frente = _ws_mola(b, "ws:frente", alvos[k_at], 26.0)
+    tras = _ws_mola(b, "ws:tras", alvos[k_at], 13.0)
+    frente.alvo = tras.alvo = alvos[k_at]
+    if not (1 <= b.ws_ativo <= 5):
+        mexe = any(not b.molas_s[c][0].parada for c in b.molas_s if c.startswith("ws:")) or b.ws_gotas
+        if mexe:
+            b.animar_solido()
+        return
+    a, t_ = x + frente.x, x + tras.x
+    meia, hp = WS_PILULA / 2, 8.0
+    dist = abs(a - t_)
+    cr.set_source_rgb(*cor_s("primary"))
+    if dist < 12:                                           # perto: uma pílula só, ESTICADA entre as duas
+        x0, x1 = min(a, t_) - meia, max(a, t_) + meia
+        h = hp * max(0.72, WS_PILULA / (x1 - x0)) ** 0.5    # estica = afina (o volume se conserva)
+        pilula(cr, x0, cy - h / 2, x1 - x0, h)
+        cr.fill()
+    else:                                                   # longe: cabeça + gota traseira + pescoço
+        rt = 4.0 * max(0.55, 1 - (dist - 12) / 60)          # a traseira encolhe enquanto o pescoço estica
+        pilula(cr, a - meia, cy - hp / 2, WS_PILULA, hp)
+        cr.fill()
+        pilula(cr, t_ - rt * 1.4, cy - rt, rt * 2.8, rt * 2)
+        cr.fill()
+        if a > t_:                                          # ponte entre a traseira (esq.) e a frente (dir.)
+            solido.ponte(cr, t_ + rt * 1.4, a - meia, cy - rt, rt * 2, 34)
+        else:
+            solido.ponte(cr, a + meia, t_ - rt * 1.4, cy - rt, rt * 2, 34)
+    if b.ws_gotas or any(not b.molas_s[c][0].parada for c in b.molas_s if c.startswith("ws:")):
+        b.animar_solido()
+
+
 def desenhar_modulo_solido(b, m, cr, x):
     cy = ALTURA / 2
     fg, dim = cor_s("on_surface"), cor_s("on_surface_variant")
     if isinstance(m, Workspaces):
-        xx, m.casas = x + 8, []
-        for k in range(5):
-            n = k + 1
-            if n == b.ws_ativo:
-                pilula(cr, xx, cy - 4, WS_PILULA, 8)
-                cr.set_source_rgb(*cor_s("primary"))
-                cr.fill()
-                m.casas.append((xx, xx + WS_PILULA))
-                xx += WS_PILULA + WS_GAP
-            else:
-                usado = n in b.ws_usados
-                cr.arc(xx + WS_PONTO / 2, cy, 4 if usado else 3, 0, 2 * math.pi)
-                cr.set_source_rgba(*dim, 1.0 if usado else 0.4)
-                cr.fill()
-                m.casas.append((xx, xx + WS_PONTO))
-                xx += WS_PONTO + WS_GAP
+        desenhar_workspaces_solido(b, m, cr, x, cy, dim)
     elif isinstance(m, Minimizados):
         glifo_s(cr, GLIFOS_S["min"], x + PAD_S + GL_S / 2, cy, fg)
         texto_s(cr, str(b.minimizados), x + PAD_S + GL_S + 4, cy, 12, fg)
