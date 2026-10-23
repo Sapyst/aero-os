@@ -33,6 +33,11 @@ Peças técnicas (detalhes no doc 24):
   flutuante na tela, conferimos de novo 2x por segundo. É uma conversa direta pelo socket, sem abrir
   outro programa: custa quase nada.
 
+No visual Solid (solido.py): a barra é uma superfície tonal chapada (sem contorno), cada ícone tem um "chip"
+redondo, o indicador de aberto é uma pílula na cor primária. A onda vira METABALL: enquanto o mouse está no
+Dock (ou um app abrindo pula), uma GLArea (liquido.CampoSolido) desenha a barra com bolhas da mesma cor sob
+os ícones que sobem — a barra "estica" como líquido até eles. Parado e sem mouse, a GLArea sai.
+
 Configurações (Settings → Dock, chaves DOCK_* no painel.conf): o Dock vigia o arquivo e aplica na hora.
 Apps do Dock: ~/.config/aero-shell/dock.json (o "Add to Dock" do Super Menu também grava lá).
 Precisa de LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so (o lançador ~/.local/bin/dock faz isso).
@@ -60,6 +65,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk  # noqa: E402
 from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import apps  # noqa: E402
+import solido  # noqa: E402
 
 PAINEL = os.path.expanduser("~/.config/hypr/painel.conf")
 CORES_BARRA = os.path.expanduser("~/.config/waybar/cores.css")      # a cor da barra de cima (doc 18)
@@ -305,6 +311,8 @@ class Faixa(Gtk.Widget):
             if isinstance(filho, Gtk.Popover):
                 filho.present()
             filho = filho.get_next_sibling()
+        if self.dock.campo is not None:
+            self.dock.campo.allocate(largura, altura, -1, None)
         for item in self.dock.itens:
             if item.widget is None:
                 continue
@@ -321,6 +329,8 @@ class Faixa(Gtk.Widget):
         d = self.dock
         if getattr(d, "dots", False):
             return self.snapshot_pontos(snap)
+        if getattr(d, "solido", False):
+            return self.snapshot_solido(snap)
         if DEPURAR:
             print("desenho: fase", round(d.fase, 2), "alvo", d.alvo, "barra", d.ret_barra, "alfa", round(d.alfa_barra, 2),
                   "encostado", d.encostado, "tela cheia", d.tela_cheia, flush=True)
@@ -360,6 +370,46 @@ class Faixa(Gtk.Widget):
                                       retangulo(cx - largura / 2, y, largura, 4))
                     snap.pop()
 
+
+    def snapshot_solido(self, snap):
+        """Solid: barra tonal chapada (ou o metaball, enquanto existe), chips, ícones e a pílula de aberto."""
+        d = self.dock
+        sup, chip = solido.rgb("surface_container"), solido.rgb("surface_container_highest")
+        if d.ret_barra and d.alfa_barra > 0.005:
+            x, y, w, h = d.ret_barra
+            contorno = cantos_redondos(retangulo(x, y, w, h), min(d.raio_s, h / 2))
+            snap.append_outset_shadow(contorno, rgba((0, 0, 0, 1), 0.14 * d.forma * d.alfa_barra), 0, 2, 0, 12 * d.forma)
+            if d.campo is not None and d.campo.ok:
+                self.snapshot_child(d.campo, snap)                     # a barra + as bolhas líquidas
+            else:
+                snap.push_rounded_clip(contorno)
+                snap.append_color(rgba(sup + (1.0,), d.alfa_barra), retangulo(x, y, w, h))
+                snap.pop()
+        for item in d.itens:
+            if item.tipo == "separador" and item.visivel > 0.01:
+                altura = d.tam * 0.5 * item.visivel
+                sep = cantos_redondos(retangulo(item.x - 1.5, item.y - altura / 2, 3, altura), 1.5)
+                snap.push_rounded_clip(sep)
+                snap.append_color(rgba(solido.rgb("outline_variant") + (1.0,), item.visivel),
+                                  retangulo(item.x - 1.5, item.y - altura / 2, 3, altura))
+                snap.pop()
+            elif item.widget is not None and item.visivel > 0.01:
+                lado = d.tam_max * item.escala
+                r = lado * 0.5 * 0.9
+                cx, cy = item.x + lado / 2, item.y + lado / 2
+                bola = cantos_redondos(retangulo(cx - r, cy - r, 2 * r, 2 * r), r)
+                snap.push_rounded_clip(bola)
+                snap.append_color(rgba(chip + (1.0,), item.visivel), retangulo(cx - r, cy - r, 2 * r, 2 * r))
+                snap.pop()
+                self.snapshot_child(item.widget, snap)
+                if item.janelas:                                       # aberto: pontinho; em uso: pílula primária
+                    largura = 14 if item.ativo else 5
+                    y = d.base_barra - 5
+                    ponto = cantos_redondos(retangulo(cx - largura / 2, y, largura, 4), 2)
+                    snap.push_rounded_clip(ponto)
+                    cor = solido.rgb("primary") if item.ativo else solido.rgb("on_surface_variant")
+                    snap.append_color(rgba(cor + (1.0,), item.visivel), retangulo(cx - largura / 2, y, largura, 4))
+                    snap.pop()
 
     def snapshot_pontos(self, snap):
         """DotStyle dock: no bar. A halftone of dots around the bubbles (big against them, fading out), which
@@ -457,6 +507,9 @@ class Dock(Gtk.ApplicationWindow):
         self.add_css_class("dock")
         self.app = app
         self.dots = visual_atual() == "DotStyle"      # DotStyle: halftone dock (Faixa.snapshot_pontos)
+        self.solido = visual_atual() == "Solid"       # Solid: barra tonal + chips + metaball (snapshot_solido)
+        self.campo = None                             # a GLArea do metaball (só enquanto anima/mouse em cima)
+        self.raio_s = solido.raio()
         Camada.init_for_window(self)
         Camada.set_layer(self, Camada.Layer.TOP)             # acima das janelas (abaixo de tela cheia)
         Camada.set_namespace(self, "dock")
@@ -583,6 +636,8 @@ class Dock(Gtk.ApplicationWindow):
         gicon = item.app.get_icon() or Gio.ThemedIcon.new("application-x-executable")
         if getattr(self, "dots", False):
             icone = BolhaIcone(gicon, self.tam_max, item.app.get_display_name() or "")
+        elif getattr(self, "solido", False):                  # o ícone dentro do chip
+            icone = Gtk.Image(gicon=gicon, pixel_size=int(self.tam_max * 0.64), hexpand=True, vexpand=True)
         else:
             icone = Gtk.Image(gicon=gicon, pixel_size=int(self.tam_max * 0.72), hexpand=True, vexpand=True)
         bolha.append(icone)
@@ -791,10 +846,44 @@ class Dock(Gtk.ApplicationWindow):
                 parado = False
         self.faixa.queue_allocate()
         self.faixa.queue_draw()
+        if self.solido:
+            self.metaball(parado)
         if parado:
             self.relogio = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
+
+    def metaball(self, parado):
+        """Solid: liga a GLArea do metaball enquanto a onda/um pulo anima ou o mouse está no Dock; parado e
+        sem mouse, ela sai (a barra volta a ser um retângulo do GSK, igual, sem GPU nenhuma)."""
+        pulando = any(i.quique_desde is not None for i in self.itens)
+        precisa = (self.ret_barra is not None and self.fase > 0.5 and self.movimento
+                   and (self.mouse_dentro or self.onda > 0.002 or pulando or not parado))
+        if precisa and self.campo is None:
+            from liquido import CampoSolido
+            self.campo = CampoSolido(cor=solido.rgb("surface_container"), k=20.0)
+            self.campo.set_parent(self.faixa)
+            self.faixa.queue_allocate()
+        if self.campo is None:
+            return
+        if not precisa:
+            self.campo.unparent()
+            self.campo = None
+            self.faixa.queue_draw()
+            return
+        x, y, w, h = self.ret_barra
+        caixa = (x + w / 2, y + h / 2, w / 2, h / 2, min(self.raio_s, h / 2))
+        gotas = []
+        for item in self.itens:
+            if item.widget is None or item.visivel <= 0.01:
+                continue
+            lado = self.tam_max * item.escala
+            r = lado * 0.5 * 0.9 + 4                    # o chip + uma borda da cor da barra
+            cx, cy = item.x + lado / 2, item.y + lado / 2
+            if cy - r < y - 0.5:                        # só quem sobe além da barra vira bolha
+                gotas.append((cx, cy, r))
+        self.campo.cor = (*solido.rgb("surface_container"), 1.0)
+        self.campo.formas(gotas, 1.0, [caixa])
 
     # ---------- estado: visível ou dormente? ----------
 
@@ -1286,6 +1375,8 @@ class App(Adw.Application):    # Adw = menus acompanham o claro/escuro (doc 35)
     def iniciar(self):
         self.hold()
         carregar_dicas_dotstyle()
+        if visual_atual() == "Solid":
+            solido.aplicar_css()                     # dicas e menus do Solid
         self.provedor = Gtk.CssProvider()
         # USER+1: vence o gtk.css do usuário, que liga o vidro em toda janela (doc 16)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.provedor,
@@ -1339,6 +1430,10 @@ class App(Adw.Application):    # Adw = menus acompanham o claro/escuro (doc 35)
 
     def aplicar_cores(self):
         self.dock.cores = ler_cores()
+        if self.dock.solido:                         # Solid: as cores da paleta tonal (mudam com o wallpaper)
+            solido.recarregar()
+            self.dock.cores = {"fundo": solido.rgb("surface_container") + (1.0,),
+                               "texto": solido.rgb("on_surface") + (1.0,), "destaque": solido.rgb("primary") + (1.0,)}
         r, g, b, _a = self.dock.cores["texto"]
         self.provedor.load_from_string(CSS_MODELO % {"texto": f"rgb({r * 255:.0f},{g * 255:.0f},{b * 255:.0f})"})
         self.dock.animar()

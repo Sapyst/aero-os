@@ -228,6 +228,9 @@ def css_shell(esq=None):
 .solid-titulo {{ font-size: 22px; font-weight: 400; color: @solid_on_surface; }}
 .solid-texto {{ font-size: 14px; color: @solid_on_surface; }}
 .solid-fraco {{ font-size: 12px; color: @solid_on_surface_variant; }}
+tooltip {{ background-color: @solid_inverse_surface; color: @solid_inverse_on_surface; border-radius: 999px;
+  border: none; box-shadow: none; padding: 5px 12px; }}
+tooltip > box > label {{ color: @solid_inverse_on_surface; }}
 """
 
 
