@@ -384,7 +384,7 @@ def orbitar(itens, w, h):
     CENTROS.clear()
     CENTROS.update({g: c for g, c in centro.items() if peso[g] > 0})
     pos = [list(a) for a in alvo]
-    lx, ly = w / 2 - 60, h / 2 - 115
+    lx, ly = w / 2 - 60, h / 2 - 175          # leaves room for the MODIFIED ruler and the chips
     hx, hy = BURACO * 1.55, BURACO * 0.72
     for _ in range(60):
         for i in range(n):
@@ -859,6 +859,7 @@ class Orbita(nuvem.Nuvem):
     def abrir(self):
         self.ajustar_ao_monitor()
         self.consulta, self.peek, self.foco, self.filtro = "", None, None, None
+        self.editando = None
         self.anel = [0, ANEL_N]
         self.bolhas, self.enfeites = [], []
         self.t_abrir, self.t_fechar = time.monotonic(), None
@@ -919,14 +920,26 @@ class Orbita(nuvem.Nuvem):
     # ---------- geometry of the extras ----------
 
     def geo_anel(self, w, h):
-        cx, cy = self._centro()
-        R = min(h * 0.43, w * 0.3, 520)
-        return cx, cy + 40, R, math.radians(200), math.radians(340)
+        """The "modified" ruler: a row of dots above the kind chips (x0, y, length)."""
+        L = min(560, w * 0.4)
+        return (w - L) / 2, h - 134, L
 
     def ponto_anel(self, i, w, h):
-        cx, cy, R, a0, a1 = self.geo_anel(w, h)
-        a = a0 + (a1 - a0) * i / ANEL_N
-        return cx + R * math.cos(a), cy + R * math.sin(a)
+        x0, y, L = self.geo_anel(w, h)
+        return x0 + L * i / ANEL_N, y
+
+    @staticmethod
+    def idade_rotulo(i):
+        if i <= 0:
+            return "ANY TIME"
+        if i >= ANEL_N:
+            return "NOW"
+        s = idade_fracao(i / ANEL_N)
+        for lim, div, u in ((3600 * 48, 3600, "H"), (86400 * 14, 86400, "D"), (86400 * 60, 7 * 86400, "W"),
+                            (86400 * 365 * 2, 30 * 86400, "MO")):
+            if s < lim:
+                return f"{max(1, round(s / div))} {u} AGO"
+        return f"{round(s / (365 * 86400))} Y AGO"
 
     def satelites(self, b, agora):
         x, y, r, a = self._onde(b, agora)
@@ -1211,31 +1224,38 @@ class Orbita(nuvem.Nuvem):
             self._texto_cor(cr, NOME_SETOR[ang], x, y, "Doto Black 12", FG, 0.3 * fundo)
 
     def desenhar_anel(self, cr, w, h, fundo):
+        """MODIFIED: a ruler of dots from "any time" (left) to "now" (right); drag the two red handles to
+        keep only files changed in that window. Faint while unused, the chosen range written in words."""
         lo, hi = self.anel
+        usado = (lo, hi) != (0, ANEL_N)
+        x0, y, L = self.geo_anel(w, h)
+        perto = self.mouse is not None and abs(self.mouse[1] - y) < 40 and x0 - 60 < self.mouse[0] < x0 + L + 60
+        forca = (1.0 if usado or perto or self.arrasto in (0, 1) else 0.45) * fundo
         apagado, aceso = [], []
         for i in range(ANEL_N + 1):
             (aceso if lo <= i <= hi else apagado).append(self.ponto_anel(i, w, h))
-        for pts, rr, al in ((apagado, 2.2, 0.16), (aceso, 3.1, 0.75)):
+        for pts, rr, al in ((apagado, 2.0, 0.18), (aceso, 2.8, 0.75)):
             cr.new_path()
-            for x, y in pts:
+            for x, yy in pts:
                 cr.new_sub_path()
-                cr.arc(x, y, rr, 0, 2 * math.pi)
-            cr.set_source_rgba(*FG, al * fundo)
+                cr.arc(x, yy, rr, 0, 2 * math.pi)
+            cr.set_source_rgba(*FG, al * forca)
             cr.fill()
-        cx, cy, R, a0, a1 = self.geo_anel(w, h)
-        for nome, idade in MARCAS:
-            f = fracao_idade(idade)
-            a = a0 + (a1 - a0) * f
-            self._texto_cor(cr, nome, cx + (R + 26) * math.cos(a), cy + (R + 26) * math.sin(a),
-                            "Doto Black 11", FG, 0.42 * fundo)
+        for nome, idade in MARCAS:                             # faint ticks under the row
+            self._texto_cor(cr, nome, x0 + L * fracao_idade(idade), y + 17, "Doto Black 9", FG, 0.3 * forca)
+        mw = self._texto_cor(cr, "MODIFIED", -9999, -9999, "Doto Black 11", FG, 0)
+        self._texto_cor(cr, "MODIFIED", x0 - 28 - mw / 2, y, "Doto Black 11", FG, 0.55 * forca)
+        faixa = "ANY TIME" if not usado else f"{self.idade_rotulo(lo)} → {self.idade_rotulo(hi)}"
+        fw = self._texto_cor(cr, faixa, -9999, -9999, "Doto Black 11", FG, 0)          # measure, then left-align
+        self._texto_cor(cr, faixa, x0 + L + 28 + fw / 2, y, "Doto Black 11", RED if usado else FG, (0.9 if usado else 0.5) * forca)
         for k in (0, 1):
-            x, y = self.ponto_anel(self.anel[k], w, h)
+            x, yy = self.ponto_anel(self.anel[k], w, h)
             cr.new_path()
-            cr.arc(x, y, 7, 0, 2 * math.pi)
-            cr.set_source_rgba(*RED, fundo)
+            cr.arc(x, yy, 6.5, 0, 2 * math.pi)
+            cr.set_source_rgba(*RED, forca)
             cr.set_line_width(2.2)
             cr.stroke()
-            self.zonas.append(("anel", k, x, y, 16))
+            self.zonas.append(("anel", k, x, yy, 16))
 
     def desenhar_caminho(self, cr, w, h, fundo):
         """The path as a constellation: one star per folder, joined by a dotted line."""
@@ -1273,6 +1293,35 @@ class Orbita(nuvem.Nuvem):
             for _ in range(subir):
                 alvo = CASA if alvo in RAIZES[1:] else os.path.dirname(alvo)
             self.zonas.append(("pasta", alvo, x, y - 8, 22))
+        # the path as editable text (click / Ctrl+L) and a COPY drop next to it
+        editando = getattr(self, "editando", None)
+        texto = editando if editando is not None else exibir(self.pasta)
+        fonte = "Inter 12.5"
+        tw = self._texto_cor(cr, texto or " ", -9999, -9999, fonte, FG, 0)
+        x0, y0, alt = 60, 136, 30
+        larg = max(160, tw + 30)
+        cr.new_path()
+        cr.arc(x0 + alt / 2, y0, alt / 2, math.pi / 2, 3 * math.pi / 2)
+        cr.arc(x0 + larg - alt / 2, y0, alt / 2, -math.pi / 2, math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(*FUNDO_BOLHA, (0.95 if editando is not None else 0.6) * fundo)
+        cr.fill_preserve()
+        cr.set_source_rgba(*(RED if editando is not None else FG), (0.7 if editando is not None else 0.12) * fundo)
+        cr.set_line_width(1.2)
+        cr.stroke()
+        self._texto_cor(cr, texto, x0 + 15 + tw / 2, y0, fonte, FG, (1 if editando is not None else 0.75) * fundo)
+        if editando is not None:
+            cr.rectangle(x0 + 17 + tw, y0 - 8, 2, 16)
+            cr.set_source_rgba(*RED, fundo)
+            cr.fill()
+        self.zonas.append(("editar", None, x0 + larg / 2, y0, larg / 2))
+        bx = x0 + larg + 26
+        cr.new_path()
+        cr.arc(bx, y0, 18, 0, 2 * math.pi)
+        cr.set_source_rgba(*FUNDO_BOLHA, 0.85 * fundo)
+        cr.fill()
+        self._texto_cor(cr, "COPY", bx, y0, "Doto Black 9.5", FG, 0.8 * fundo)
+        self.zonas.append(("copiar", None, bx, y0, 18))
 
     def desenhar_chips(self, cr, w, h, fundo):
         layout = PangoCairo.create_layout(cr)
@@ -1398,7 +1447,7 @@ class Orbita(nuvem.Nuvem):
 
     def zona_em(self, x, y):
         for tipo, valor, zx, zy, zr in reversed(self.zonas):
-            if tipo == "chip":
+            if tipo in ("chip", "editar"):
                 if abs(x - zx) <= zr and abs(y - zy) <= 17:
                     return tipo, valor
             elif math.hypot(x - zx, y - zy) <= zr:
@@ -1450,6 +1499,13 @@ class Orbita(nuvem.Nuvem):
             elif tipo == "chip":
                 self.filtro = valor
                 self.atualizar()
+            elif tipo == "editar":
+                self.editando = exibir(self.pasta)
+                self.area.queue_draw()
+            elif tipo == "copiar":
+                subprocess.Popen(["wl-copy", self.pasta], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.aviso = ("PATH COPIED", time.monotonic())
+                self.animar()
             return
         i = self.bolha_em(x, y)
         if i is None:
@@ -1479,12 +1535,8 @@ class Orbita(nuvem.Nuvem):
         self._arrastou = True
         x, y = self._ini[0] + dx, self._ini[1] + dy
         w, h = self.area.get_width(), self.area.get_height()
-        cx, cy, R, a0, a1 = self.geo_anel(w, h)
-        a = math.atan2(y - cy, x - cx)
-        if a < 0:
-            a += 2 * math.pi
-        i = round((a - a0) / (a1 - a0) * ANEL_N)
-        i = max(0, min(ANEL_N, i))
+        x0, _y, L = self.geo_anel(w, h)
+        i = max(0, min(ANEL_N, round((x - x0) / L * ANEL_N)))
         if self.arrasto == 0:
             self.anel[0] = min(i, self.anel[1] - 2)
         else:
@@ -1502,6 +1554,12 @@ class Orbita(nuvem.Nuvem):
 
     def _tecla(self, _c, tecla, _cod, mods):
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+        if ctrl and tecla in (Gdk.KEY_l, Gdk.KEY_L):
+            self.editando = exibir(self.pasta)
+            self.area.queue_draw()
+            return True
+        if getattr(self, "editando", None) is not None:
+            return self.tecla_caminho(tecla, ctrl)
         if self.vis is not None:
             m = self.visor.midia
             if tecla == Gdk.KEY_Escape:
@@ -1576,6 +1634,59 @@ class Orbita(nuvem.Nuvem):
             self.atualizar()
             return True
         return False
+
+    def resolver(self, texto):
+        t = texto.strip()
+        if t.upper().startswith("D:"):
+            t = DADOS + t[2:]
+        elif t.startswith("~"):
+            t = CASA + t[1:]
+        return os.path.normpath(os.path.expanduser(t)) if t else self.pasta
+
+    def tecla_caminho(self, tecla, ctrl):
+        """Typing a path: Enter goes there (a file: its folder), Tab completes the folder name,
+        Ctrl+V pastes, Esc cancels."""
+        e = self.editando
+        if tecla == Gdk.KEY_Escape:
+            self.editando = None
+        elif tecla in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            alvo = self.resolver(e)
+            if os.path.isfile(alvo):
+                alvo = os.path.dirname(alvo)
+            if os.path.isdir(alvo):
+                self.editando = None
+                self.ir_para(alvo)
+            else:
+                self.aviso = ("NOT FOUND", time.monotonic())
+                self.animar()
+        elif tecla == Gdk.KEY_Tab:
+            base = self.resolver(e)
+            pai, parte = (base, "") if e.endswith("/") else os.path.split(base)
+            try:
+                nomes = sorted(n for n in os.listdir(pai) if n.casefold().startswith(parte.casefold())
+                               and not n.startswith(".") and os.path.isdir(os.path.join(pai, n)))
+            except OSError:
+                nomes = []
+            if nomes:
+                self.editando = exibir(os.path.join(pai, nomes[0])) + "/"
+        elif tecla == Gdk.KEY_BackSpace:
+            self.editando = e[:-1]
+        elif ctrl and tecla in (Gdk.KEY_v, Gdk.KEY_V):
+            def colado(cb, res):
+                try:
+                    t = cb.read_text_finish(res)
+                except GLib.Error:
+                    t = None
+                if t and self.editando is not None:
+                    self.editando += t.strip().splitlines()[0]
+                    self.area.queue_draw()
+            self.get_display().get_clipboard().read_text_async(None, colado)
+        else:
+            u = Gdk.keyval_to_unicode(tecla)
+            if u and chr(u).isprintable() and not ctrl:
+                self.editando = e + chr(u)
+        self.area.queue_draw()
+        return True
 
     def _mover(self, _c, x, y):
         if self.vis is not None:                             # while viewing: no lens behind the window
