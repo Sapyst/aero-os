@@ -40,6 +40,7 @@ from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 import cairo  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import liquido  # noqa: E402
 import nuvem  # noqa: E402
 from nuvem import FG, RED, empacotar, pop, suave  # noqa: E402
 
@@ -473,6 +474,10 @@ class Orbita(nuvem.Nuvem):
         self.set_child(None)
         raiz = Gtk.Overlay()
         raiz.set_child(self.veu)
+        # the liquid layer (GPU): bubbles are drops that pour in, join with necks, and the halftone around
+        # them. Content (thumbnails, text) is drawn on top by cairo. Without GL it stays off (old drawing).
+        self.liquido = liquido.CampoLiquido()
+        raiz.add_overlay(self.liquido)
         raiz.add_overlay(self.area)
         self.set_child(raiz)
         self.indice = Indice()
@@ -783,7 +788,8 @@ class Orbita(nuvem.Nuvem):
             self.veu.set_opacity(fundo)
         self.desenhar_anel(cr, w, h, fundo)
         self.desenhar_guias(cr, w, h, fundo)
-        if self.bolhas:
+        liq = self.liquido.ok
+        if self.bolhas and not liq:
             self.desenhar_enfeites(cr, w, h, agora, fundo)
         sobre = self.bolha_em(*self.mouse) if self.mouse else None
         if sobre is not None:
@@ -802,16 +808,54 @@ class Orbita(nuvem.Nuvem):
             self.desenhar_bolha(cr, self.bolhas[i], agora, i == foco)
         if foco is not None and 0 <= foco < len(self.bolhas) and self.t_fechar is None:
             self.desenhar_satelites(cr, self.bolhas[foco], agora)
+        if liq:
+            self.formas_liquidas(agora, foco, fundo)
         self.desenhar_centro(cr, w, h, fundo, agora)
         self.desenhar_caminho(cr, w, h, fundo)
         self.desenhar_chips(cr, w, h, fundo)
         if self.peek is not None:
             self.desenhar_peek(cr, w, h, agora)
 
+    def peek_k(self, agora):
+        """0..1: how far the peek drop has travelled from its bubble to the middle."""
+        if self.peek is None:
+            return 0.0
+        t = min(1.0, (agora - self.peek[2]) / 0.42)
+        return 1 - (1 - t) ** 3
+
+    def formas_liquidas(self, agora, foco, fundo):
+        """Hands the GPU layer this frame's drops: every bubble, the drops pouring into newborn ones, the
+        satellites of the focused one, and the peek drop stretching out of its bubble."""
+        formas, pk = [], self.peek_k(agora)
+        cx, cy = self._centro()
+        for i, b in enumerate(self.bolhas):
+            x, y, r, a = self._onde(b, agora)
+            if self.peek is not None and self.peek[0] is not b:
+                r *= 1 - 0.75 * pk                                  # the others melt away while peeking
+            if r > 0.6:
+                formas.append((x, y, r))
+            formas += liquido.gotas_de_nascimento(x, y, b.r, agora - b.nasce, i + 1)
+        if foco is not None and 0 <= foco < len(self.bolhas) and self.t_fechar is None and self.peek is None:
+            formas += [(sx, sy, 23 * a) for _n, sx, sy, a in self.satelites(self.bolhas[foco], agora)]
+        if self.peek is not None:
+            bx, by, br, _a = self._onde(self.peek[0], agora)
+            R = min(self.area.get_width(), self.area.get_height()) * 0.3
+            formas.append((bx + (cx - bx) * pk, by + (cy - by) * pk, br + (R - br) * pk))
+        self.liquido.formas(formas, fundo)
+
     def desenhar_bolha(self, cr, b, agora, focada):
         x, y, r, a = self._onde(b, agora)
         if r < 0.6 or a <= 0.01:
             return
+        liq = self.liquido.ok
+        if liq:
+            # the content shows up once the drops have joined: the pour hides the loading
+            a *= min(1.0, max(0.0, (agora - b.nasce - 0.28) / 0.25))
+            if self.peek is not None and self.peek[0] is not b:
+                r *= 1 - 0.75 * self.peek_k(agora)
+                a *= 1 - 0.85 * self.peek_k(agora)
+            if a <= 0.01:
+                return
         cr.new_path()
         if focada:
             g = cairo.RadialGradient(x, y, r * 0.8, x, y, r * 1.7)
@@ -839,12 +883,13 @@ class Orbita(nuvem.Nuvem):
             cr.set_line_width(1)
             cr.stroke()
         else:
-            cr.arc(x, y, r, 0, 2 * math.pi)
-            cr.set_source_rgba(*FUNDO_BOLHA, 0.9 * a)
-            cr.fill_preserve()
-            cr.set_source_rgba(*FG, 0.12 * a)
-            cr.set_line_width(1.2)
-            cr.stroke()
+            if not liq:                                    # with the liquid layer, the GPU draws the drop
+                cr.arc(x, y, r, 0, 2 * math.pi)
+                cr.set_source_rgba(*FUNDO_BOLHA, 0.9 * a)
+                cr.fill_preserve()
+                cr.set_source_rgba(*FG, 0.12 * a)
+                cr.set_line_width(1.2)
+                cr.stroke()
             if b.tipo in ("dir", "grupo"):
                 self.aglomerado(cr, b, x, y, r, a)
                 if b.tipo == "grupo":
@@ -908,6 +953,11 @@ class Orbita(nuvem.Nuvem):
             cr.new_path()
             cr.arc(sx, sy, 23, 0, 2 * math.pi)
             sobre = self.mouse is not None and math.hypot(self.mouse[0] - sx, self.mouse[1] - sy) < 23
+            if self.liquido.ok and not sobre:              # the drop itself comes from the liquid layer
+                cr.new_path()
+                self._texto_cor(cr, nome, sx, sy, "Doto Black 10.5", FG, a)
+                self.zonas.append(("acao", (nome, b), sx, sy, 23))
+                continue
             cr.set_source_rgba(*((0.93, 0.92, 0.91) if sobre else FUNDO_BOLHA), 0.95 * a)
             cr.fill_preserve()
             cr.set_source_rgba(*FG, 0.16 * a)
@@ -1075,23 +1125,33 @@ class Orbita(nuvem.Nuvem):
 
     def desenhar_peek(self, cr, w, h, agora):
         b, conteudo, t0 = self.peek
-        k = pop(agora - t0)
         cx, cy = self._centro()
-        R = min(w, h) * 0.3 * k
+        if self.liquido.ok:
+            # the peek is a drop that left its bubble and grew in the middle; content once it settles
+            pk = self.peek_k(agora)
+            bx, by, br, _a = self._onde(b, agora)
+            cx, cy = bx + (cx - bx) * pk, by + (cy - by) * pk
+            R = br + (min(w, h) * 0.3 - br) * pk
+            if pk < 0.75:
+                return
+        else:
+            R = min(w, h) * 0.3 * pop(agora - t0)
         if R < 1:
             return
         cr.new_path()
-        cr.set_source_rgba(0.01, 0.01, 0.012, 0.6 * min(1, (agora - t0) / 0.2))
-        cr.paint()
+        if not self.liquido.ok:
+            cr.set_source_rgba(0.01, 0.01, 0.012, 0.6 * min(1, (agora - t0) / 0.2))
+            cr.paint()
         g = cairo.RadialGradient(cx, cy, R * 0.9, cx, cy, R * 1.35)
         g.add_color_stop_rgba(0, *FG, 0.16)
         g.add_color_stop_rgba(1, *FG, 0.0)
         cr.set_source(g)
         cr.arc(cx, cy, R * 1.35, 0, 2 * math.pi)
         cr.fill()
-        cr.arc(cx, cy, R, 0, 2 * math.pi)
-        cr.set_source_rgba(*FUNDO_BOLHA, 0.97)
-        cr.fill()
+        if not self.liquido.ok:
+            cr.arc(cx, cy, R, 0, 2 * math.pi)
+            cr.set_source_rgba(*FUNDO_BOLHA, 0.97)
+            cr.fill()
         if isinstance(conteudo, cairo.ImageSurface):
             cr.save()
             cr.arc(cx, cy, R, 0, 2 * math.pi)
