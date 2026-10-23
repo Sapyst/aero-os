@@ -68,7 +68,7 @@ if [ "$linha" != pronto ]; then
 fi
 "$@"
 r=$?
-sleep 0.35                     # os apps e as peças do shell terminam de redesenhar com o visual novo
+sleep 0.5                      # os apps e as peças do shell terminam de redesenhar com o visual novo
 { echo ir >&"$ESCREVE"; } 2>/dev/null
 wait "$pid_onda" 2>/dev/null
 exit $r

@@ -344,7 +344,11 @@ aplicar() {
         fi
         aplicar_tema "$tema"
     fi
-    if [ "$1" = --forcar ] || [ "$filtro" != "$(cat "$ESTADO/filtro" 2>/dev/null)" ]; then aplicar_filtro "$filtro"; fi
+    # Filtro de luz azul: só quando MUDA. Reenviar a mesma temperatura reaplica a matriz de cor (CTM) na
+    # placa, e na NVIDIA isso pisca a tela em PRETO — era o "apagão" ao trocar claro/escuro (a troca com
+    # onda chama este script com --forcar). O --forcar só força o filtro fora da onda (login, na mão).
+    if { [ "$1" = --forcar ] && [ -z "${AERO_TEMA_ONDA:-}" ]; } ||
+       [ "$filtro" != "$(cat "$ESTADO/filtro" 2>/dev/null)" ]; then aplicar_filtro "$filtro"; fi
 }
 
 # O Hyprland que me iniciou ainda está vivo?

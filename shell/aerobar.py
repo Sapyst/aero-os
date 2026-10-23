@@ -787,6 +787,7 @@ class Barra(Gtk.Window):
     def mudar_sobre(self, m):
         if m is not self.sobre:
             self.sobre = m
+            self._clicado = None                     # saiu do ícone clicado: a dica volta a valer
             self.area.queue_draw()
             if getattr(self, "_dica_id", None):
                 GLib.source_remove(self._dica_id)
@@ -807,7 +808,7 @@ class Barra(Gtk.Window):
 
     def _mostrar_dica(self, m):
         self._dica_id = None
-        if m is not self.sobre:
+        if m is not self.sobre or m is getattr(self, "_clicado", None):
             return False
         texto_ = texto_dica_solida(self, m) if SOLIDO else self.texto_dica(m)
         if texto_:
@@ -832,6 +833,12 @@ class Barra(Gtk.Window):
 
     def ao_clicar(self, g, _n, x, _y):
         m = self.modulo_em(x)
+        # clicou: a dica (pílula) some e não volta até o ponteiro sair desse ícone e voltar
+        self._clicado = m
+        if getattr(self, "_dica_id", None):
+            GLib.source_remove(self._dica_id)
+            self._dica_id = None
+        self.gota.esconder()
         if m is not None:
             m.clique(g.get_current_button(), x)
 

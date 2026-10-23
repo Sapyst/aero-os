@@ -359,8 +359,19 @@ class Onda(Gtk.Window):
         self.f_1f(self.u["revela"], 1.0 if self.revelar else 0.0)
         self.f_draw(TRIANGLE_STRIP, 0, 4)
         if self.estado == "parado" and not getattr(self, "avisou_pronto", False):
+            # o print foi DESENHADO, mas ainda não está na tela: só avisa "pronto" depois de 2 quadros
+            # apresentados (o compositor já mostrou a camada). Antes, o tema trocava por baixo de uma
+            # camada que ainda não tinha aparecido, e dava pra ver as peças trocando de cor.
             self.avisou_pronto = True
-            GLib.idle_add(avisar, "pronto")              # o print já está na tela, igual ao que havia
+            quadros = [0]
+
+            def apresentado(_w, _relogio):
+                quadros[0] += 1
+                if quadros[0] < 3:
+                    return GLib.SOURCE_CONTINUE
+                avisar("pronto")
+                return GLib.SOURCE_REMOVE
+            area.add_tick_callback(apresentado)
             return True
         if self.revelar and t >= 1 and self.estado == "onda":
             self.estado = "fim"                          # o buraco já cobre tudo: só sair
