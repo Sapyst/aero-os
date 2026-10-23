@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# ORBIT: the DotStyle file finder (experimental). Opens/closes; the process stays warm 10 min after closing.
+LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 "$HOME/.local/share/aero-shell/orbit.py" "$@"
