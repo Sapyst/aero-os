@@ -20,6 +20,8 @@ Runs as its own small process (com.aero.Orbit) and quits by itself 10 minutes af
 """
 import hashlib
 import math
+from array import array
+from bisect import bisect_right
 import os
 import random
 import subprocess
@@ -42,10 +44,25 @@ import nuvem  # noqa: E402
 from nuvem import FG, RED, empacotar, pop, suave  # noqa: E402
 
 CASA = os.path.expanduser("~")
+DADOS = os.environ.get("AERO_DADOS", "/mnt/d")          # the data drive (shown as "D:" next to your folders)
+RAIZES = [CASA] + ([DADOS] if os.path.ismount(DADOS) else [])
+NOME_RAIZ = {CASA: "HOME", DADOS: "D:"}
+
+
+def exibir(path):
+    """~/x for the home, D:/x for the data drive."""
+    for raiz, nome in ((DADOS, "D:"), (CASA, "~")):
+        if path == raiz or path.startswith(raiz + "/"):
+            return nome + path[len(raiz):]
+    return path
 FUNDO_BOLHA = (0.08, 0.08, 0.09)
 PULAR = {"node_modules", "target", "__pycache__", "build", "dist", "venv", "site-packages", "steamapps",
-         "compatdata", "shadercache", "Cache", "cache", "CachedData", "GPUCache"}
-LIMITE_INDICE = 200_000          # entries; the walk also stops after ~5 s
+         "compatdata", "shadercache", "Cache", "cache", "CachedData", "GPUCache", "System Volume Information",
+         # engines/SDK installs and project caches: thousands of internal files nobody searches for
+         "Library", "Temp", "obj", "Intermediate", "DerivedDataCache", "Unity", "sdk", "platforms",
+         "ndk", "build-tools", "system-images", "Logs"}
+LIMITE_INDICE = 400_000          # entries in all; each root also has a time budget (TEMPO_RAIZ)
+TEMPO_RAIZ = {CASA: 5, DADOS: 10}
 MAX_BOLHAS = 44
 RAIOS = (70, 54, 42, 32, 25)     # rank 0, 1-5, 6-15, 16-29, the rest
 BURACO = 185                     # the empty circle in the middle, where the search is written
@@ -138,11 +155,14 @@ def pontuar(q, nome_cf, rel_cf):
 
 
 class Indice:
-    """Every file and folder under ~ (hidden ones and heavy build/cache folders skipped), walked in a
-    thread when ORBIT opens. Entries: (path, name casefolded, is_dir, mtime, size)."""
+    """Every file and folder under ~ and the data drive D: (hidden ones, Windows system folders and heavy
+    build/cache folders skipped), walked in a thread when ORBIT opens. The home is ready first (search
+    works right away), D: is added after. Kept as parallel arrays (path list + compact number arrays):
+    about 3x less RAM than a tuple per file."""
 
     def __init__(self):
-        self.itens, self.pronto, self.rodando, self.quando = [], False, False, 0.0
+        self.itens = ([], array("d"), array("q"), bytearray())      # paths, mtimes, sizes, is_dir
+        self.pronto, self.rodando, self.quando = False, False, 0.0
 
     def construir(self, ao_terminar):
         if self.rodando or (self.pronto and time.monotonic() - self.quando < 300):
@@ -150,27 +170,47 @@ class Indice:
         self.rodando = True
 
         def trabalho():
-            itens, pilha, t0 = [], [CASA], time.monotonic()
-            while pilha and len(itens) < LIMITE_INDICE and time.monotonic() - t0 < 5:
-                pasta = pilha.pop()
-                try:
-                    with os.scandir(pasta) as it:
-                        for e in it:
-                            if e.name.startswith("."):
-                                continue
-                            try:
-                                eh_dir = e.is_dir(follow_symlinks=False)
-                                st = e.stat(follow_symlinks=False)
-                            except OSError:
-                                continue
-                            itens.append((e.path, e.name.casefold(), eh_dir, st.st_mtime, st.st_size))
-                            if eh_dir and e.name not in PULAR:
-                                pilha.append(e.path)
-                except OSError:
-                    continue
-            self.itens, self.pronto, self.rodando, self.quando = itens, True, False, time.monotonic()
-            GLib.idle_add(lambda: (ao_terminar(), False)[1])
+            itens = ([], array("d"), array("q"), bytearray())
+            for raiz in RAIZES:
+                self._andar(raiz, itens)
+                n = len(itens[0])
+                # all names, casefolded, in ONE string ("\n" between them) + where each one starts: a search
+                # is then str.find (C speed) instead of a Python loop over 250k files
+                nomes = [c[c.rfind("/") + 1:].casefold() for c in itens[0][:n]]
+                inicios, k = array("q"), 0
+                for nm in nomes:
+                    inicios.append(k)
+                    k += len(nm) + 1
+                self.itens = (itens[0][:n], itens[1][:n], itens[2][:n], itens[3][:n], "\n".join(nomes), inicios)
+                self.pronto = True
+                GLib.idle_add(lambda: (ao_terminar(), False)[1])
+            self.rodando, self.quando = False, time.monotonic()
         threading.Thread(target=trabalho, daemon=True).start()
+
+    def _andar(self, raiz, itens):
+        pilha, t0, prazo = [raiz], time.monotonic(), TEMPO_RAIZ.get(raiz, 5)
+        caminhos, mtimes, tams, dirs = itens
+        while pilha and len(caminhos) < LIMITE_INDICE and time.monotonic() - t0 < prazo:
+            pasta = pilha.pop()
+            try:
+                with os.scandir(pasta) as it:
+                    for e in it:
+                        if e.name.startswith((".", "$")):
+                            continue
+                        try:
+                            eh_dir = e.is_dir()                 # a link to a folder counts as a folder...
+                            link = e.is_symlink()
+                            st = e.stat()
+                        except OSError:
+                            continue
+                        caminhos.append(e.path)
+                        mtimes.append(st.st_mtime)
+                        tams.append(st.st_size)
+                        dirs.append(1 if eh_dir else 0)
+                        if eh_dir and not link and e.name not in PULAR:     # ...but is not walked into
+                            pilha.append(e.path)
+            except OSError:
+                continue
 
 
 class Arquivo:
@@ -179,7 +219,7 @@ class Arquivo:
                  "grupo", "variantes", "pontos", "rank")
 
     def __init__(self, path, eh_dir, mtime, tam, grupo=0):
-        self.path, self.nome = path, os.path.basename(path) or path
+        self.path, self.nome = path, NOME_RAIZ.get(path) or os.path.basename(path) or path
         self.grupo = grupo                         # > 0: a folder standing for that many results inside it
         self.tipo = "grupo" if grupo else tipo_de(self.nome, eh_dir)
         self.mtime, self.tam = mtime, tam
@@ -238,12 +278,26 @@ def buscar(p, itens):
                         cands.append((st.st_mtime, e.path, eh_dir, st.st_mtime, st.st_size))
         except OSError:
             pass
+        if p["pasta"] == CASA and DADOS in RAIZES and p["filtro"] in (None, "dir"):
+            cands.append((float("inf"), DADOS, True, agora, 0))        # the D: drive, always in the home view
     else:
-        base = p["pasta"].rstrip("/") + "/"
-        for path, nome_cf, eh_dir, mtime, tam in itens:
-            if not path.startswith(base):
+        bases = tuple(r + "/" for r in RAIZES) if p["pasta"] == CASA else (p["pasta"].rstrip("/") + "/",)
+        caminhos, mtimes, tams, dirs, texto, inicios = itens if len(itens) == 6 else (*itens, "", array("q"))
+        achados, pos = [], texto.find(q)
+        while pos != -1 and len(achados) < 20000:
+            i = bisect_right(inicios, pos) - 1
+            achados.append(i)
+            pos = texto.find(q, inicios[i + 1]) if i + 1 < len(inicios) else -1
+        if not achados and len(q) >= 3:                    # nothing: try letters-in-order (typos), slower
+            vistos = set(achados)
+            achados += [i for i, nm in enumerate(texto.split("\n")) if i not in vistos and pontuar(q, nm, "") > 0][:200]
+        for i in achados:
+            path = caminhos[i]
+            if not path.startswith(bases):
                 continue
-            rel = path[len(base):]
+            nome_cf = texto[inicios[i]:(inicios[i + 1] - 1) if i + 1 < len(inicios) else len(texto)]
+            eh_dir, mtime, tam = bool(dirs[i]), mtimes[i], tams[i]
+            rel = path[len(next(b for b in bases if path.startswith(b))):]
             nota = pontuar(q, nome_cf, rel.casefold())
             if nota <= 0 or not passa(eh_dir, nome_cf, mtime):
                 continue
@@ -265,7 +319,7 @@ def buscar(p, itens):
         for u in unicos[:200]:
             d = os.path.dirname(u[0])
             conta[d] = conta.get(d, 0) + 1
-        grandes = {d for d, n in conta.items() if n >= 5 and d != p["pasta"].rstrip("/")}
+        grandes = {d for d, n in conta.items() if n >= 5 and d != p["pasta"].rstrip("/") and d not in RAIZES}
         saida, feitas = [], set()
         for u in unicos:
             d = os.path.dirname(u[0])
@@ -829,9 +883,9 @@ class Orbita(nuvem.Nuvem):
                 return False
             self._pisca = GLib.timeout_add(620, piscar_)
         if self.consulta and not self.indice.pronto:
-            info = "INDEXING ~ …"
+            info = "INDEXING …"
         else:
-            onde = "~" + self.pasta[len(CASA):] if self.pasta.startswith(CASA) else self.pasta
+            onde = exibir(self.pasta)
             info = f"{len(self.bolhas)} {'FILES' if self.consulta else 'ITEMS'} · {onde}"
         aviso = getattr(self, "aviso", None)
         if aviso and agora - aviso[1] < 1.6:
@@ -898,8 +952,10 @@ class Orbita(nuvem.Nuvem):
 
     def desenhar_caminho(self, cr, w, h, fundo):
         """The path as a constellation: one star per folder, joined by a dotted line."""
-        if self.pasta.startswith(CASA):
-            partes = ["HOME"] + [p for p in self.pasta[len(CASA):].split("/") if p]
+        raiz = next((r for r in RAIZES[::-1] if self.pasta == r or self.pasta.startswith(r + "/")), None)
+        if raiz is not None:
+            partes = ([NOME_RAIZ[CASA]] if raiz != CASA else []) + [NOME_RAIZ[raiz]] + \
+                     [p for p in self.pasta[len(raiz):].split("/") if p]
         else:
             partes = ["/"] + [p for p in self.pasta.split("/") if p]
         partes = partes[-6:]
@@ -928,7 +984,7 @@ class Orbita(nuvem.Nuvem):
             subir = len(partes) - 1 - i
             alvo = self.pasta
             for _ in range(subir):
-                alvo = os.path.dirname(alvo)
+                alvo = CASA if alvo in RAIZES[1:] else os.path.dirname(alvo)
             self.zonas.append(("pasta", alvo, x, y - 8, 22))
 
     def desenhar_chips(self, cr, w, h, fundo):
@@ -1016,8 +1072,7 @@ class Orbita(nuvem.Nuvem):
         self._texto_cor(cr, b.nome, cx, cy + R + 30, "Inter Semi-Bold 15", FG, 1)
         sub = (tamanho_txt(b.tam) if b.tipo != "dir" else f"{b.filhos or 0} ITEMS") + " · " + idade_txt(b.mtime)
         self._texto_cor(cr, sub, cx, cy + R + 54, "Doto Black 12", FG, 0.5)
-        onde = os.path.dirname(b.path)
-        onde = "~" + onde[len(CASA):] if onde.startswith(CASA) else onde
+        onde = exibir(os.path.dirname(b.path))
         self._texto_cor(cr, onde, cx, cy + R + 76, "Inter 10.5", FG, 0.4)
 
     def _texto_cor(self, cr, s, x, y, fonte, cor, alfa):
@@ -1141,6 +1196,8 @@ class Orbita(nuvem.Nuvem):
             if self.consulta:
                 self.consulta = self.consulta[:-1]
                 self.atualizar()
+            elif self.pasta in RAIZES[1:]:
+                self.ir_para(CASA)                       # D: lives next to your folders
             elif self.pasta != "/":
                 self.ir_para(os.path.dirname(self.pasta.rstrip("/")) or "/")
             return True
