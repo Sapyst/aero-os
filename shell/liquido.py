@@ -46,6 +46,9 @@ uniform vec2 res;          // device pixels
 uniform float esc;         // device pixels per logical pixel
 uniform int n;
 uniform vec3 b[%(MAX)d];   // x, y (logical, y down), radius
+uniform int nr;
+uniform vec4 rr[4];        // windows: centre x, y, half width, half height (logical)
+uniform float rc[4];       // their corner radius
 uniform float k;           // how eagerly drops join (the size of the neck), logical px
 uniform float celula;      // halftone cell, logical px
 uniform float alcance;     // how far the halftone reaches, logical px
@@ -58,12 +61,20 @@ float smin(float a, float c, float kk) {
   return min(a, c) - h * h * kk * .25;
 }
 // the field, and "duro": the plain nearest shape without joins (the gap between both is the liquid neck)
+float caixa(vec2 p, vec4 r, float c) {
+  vec2 q = abs(p - r.xy) - (r.zw - c);
+  return length(max(q, 0.)) + min(max(q.x, q.y), 0.) - c;
+}
 float campo2(vec2 p, out float duro) {
   float d = 1e5; duro = 1e5;
   for (int i = 0; i < %(MAX)d; i++) {
     if (i >= n) break;
     vec3 s = b[i];
     if (s.z > .3) { float e = length(p - s.xy) - s.z; d = smin(d, e, k); duro = min(duro, e); }
+  }
+  for (int i = 0; i < 4; i++) {
+    if (i >= nr) break;
+    float e = caixa(p, rr[i], rc[i]); d = smin(d, e, k * 1.6); duro = min(duro, e);
   }
   return d;
 }
@@ -73,6 +84,10 @@ float campo(vec2 p) {
     if (i >= n) break;
     vec3 s = b[i];
     if (s.z > .3) d = smin(d, length(p - s.xy) - s.z, k);
+  }
+  for (int i = 0; i < 4; i++) {
+    if (i >= nr) break;
+    d = smin(d, caixa(p, rr[i], rc[i]), k * 1.6);
   }
   return d;
 }
@@ -118,15 +133,16 @@ class CampoLiquido(Gtk.GLArea):
         super().__init__(hexpand=True, vexpand=True, can_target=False, has_depth_buffer=False)
         self.set_auto_render(False)
         self.k, self.celula, self.alcance = k, celula, alcance
-        self._formas, self.geral = [], 1.0
+        self._formas, self.geral, self._janelas = [], 1.0, []
         self.ok = False
         self.prog = None
         self.connect("realize", self._realizar)
         self.connect("render", self._render)
 
-    def formas(self, lista, geral=1.0):
-        """[(x, y, r)] in logical pixels. Redraws on the next frame."""
-        self._formas, self.geral = lista[:MAX], geral
+    def formas(self, lista, geral=1.0, janelas=()):
+        """lista: drops [(x, y, r)]; janelas: up to 4 windows [(cx, cy, half_w, half_h, corner)], all in
+        logical pixels. Windows join the drops with the same liquid necks. Redraws on the next frame."""
+        self._formas, self.geral, self._janelas = lista[:MAX], geral, list(janelas)[:4]
         if self.ok:
             self.queue_render()
 
@@ -158,13 +174,15 @@ class CampoLiquido(Gtk.GLArea):
             self.vao = vao
             uni = _gl("glGetUniformLocation", GLint, GLuint, ctypes.c_char_p)
             self.u = {nome: uni(self.prog, nome.encode()) for nome in
-                      ("res", "esc", "n", "b", "k", "celula", "alcance", "geral", "t")}
+                      ("res", "esc", "n", "b", "k", "celula", "alcance", "geral", "t", "nr", "rr", "rc")}
             self.f_use = _gl("glUseProgram", None, GLuint)
             self.f_vao = bind_vao
             self.f_2f = _gl("glUniform2f", None, GLint, GLfloat, GLfloat)
             self.f_1f = _gl("glUniform1f", None, GLint, GLfloat)
             self.f_1i = _gl("glUniform1i", None, GLint, GLint)
             self.f_3fv = _gl("glUniform3fv", None, GLint, GLsizei, ctypes.POINTER(GLfloat))
+            self.f_4fv = _gl("glUniform4fv", None, GLint, GLsizei, ctypes.POINTER(GLfloat))
+            self.f_1fv = _gl("glUniform1fv", None, GLint, GLsizei, ctypes.POINTER(GLfloat))
             self.f_clearc = _gl("glClearColor", None, GLfloat, GLfloat, GLfloat, GLfloat)
             self.f_clear = _gl("glClear", None, ctypes.c_uint)
             self.f_draw = _gl("glDrawArrays", None, GLenum, GLint, GLsizei)
@@ -202,17 +220,23 @@ class CampoLiquido(Gtk.GLArea):
     def _render(self, _a, _ctx):
         self.f_clearc(0, 0, 0, 0)
         self.f_clear(COLOR_BUFFER_BIT)
-        if not self.ok or not self._formas or self.geral <= 0.004:
+        if not self.ok or not (self._formas or self._janelas) or self.geral <= 0.004:
             return True
         esc = self.get_scale_factor()
         w, h = self.get_width() * esc, self.get_height() * esc
         self.f_use(self.prog)
         self.f_vao(self.vao)
-        dados = (GLfloat * (3 * len(self._formas)))(*[v for f in self._formas for v in f])
+        dados = (GLfloat * max(3, 3 * len(self._formas)))(*[v for f in self._formas for v in f])
         self.f_2f(self.u["res"], w, h)
         self.f_1f(self.u["esc"], esc)
         self.f_1i(self.u["n"], len(self._formas))
-        self.f_3fv(self.u["b"], len(self._formas), dados)
+        self.f_3fv(self.u["b"], max(1, len(self._formas)), dados)
+        self.f_1i(self.u["nr"], len(self._janelas))
+        if self._janelas:
+            rs = (GLfloat * (4 * len(self._janelas)))(*[v for j in self._janelas for v in j[:4]])
+            cs = (GLfloat * len(self._janelas))(*[j[4] for j in self._janelas])
+            self.f_4fv(self.u["rr"], len(self._janelas), rs)
+            self.f_1fv(self.u["rc"], len(self._janelas), cs)
         self.f_1f(self.u["k"], self.k)
         self.f_1f(self.u["celula"], self.celula)
         self.f_1f(self.u["alcance"], self.alcance)

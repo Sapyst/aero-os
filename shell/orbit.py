@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import gi
 
@@ -41,6 +42,7 @@ import cairo  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import liquido  # noqa: E402
+import visor  # noqa: E402
 import nuvem  # noqa: E402
 from nuvem import FG, RED, empacotar, pop, suave  # noqa: E402
 
@@ -478,7 +480,15 @@ class Orbita(nuvem.Nuvem):
         # them. Content (thumbnails, text) is drawn on top by cairo. Without GL it stays off (old drawing).
         self.liquido = liquido.CampoLiquido()
         raiz.add_overlay(self.liquido)
+        # the media viewer paints inside its liquid window (visor.py); input still goes through self.area
+        self.visor = visor.Visor()
+        self.visor.ao_mudar = self._visor_mudou
+        raiz.add_overlay(self.visor)
         raiz.add_overlay(self.area)
+        self.vis = None
+        rolar = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        rolar.connect("scroll", self._rolar)
+        self.area.add_controller(rolar)
         self.set_child(raiz)
         self.indice = Indice()
         self.pasta = CASA
@@ -658,12 +668,153 @@ class Orbita(nuvem.Nuvem):
         if b.tipo == "dir":
             self.ir_para(b.path)
             return
+        if visor.tipo_midia(b.path):
+            self.abrir_visor(b)                            # pictures, GIFs, videos, sound: the built-in viewer
+            return
+        self.abrir_fora(b)
+
+    def abrir_fora(self, b):
         self.fechar(lambda: subprocess.Popen(["gio", "open", b.path], stdout=subprocess.DEVNULL,
                                              stderr=subprocess.DEVNULL, start_new_session=True))
 
+    # ---------- the media viewer: a liquid window born from the bubble ----------
+
+    def abrir_visor(self, b):
+        self.peek = None
+        itens = visor.irmaos(b.path)
+        self.vis = {"b": b, "itens": itens, "i": itens.index(b.path) if b.path in itens else 0,
+                    "t0": time.monotonic(), "fechando": None, "atual": None}
+        self.visor.carregar(b.path)
+        self.mouse_v = self.mouse
+        self.animar()
+
+    def fechar_visor(self):
+        if self.vis is not None and self.vis["fechando"] is None:
+            self.vis["fechando"] = time.monotonic()
+            self.visor.parar()
+            self.animar()
+
+    def navegar(self, passo):
+        v = self.vis
+        if v is None or len(v["itens"]) < 2:
+            return
+        v["i"] = (v["i"] + passo) % len(v["itens"])
+        self.visor.carregar(v["itens"][v["i"]])
+        self.animar()
+
+    def _visor_mudou(self, oque):
+        if oque == "tamanho":
+            self.animar()
+        else:
+            self.area.queue_draw()
+
+    def visor_m(self, agora):
+        """0 = still the bubble, 1 = the full window."""
+        v = self.vis
+        if v is None:
+            return 0.0
+        if v["fechando"] is not None:
+            t = min(1.0, (agora - v["fechando"]) / 0.36)
+            return 1 - (1 - (1 - t) ** 3)
+        t = min(1.0, (agora - v["t0"]) / 0.45)
+        return 1 - (1 - t) ** 3
+
+    def visor_alvo(self):
+        """Where the window wants to be: the whole picture, fitted (any shape), a bit above the middle."""
+        w, h = self.area.get_width() or 1920, self.area.get_height() or 1080
+        cx, cy = self._centro()
+        tam = self.visor.tamanho or (420, 420)
+        s = min(w * 0.84 / tam[0], (h - 260) / tam[1])
+        return [cx, cy - 22, tam[0] * s / 2, tam[1] * s / 2]
+
+    def visor_janela(self, agora):
+        """This frame's window (cx, cy, half_w, half_h, corner), morphing from the bubble; None when gone."""
+        v = self.vis
+        if v is None:
+            return None
+        alvo = self.visor_alvo()
+        if v["atual"] is None:
+            v["atual"] = list(alvo)
+        mexeu = False
+        for k in range(4):                                  # a soft spring: changing pictures reshapes it
+            dif = alvo[k] - v["atual"][k]
+            if abs(dif) > 0.3:
+                v["atual"][k] += dif * 0.22
+                mexeu = True
+        v["mexendo"] = mexeu
+        m = self.visor_m(agora)
+        bx, by, br, _a = self._onde(v["b"], agora)
+        br = max(br, 8.0)
+        cx = bx + (v["atual"][0] - bx) * m
+        cy = by + (v["atual"][1] - by) * m
+        hw = br + (v["atual"][2] - br) * m
+        hh = br + (v["atual"][3] - br) * m
+        canto = min(hw, hh, br + (24 - br) * m)
+        if v["fechando"] is not None and m <= 0.01:
+            self.vis, self.visor.janela = None, None
+            self.visor.queue_draw()
+            return None
+        self.visor.janela = (cx, cy, hw, hh, canto)
+        self.visor.alfa = min(1.0, max(0.0, (m - 0.7) / 0.3)) if self.visor.tamanho else 0.0
+        self.visor.queue_draw()
+        return (cx, cy, hw, hh, canto)
+
+    def desenhar_visor_ui(self, cr, w, h, agora):
+        """Name, position in the folder, size, zoom, the playback dots and the side arrows (as drops)."""
+        v, jan = self.vis, self.visor.janela
+        if v is None or jan is None or self.visor_m(agora) < 0.9 or v["fechando"] is not None:
+            return
+        cx, cy, hw, hh, _c = jan
+        path = v["itens"][v["i"]]
+        nome = os.path.basename(path)
+        nome = nome if len(nome) <= 48 else nome[:46] + "…"
+        y = cy + hh + 30
+        self._texto_cor(cr, nome, cx, y, "Inter Semi-Bold 14", FG, 1)
+        partes = [f"{v['i'] + 1}/{len(v['itens'])}"]
+        if self.visor.tamanho and self.visor.tipo != "som":
+            partes.append(f"{self.visor.tamanho[0]}×{self.visor.tamanho[1]}")
+        try:
+            partes.append(tamanho_txt(os.path.getsize(path)))
+        except OSError:
+            pass
+        if self.visor.zoom > 1.001:
+            partes.append(f"{self.visor.zoom * 100:.0f}%")
+        self._texto_cor(cr, "  ·  ".join(partes), cx, y + 22, "Doto Black 11", FG, 0.5)
+        if self.visor.tipo == "som":
+            self._texto_cor(cr, "♪", cx, cy - 10, f"Doto Black {int(min(hw, hh) * 0.5)}", (0.79, 0.65, 0.92), 0.9)
+        if self.visor.erro:
+            msg = "THIS NEEDS THE VIDEO/SOUND CODECS (GSTREAMER)" if self.visor.tipo in ("vid", "som") else "CAN'T OPEN THIS FILE"
+            self._texto_cor(cr, msg, cx, cy, "Doto Black 13", RED, 0.9)
+        prog = self.visor.progresso()
+        if prog is not None:                               # playback: a row of dots, lit up to where it is
+            frac, seg, tot = prog
+            n, larg = 48, min(2 * hw, 560)
+            x0, yb = cx - larg / 2, y + 48
+            for k in range(n):
+                px = x0 + larg * k / (n - 1)
+                aceso = k / (n - 1) <= frac
+                cr.new_sub_path()
+                cr.arc(px, yb, 3.2 if aceso else 2.2, 0, 2 * math.pi)
+                cr.set_source_rgba(*(RED if aceso and abs(k / (n - 1) - frac) < 1.5 / n else FG), 0.95 if aceso else 0.22)
+                cr.fill()
+                self.zonas.append(("busca", k / (n - 1), px, yb, larg / n))
+            def mmss(x):
+                return f"{int(x // 60)}:{int(x % 60):02d}"
+            self._texto_cor(cr, f"{mmss(seg)} / {mmss(tot)}" + ("" if self.visor.tocando() else "  ·  PAUSED"),
+                            cx, yb + 20, "Doto Black 10", FG, 0.45)
+        if len(v["itens"]) > 1:                             # side arrows: little drops next to the window
+            for passo, sx in ((-1, cx - hw - 46), (1, cx + hw + 46)):
+                self._texto_cor(cr, "‹" if passo < 0 else "›", sx, cy - 3, "Doto Black 22", FG, 0.85)
+                self.zonas.append(("nav", passo, sx, cy, 24))
+        self._texto_cor(cr, "← → NEXT · WHEEL ZOOM · DRAG MOVE · SPACE PLAY · ESC BACK", cx, h - 40,
+                        "Doto Black 10", FG, 0.35)
+
     def acao(self, nome, b):
         if nome == "OPEN":
-            self.abrir_item(b)
+            if b.tipo in ("dir", "grupo"):
+                self.abrir_item(b)
+            else:
+                self.abrir_fora(b)                         # OPEN = its own app; click/Enter = the viewer
         elif nome == "SHOW":
             pasta = os.path.dirname(b.path)
             self.fechar(lambda: subprocess.Popen(["gio", "open", pasta], stdout=subprocess.DEVNULL,
@@ -676,6 +827,9 @@ class Orbita(nuvem.Nuvem):
             self.espiar(b)
 
     def espiar(self, b):
+        if visor.tipo_midia(b.path) and b.tipo not in ("dir", "grupo"):
+            self.abrir_visor(b)
+            return
         if self.peek is not None and self.peek[0] is b:
             self.peek = None
         else:
@@ -722,6 +876,9 @@ class Orbita(nuvem.Nuvem):
         self.area.queue_draw()
 
     def fechar(self, depois=None):
+        if self.vis is not None:
+            self.visor.parar()
+            self.vis, self.visor.janela = None, None
         def tudo():
             if depois:
                 depois()
@@ -736,6 +893,8 @@ class Orbita(nuvem.Nuvem):
         if r == GLib.SOURCE_REMOVE and self.t_fechar is None and self.get_visible():
             vivo = (any(agora - b.nasce < 0.6 for b in self.bolhas)
                     or (self.peek is not None and agora - self.peek[2] < 0.5)
+                    or (self.vis is not None and (agora - self.vis["t0"] < 0.6 or self.vis["fechando"] is not None
+                                                  or self.vis.get("mexendo")))
                     or (getattr(self, "aviso", None) and agora - self.aviso[1] < 1.6))
             if vivo:
                 GLib.idle_add(lambda: (self.animar(), False)[1])
@@ -802,6 +961,8 @@ class Orbita(nuvem.Nuvem):
             foco = self.sel
         else:
             foco = self.foco
+        if self.vis is not None:
+            foco = None                                     # the viewer has the attention
         self.gif_foco(self.bolhas[foco] if foco is not None and 0 <= foco < len(self.bolhas) else None)
         ordem = sorted(range(len(self.bolhas)), key=lambda i: (i == foco, self.bolhas[i].r))
         for i in ordem:
@@ -815,9 +976,19 @@ class Orbita(nuvem.Nuvem):
         self.desenhar_chips(cr, w, h, fundo)
         if self.peek is not None:
             self.desenhar_peek(cr, w, h, agora)
+        if self.vis is not None:
+            self.desenhar_visor_ui(cr, w, h, agora)
+
+    def fonte(self):
+        """The bubble the peek or the viewer came out of (the others melt away meanwhile)."""
+        if self.vis is not None:
+            return self.vis["b"]
+        return self.peek[0] if self.peek is not None else None
 
     def peek_k(self, agora):
-        """0..1: how far the peek drop has travelled from its bubble to the middle."""
+        """0..1: how far the peek drop / the viewer window has grown out of its bubble."""
+        if self.vis is not None:
+            return self.visor_m(agora)
         if self.peek is None:
             return 0.0
         t = min(1.0, (agora - self.peek[2]) / 0.42)
@@ -830,18 +1001,25 @@ class Orbita(nuvem.Nuvem):
         cx, cy = self._centro()
         for i, b in enumerate(self.bolhas):
             x, y, r, a = self._onde(b, agora)
-            if self.peek is not None and self.peek[0] is not b:
+            if self.fonte() is not None and self.fonte() is not b:
                 r *= 1 - 0.75 * pk                                  # the others melt away while peeking
             if r > 0.6:
                 formas.append((x, y, r))
             formas += liquido.gotas_de_nascimento(x, y, b.r, agora - b.nasce, i + 1)
-        if foco is not None and 0 <= foco < len(self.bolhas) and self.t_fechar is None and self.peek is None:
+        if (foco is not None and 0 <= foco < len(self.bolhas) and self.t_fechar is None and self.peek is None
+                and self.vis is None):
             formas += [(sx, sy, 23 * a) for _n, sx, sy, a in self.satelites(self.bolhas[foco], agora)]
         if self.peek is not None:
             bx, by, br, _a = self._onde(self.peek[0], agora)
             R = min(self.area.get_width(), self.area.get_height()) * 0.3
             formas.append((bx + (cx - bx) * pk, by + (cy - by) * pk, br + (R - br) * pk))
-        self.liquido.formas(formas, fundo)
+        janelas = []
+        jan = self.visor_janela(agora)
+        if jan is not None:
+            janelas.append(jan)
+            if self.visor_m(agora) > 0.9 and len(self.vis["itens"]) > 1:      # the side arrows are drops
+                formas += [(jan[0] - jan[2] - 46, jan[1], 20), (jan[0] + jan[2] + 46, jan[1], 20)]
+        self.liquido.formas(formas, fundo, janelas)
 
     def desenhar_bolha(self, cr, b, agora, focada):
         x, y, r, a = self._onde(b, agora)
@@ -851,9 +1029,11 @@ class Orbita(nuvem.Nuvem):
         if liq:
             # the content shows up once the drops have joined: the pour hides the loading
             a *= min(1.0, max(0.0, (agora - b.nasce - 0.28) / 0.25))
-            if self.peek is not None and self.peek[0] is not b:
+            if self.fonte() is not None and self.fonte() is not b:
                 r *= 1 - 0.75 * self.peek_k(agora)
                 a *= 1 - 0.85 * self.peek_k(agora)
+            elif self.vis is not None and self.vis["b"] is b:
+                a *= 1 - self.visor_m(agora)                       # it became the window
             if a <= 0.01:
                 return
         cr.new_path()
@@ -1225,9 +1405,36 @@ class Orbita(nuvem.Nuvem):
                 return tipo, valor
         return None
 
-    def _clique(self, g, _n, x, y):
+    def dentro_visor(self, x, y):
+        j = self.visor.janela
+        return j is not None and abs(x - j[0]) <= j[2] and abs(y - j[1]) <= j[3]
+
+    def _rolar(self, _c, _dx, dy):
+        if self.vis is None:
+            return False
+        mx, my = getattr(self, "mouse_v", None) or (None, None)
+        self.visor.ampliar(1.18 ** (-dy), mx, my)
+        self.area.queue_draw()
+        return True
+
+    def _clique(self, g, n, x, y):
         if getattr(self, "_arrastou", False):
             self._arrastou = False
+            return
+        if self.vis is not None:
+            z = self.zona_em(x, y)
+            if z is not None and z[0] == "busca":
+                self.visor.buscar(z[1])
+            elif z is not None and z[0] == "nav":
+                self.navegar(z[1])
+            elif self.dentro_visor(x, y):
+                if n == 2:                                  # double click: fit <-> 2x at the pointer
+                    self.visor.ampliar(1 / self.visor.zoom if self.visor.zoom > 1.01 else 2.0, x, y)
+                elif self.visor.tipo in ("vid", "som", "gif"):
+                    self.visor.tocar_pausar()
+                self.area.queue_draw()
+            else:
+                self.fechar_visor()
             return
         if self.peek is not None:
             self.peek = None
@@ -1253,11 +1460,20 @@ class Orbita(nuvem.Nuvem):
             self.espiar(self.bolhas[i])
 
     def _arrasto_ini(self, g, x, y):
+        if self.vis is not None:
+            self.arrasto = "pan" if self.dentro_visor(x, y) and self.visor.zoom > 1.001 else None
+            self._pan0 = list(self.visor.pan)
+            return
         z = self.zona_em(x, y)
         self.arrasto = z[1] if z is not None and z[0] == "anel" else None
         self._ini = (x, y)
 
     def _arrasto_mov(self, g, dx, dy):
+        if self.arrasto == "pan":
+            self._arrastou = abs(dx) + abs(dy) > 3
+            self.visor.pan = [self._pan0[0] + dx, self._pan0[1] + dy]
+            self.visor.queue_draw()
+            return
         if self.arrasto is None:
             return
         self._arrastou = True
@@ -1276,6 +1492,9 @@ class Orbita(nuvem.Nuvem):
         self.area.queue_draw()
 
     def _arrasto_fim(self):
+        if self.arrasto == "pan":
+            self.arrasto = None
+            return False
         if self.arrasto is not None:
             self.arrasto = None
             self.atualizar()
@@ -1283,6 +1502,26 @@ class Orbita(nuvem.Nuvem):
 
     def _tecla(self, _c, tecla, _cod, mods):
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+        if self.vis is not None:
+            m = self.visor.midia
+            if tecla == Gdk.KEY_Escape:
+                self.fechar_visor()
+            elif tecla in (Gdk.KEY_Left, Gdk.KEY_Right):
+                self.navegar(-1 if tecla == Gdk.KEY_Left else 1)
+            elif tecla == Gdk.KEY_space:
+                self.visor.tocar_pausar()
+            elif tecla in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
+                self.visor.ampliar(1.25)
+            elif tecla in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
+                self.visor.ampliar(0.8)
+            elif tecla == Gdk.KEY_0:
+                self.visor.ampliar(1 / self.visor.zoom)
+            elif tecla in (Gdk.KEY_Up, Gdk.KEY_Down) and m is not None:
+                m.set_volume(max(0.0, min(1.0, m.get_volume() + (0.1 if tecla == Gdk.KEY_Up else -0.1))))
+            elif tecla in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):          # Enter: open this file in its own app
+                self.abrir_fora(types.SimpleNamespace(path=self.vis["itens"][self.vis["i"]]))
+            self.area.queue_draw()
+            return True
         atual = self.bolhas[self.sel] if 0 <= self.sel < len(self.bolhas) else None
         if self.foco is not None and 0 <= self.foco < len(self.bolhas) and self.mouse is not None:
             atual = self.bolhas[self.foco]
@@ -1339,6 +1578,10 @@ class Orbita(nuvem.Nuvem):
         return False
 
     def _mover(self, _c, x, y):
+        if self.vis is not None:                             # while viewing: no lens behind the window
+            self.mouse_v = None if x is None else (x, y)
+            self.mouse = None
+            return
         super()._mover(_c, x, y)
 
 
