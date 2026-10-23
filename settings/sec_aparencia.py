@@ -67,6 +67,29 @@ OPACIDADE = [("70%", "0.70"), ("80%", "0.80"), ("90%", "0.90"), ("100%", "1.0")]
 # taskbar: below ~35% Hyprland stops blurring it (ignore_alpha 0.3 in aparencia.conf)
 BAR_OPACITY = [("35%", "0.35"), ("45%", "0.45"), ("60%", "0.60"), ("80%", "0.80"), ("100%", "1.0")]
 WALL_ALVO = [("The workspace you are on", "workspace"), ("All workspaces", "all")]
+# Troca de wallpaper (papel-de-parede → onda_wallpaper.py): onda que desdobra o novo, ou instantânea
+WALL_ANIM = [("Wave", "wave"), ("None", "none")]
+WALL_MS_MIN, WALL_MS_MAX, WALL_MS_PADRAO = 600, 2400, 1200
+DAIMON_CONF = os.path.expanduser("~/.config/daimon/daimon.conf")
+
+
+def gravar_daimon(**chaves):
+    """Grava SÓ estas chaves no daimon.conf (chave = valor), pra o Daimon seguir o mesmo controle depois."""
+    try:
+        with open(DAIMON_CONF) as f:
+            linhas = f.read().splitlines()
+    except FileNotFoundError:
+        linhas = []
+    falta = dict(chaves)
+    for i, l in enumerate(linhas):
+        k = l.split("=", 1)[0].strip()
+        if k in falta and not l.lstrip().startswith("#"):
+            linhas[i] = f"{k} = {falta.pop(k)}"
+    linhas += [f"{k} = {v}" for k, v in falta.items()]
+    os.makedirs(os.path.dirname(DAIMON_CONF), exist_ok=True)
+    with open(DAIMON_CONF + ".tmp", "w") as f:
+        f.write("\n".join(linhas) + "\n")
+    os.replace(DAIMON_CONF + ".tmp", DAIMON_CONF)
 VIDRO = [("Off (solid windows)", "desligado"), ("Subtle", "leve"), ("Medium", "media"), ("Strong", "forte")]
 TEXTO = [("100%", "1.0"), ("110%", "1.1"), ("125%", "1.25"), ("150%", "1.5")]
 # Horários de meia em meia hora: ("07:30", "07:30")
@@ -377,6 +400,21 @@ class SecaoAparencia(Secao):
                                atualizar_painel(WALL_TARGET=valor_de(self.wall_alvo, WALL_ALVO)))
         self.carregando_alvo = False
         papel.add(self.wall_alvo)
+        # a troca: onda (desdobra o novo por cima do velho) ou instantânea; e quanto tempo a onda leva
+        self.wall_anim = combo("Change animation", WALL_ANIM, 0,
+                               "Wave unfolds the new wallpaper over the old one. Never over a fullscreen game")
+        self.wall_anim.connect("notify::selected", lambda *_: self.salvar_wall_anim())
+        papel.add(self.wall_anim)
+        self.wall_ms_linha = Adw.ActionRow(use_markup=False, title="Duration")
+        self.wall_ms = Gtk.Adjustment(value=WALL_MS_PADRAO, lower=WALL_MS_MIN, upper=WALL_MS_MAX,
+                                      step_increment=100, page_increment=200)
+        escala = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.wall_ms, digits=0,
+                           draw_value=False, hexpand=True, width_request=200, valign=Gtk.Align.CENTER)
+        escala.add_mark(WALL_MS_PADRAO, Gtk.PositionType.BOTTOM, None)
+        self.wall_ms_linha.add_suffix(escala)
+        self.wall_ms.connect("value-changed", lambda *_: self.salvar_wall_anim())
+        papel.add(self.wall_ms_linha)
+        self.mostrar_wall_ms()
         self.secao_wall = None
 
         aplicar = grupo_botao_aplicar(self.aplicar)
@@ -460,10 +498,33 @@ class SecaoAparencia(Secao):
         self.secao_wall.ao_mostrar()
         return self.secao_wall
 
+    def mostrar_wall_ms(self):
+        ms = int(round(self.wall_ms.get_value()))
+        self.wall_ms_linha.set_subtitle(f"{ms / 1000:.1f} s" + (" (default)" if ms == WALL_MS_PADRAO else ""))
+        self.wall_ms_linha.set_sensitive(valor_de(self.wall_anim, WALL_ANIM) == "wave")
+
+    def salvar_wall_anim(self):
+        self.mostrar_wall_ms()
+        if self.carregando_alvo:
+            return
+        anim = valor_de(self.wall_anim, WALL_ANIM)
+        ms = int(round(self.wall_ms.get_value() / 100) * 100)
+        atualizar_painel(WALL_ANIM=anim, WALL_ANIM_MS=str(ms))
+        try:
+            gravar_daimon(papel_transicao="onda" if anim == "wave" else "nenhuma", papel_duracao_ms=ms)
+        except OSError:
+            pass
+
     def mostrar_wallpaper(self, p):
         self.carregando_alvo = True
         self.wall_alvo.set_selected(indice(WALL_ALVO, p.get("WALL_TARGET", "workspace"), 0))
+        self.wall_anim.set_selected(indice(WALL_ANIM, p.get("WALL_ANIM", "wave"), 0))
+        try:
+            self.wall_ms.set_value(min(WALL_MS_MAX, max(WALL_MS_MIN, int(p.get("WALL_ANIM_MS", WALL_MS_PADRAO)))))
+        except ValueError:
+            self.wall_ms.set_value(WALL_MS_PADRAO)
         self.carregando_alvo = False
+        self.mostrar_wall_ms()
         # the workspace you are on: its own wallpaper, if it has one
         from sec_areas import area_ativa
         from sec_widgets import ler as ler_widgets

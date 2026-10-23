@@ -71,6 +71,92 @@ cores_do_wallpaper() {
         || registrar "cores-do-wallpaper falhou (veja acima)"
 }
 
+# ---------- a troca FLUIDA (Settings → Appearance → Wallpaper → Change animation) ----------
+# Em vez de trocar de uma vez, o onda_wallpaper.py (aero-shell) desdobra o novo por cima do velho numa
+# onda, numa camada logo acima do hyprpaper e abaixo de tudo. Quando a onda cobre a tela ele avisa
+# "cobriu"; aí trocamos o hyprpaper POR BAIXO (ninguém vê) e mandamos "soltar": ele some e termina.
+# painel.conf: WALL_ANIM=wave|none (padrão wave) e WALL_ANIM_MS=1200 (duração).
+# Sem animação (troca instantânea, como antes): opção em None, hyprpaper parado, janela em TELA CHEIA
+# (jogo, vídeo: nunca desenhamos nada por cima), mesma imagem, ou se o onda_wallpaper falhar.
+ONDA_PID_MEU="" ONDA_LE="" ONDA_ESCREVE=""
+onda_comecar() {   # onda_comecar ARQUIVO_NOVO  -> 0 = a onda já cobriu a tela com ele
+    local anim ms mon mx my velho linha=""
+    anim="$(sed -n 's/^WALL_ANIM=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
+    [ "${anim:-wave}" = wave ] || return 1
+    ms="$(sed -n 's/^WALL_ANIM_MS=//p' "$PAINEL" 2>/dev/null | tr -d '"' | tail -1)"
+    [[ "$ms" =~ ^[0-9]+$ ]] || ms=1200
+    hyprpaper_rodando || return 1
+    # Um python só pergunta tudo ao Hyprland: monitor em foco, tela cheia, onde está o mouse e o que o
+    # hyprpaper mostra nele agora. Imprime "monitor<TAB>x<TAB>y<TAB>wallpaper" (ou nada = sem onda).
+    IFS=$'\t' read -r mon mx my velho < <(python3 -I - <<'PY' 2>>"$LOG"
+import json, subprocess, sys
+def hypr(*a):
+    return subprocess.run(["hyprctl", *a], capture_output=True, text=True, timeout=2).stdout
+mon = next((m for m in json.loads(hypr("monitors", "-j") or "[]") if m.get("focused")), None)
+if not mon:
+    sys.exit()
+janela = json.loads(hypr("activewindow", "-j") or "{}")
+area = next((w for w in json.loads(hypr("workspaces", "-j") or "[]")
+             if w.get("id") == (mon.get("activeWorkspace") or {}).get("id")), {})
+if int(janela.get("fullscreen", 0) or 0) > 0 or area.get("hasfullscreen"):
+    sys.exit()                                        # tela cheia: nada por cima, nunca
+cur = json.loads(hypr("cursorpos", "-j") or "{}")
+esc = mon.get("scale") or 1
+w, h = mon["width"] / esc, mon["height"] / esc
+x, y = cur.get("x", 0) - mon["x"], cur.get("y", 0) - mon["y"]
+if not (0 <= x <= w and 0 <= y <= h):
+    x, y = w / 2, h / 2                               # mouse em outro monitor: nasce no centro
+velho = ""
+for linha in hypr("hyprpaper", "listactive").splitlines():
+    nome, _, caminho = linha.partition(":")
+    if nome.strip() in (mon["name"], "") and caminho.strip():
+        velho = caminho.strip()
+        if nome.strip() == mon["name"]:
+            break
+print(mon["name"], round(x), round(y), velho, sep="\t")
+PY
+)
+    [ -n "${velho:-}" ] && [ -f "$velho" ] && [ "$velho" != "$1" ] || return 1
+    # Duas trocas quase juntas: a segunda espera a primeira terminar (fd 8 = a trava)
+    exec 8>"${XDG_RUNTIME_DIR:-/tmp}/aero-onda-wallpaper.lock"
+    flock -w 10 8 || return 1
+    # GDK_DISABLE=vulkan + GSK_RENDERER=gl: só OpenGL na placa que desenha a tela. Sem isso o GTK sonda
+    # o Vulkan, que acorda a NVIDIA dormindo (~2,5 s travado no 1º quadro: a onda "pulava" pro fim).
+    coproc ONDA { GDK_DISABLE=vulkan GSK_RENDERER=gl LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so exec python3 \
+        "$HOME/.local/share/aero-shell/onda_wallpaper.py" --velho "$velho" --novo "$1" \
+        --monitor "$mon" --x "$mx" --y "$my" --ms "$ms" 2>>"$LOG"; }
+    ONDA_PID_MEU="$ONDA_PID"
+    exec {ONDA_LE}<&"${ONDA[0]}" {ONDA_ESCREVE}>&"${ONDA[1]}"     # cópias: o bash apaga ONDA[] quando ele sai
+    read -r -t $(( ms / 1000 + 10 )) linha <&"$ONDA_LE" || linha=""
+    [ "$linha" = cobriu ] && { registrar "onda: $(basename "$velho") -> $(basename "$1") (${ms} ms)"; return 0; }
+    registrar "onda não rolou (${linha:-sem resposta}): troca instantânea"
+    onda_soltar
+    return 1
+}
+trocar_hyprpaper() {   # trocar_hyprpaper ARQUIVO: com a onda cobrindo a tela, a troca fica por baixo dela
+    if [ -n "$ONDA_PID_MEU" ]; then
+        hyprctl hyprpaper wallpaper ",$1,cover" >/dev/null
+        # espera o hyprpaper ter a imagem nova de fato antes de a onda sumir. Ele troca com um fade
+        # próprio (~0,6 s, escurece e clareia): esse tempo também fica escondido debaixo da onda.
+        local i
+        for i in $(seq 20); do
+            hyprctl hyprpaper listactive 2>/dev/null | grep -qF "$1" && break
+            sleep 0.1
+        done
+        sleep 0.9
+    else
+        hyprctl hyprpaper wallpaper ",$1,cover" >/dev/null
+    fi
+}
+onda_soltar() {    # a onda some (fade curto) e o processo dela termina; sem onda, não faz nada
+    [ -n "$ONDA_PID_MEU" ] || return 0
+    { echo soltar >&"$ONDA_ESCREVE"; } 2>/dev/null
+    exec {ONDA_ESCREVE}>&- {ONDA_LE}<&-
+    wait "$ONDA_PID_MEU" 2>/dev/null
+    ONDA_PID_MEU=""
+    exec 8>&-          # solta a trava (e nenhum programa aberto depois herda ela)
+}
+
 # ---------- 1. ler o pedido ----------
 WIDGETS="$HOME/.config/aero-shell/widgets.json"
 ALVO=""
@@ -114,7 +200,7 @@ mkdir -p "$PASTA" || { avisar_erro "Can't create $PASTA"; exit 5; }
 # Arquivo provisório DENTRO da pasta (escondido: começa com ponto). Se algo der errado, o "trap"
 # apaga ele ao sair. Se der certo, ele é renomeado pro nome final.
 PROVISORIO="$(mktemp "$PASTA/.chegando-XXXXXX")" || { avisar_erro "Can't write to $PASTA"; exit 5; }
-trap 'rm -f "$PROVISORIO" "$PROVISORIO.png"' EXIT
+trap 'onda_soltar; rm -f "$PROVISORIO" "$PROVISORIO.png"' EXIT
 NOME_ORIGINAL=""      # dica de nome pro arquivo final
 
 baixar() {   # baixar URL [PAGINA] -> $PROVISORIO
@@ -254,6 +340,13 @@ fi
 
 # ---------- 6a. só numa área: grava no widgets.json; o widgets.py troca ao entrar nela ----------
 if [[ "$ALVO" =~ ^[0-9]+$ ]]; then
+    # É a área que está na tela? A onda começa ANTES de gravar: o widgets.py vê o widgets.json mudar e
+    # troca o hyprpaper sozinho — com a onda já por cima, essa troca fica escondida.
+    NA_TELA=0
+    if [ "$(area_ativa)" = "$ALVO" ] && hyprpaper_rodando; then
+        NA_TELA=1
+        onda_comecar "$FINAL"
+    fi
     python3 -I - "$WIDGETS" "$ALVO" "$FINAL" <<'PY' || { avisar_erro "Can't save the workspace wallpaper in $WIDGETS"; exit 5; }
 import json, os, sys
 caminho, area, arquivo = sys.argv[1:]
@@ -266,13 +359,18 @@ with open(caminho + ".tmp", "w") as f:
     json.dump(d, f, indent=2)
 os.replace(caminho + ".tmp", caminho)
 PY
-    [ "$(area_ativa)" = "$ALVO" ] && hyprpaper_rodando && hyprctl hyprpaper wallpaper ",$FINAL,cover" >/dev/null
+    if [ "$NA_TELA" = 1 ]; then
+        trocar_hyprpaper "$FINAL"
+        onda_soltar
+    fi
     registrar "definido na área $ALVO: $FINAL"
     notify-send -a "Wallpaper" -i "$FINAL" "Wallpaper set for workspace $ALVO" "$(basename "$FINAL")"
     exit 0
 fi
 
 # ---------- 6. definir como papel de parede (passo 3 do Aero) ----------
+# A onda começa já (pelo mesmo motivo do 6a: o widgets.py reage ao widgets.json) e fica até o passo 7
+hyprpaper_rodando && onda_comecar "$FINAL"
 # "Em todas": as áreas deixam de ter wallpaper próprio (o resto do tema delas fica)
 python3 -I - "$WIDGETS" <<'PY' 2>/dev/null || true
 import json, os, sys
@@ -310,7 +408,7 @@ os.replace(conf + ".tmp", conf)
 PY
 
 if hyprpaper_rodando; then
-    hyprctl hyprpaper wallpaper ",$FINAL,cover" >/dev/null
+    trocar_hyprpaper "$FINAL"
     sleep 0.3
     if ! hyprctl hyprpaper listactive | grep -qF "$FINAL"; then
         avisar_erro "hyprpaper didn't accept the image. It's saved in $PASTA."
@@ -322,10 +420,12 @@ fi
 registrar "definido: $FINAL"
 
 # ---------- 7. passos extras ----------
+# Brilho/contraste/saturação escolhidos no Settings valem pra todo wallpaper novo (doc 45).
+# Vem ANTES de a onda sumir: se ele trocar pela cópia ajustada, a diferença vira um fade suave.
+"$HOME/.local/bin/ajustar-wallpaper" 2>/dev/null || true
+onda_soltar
 # Cores do tema combinando com o wallpaper (só se a opção estiver ligada no Settings).
 cores_do_wallpaper "$FINAL"
-# Brilho/contraste/saturação escolhidos no Settings valem pra todo wallpaper novo (doc 45)
-"$HOME/.local/bin/ajustar-wallpaper" 2>/dev/null || true
 # Tela de login (e outros lugares) em "Same as desktop": recebem o wallpaper novo também (doc 37)
 "$HOME/.local/bin/sincronizar-fundos" 2>/dev/null || true
 
