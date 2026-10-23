@@ -22,29 +22,59 @@ elif [ "$1" = janela ]; then
 elif [ -n "$1" ]; then
     area="$1"
 else
-    # CONGELA A TELA no instante do Print: o hyprpicker tira um retrato da tela e mostra ele parado
-    # por cima de tudo (vídeos, jogos e animações param na imagem). Você seleciona em cima do retrato.
-    #   -r = congela também os outros monitores | -z = sem a lupa de cor (ele é um conta-gotas)
+    # CONGELA A TELA no instante do Print, em DOIS passos:
+    #  1) o grim tira o retrato da tela inteira ANTES de qualquer seleção aparecer. É desse retrato
+    #     que o recorte sai — então a borda do slurp, o escurecido e qualquer UI da ferramenta
+    #     nunca entram na imagem (antes o grim -g rodava com a camada do slurp ainda na tela).
+    #  2) o hyprpicker mostra a tela parada por cima de tudo (vídeos/jogos param) enquanto você seleciona.
+    #     -r = congela também os outros monitores | -z = sem a lupa de cor (ele é um conta-gotas)
+    congelado="${XDG_RUNTIME_DIR:-/tmp}/print-area-$$.ppm"   # PPM: grava instantâneo, sem compressão
+    grim -t ppm "$congelado" || { notify-send "Screenshot failed" "Could not capture the screen"; exit 1; }
     hyprpicker -r -z >/dev/null 2>&1 &
     congela=$!
-    trap 'kill $congela 2>/dev/null' EXIT    # descongela ao sair, dando certo ou não (até com Esc)
+    trap 'kill $congela 2>/dev/null; rm -f "$congelado"' EXIT   # descongela e limpa ao sair (até com Esc)
     sleep 0.15                               # tempo do retrato aparecer na tela
 
-    # slurp: desenha a seleção e devolve "X,Y LARGURAxALTURA"
+    # slurp: desenha a seleção e devolve "X,Y LARGURAxALTURA" (coordenadas lógicas do Hyprland)
     #   -d = mostra o tamanho enquanto arrasta
     #   -b = cor do fundo escurecido | -c = cor da borda | -w = espessura da borda
     # cor da borda = a cor de destaque do sistema (Settings → Appearance → Accent color)
-    # (no destaque "mono", a cor do tema: branco no escuro, preto no claro; o hypr-tema grava a cor em uso)
     destaque=$(cat "$HOME/.cache/hypr-tema/destaque" 2>/dev/null); destaque=${destaque:-3584e4}
     area=$(slurp -d -b 00000066 -c "${destaque}ff" -w 2) || exit 0   # Esc: slurp sai com erro, então cancela
+    modo=recorte
 fi
 
-# grim tira o print. Na seleção, a tela ainda está congelada: ele captura o RETRATO do momento do Print.
+# Recorta a área (lógica) de dentro do retrato congelado. O grim junta todos os monitores numa imagem
+# na MAIOR escala; então: pixel = (coordenada lógica − canto do layout) × (largura da imagem ÷ largura lógica).
+recortar() {
+    python3 -I - "$congelado" "$area" "$arquivo" <<'PY'
+import json, re, subprocess, sys
+src, area, dst = sys.argv[1:4]
+x, y, w, h = map(int, re.match(r"(-?\d+),(-?\d+) (\d+)x(\d+)", area).groups())
+mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True).stdout)
+caixas = []
+for m in mons:
+    lw, lh = m["width"] / m["scale"], m["height"] / m["scale"]
+    if m.get("transform", 0) % 2:      # monitor girado 90/270: troca largura e altura
+        lw, lh = lh, lw
+    caixas.append((m["x"], m["y"], m["x"] + lw, m["y"] + lh))
+x0, y0 = min(c[0] for c in caixas), min(c[1] for c in caixas)
+x1 = max(c[2] for c in caixas)
+with open(src, "rb") as f:                 # cabeçalho PPM: "P6\n<largura> <altura>\n255\n"
+    largura = int(f.readline() and f.readline().split()[0])
+k = largura / (x1 - x0)
+geo = f"{round(w * k)}x{round(h * k)}+{round((x - x0) * k)}+{round((y - y0) * k)}"
+sys.exit(subprocess.run(["magick", src, "-crop", geo, "+repage", dst]).returncode)
+PY
+}
+
+# grim tira o print (tela/janela); no recorte, a imagem sai do retrato congelado lá de cima.
 case $modo in
-    tela)   grim "$arquivo" ;;                                   # sem -g = a tela toda
-    janela) id=$(hyprctl activewindow -j | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("stableId",""))')
-            grim -T "$id" "$arquivo" ;;                          # -T = só aquela janela (doc 20)
-    *)      grim -g "$area" "$arquivo" ;;
+    tela)    grim "$arquivo" ;;                                   # sem -g = a tela toda
+    janela)  id=$(hyprctl activewindow -j | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("stableId",""))')
+             grim -T "$id" "$arquivo" ;;                          # -T = só aquela janela (doc 20)
+    recorte) recortar ;;
+    *)       grim -g "$area" "$arquivo" ;;                        # área passada pronta no argumento
 esac || { notify-send "Screenshot failed" "Could not capture the screen"; exit 1; }
 
 # Emagrece o PNG sem perder a leitura de texto pequeno:

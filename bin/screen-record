@@ -43,6 +43,13 @@ else
     destaque=$(cat "$HOME/.cache/hypr-tema/destaque" 2>/dev/null); destaque=${destaque:-3584e4}
     area=$(slurp -d -b 00000066 -c "${destaque}ff" -w 2) || exit 0     # Esc cancela
     alvo=(-g "$area")
+    # Espera a camada do slurp ("selection") sumir da tela + 2 quadros, senão os primeiros quadros
+    # do vídeo saem com a borda/escurecido da seleção
+    for _ in $(seq 40); do
+        hyprctl layers -j | grep -q '"namespace": *"selection"' || break
+        sleep 0.025
+    done
+    sleep 0.05
 fi
 
 # ---------- vídeo: encoder e qualidade ----------
