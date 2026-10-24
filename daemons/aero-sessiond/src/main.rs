@@ -22,7 +22,7 @@ mod compositor;
 mod icones;
 mod taxa;
 
-use compositor::{Compositor, EventoCompositor, HyprlandCompositor};
+use compositor::{EventoCompositor, obter_compositor};
 use std::env;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
@@ -31,8 +31,6 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
-
-static COMPOSITOR: HyprlandCompositor = HyprlandCompositor;
 
 #[derive(Debug)]
 enum EventoSessao {
@@ -271,9 +269,10 @@ fn rodar_daemon() {
     // No modo Rust, garante que nenhum taxa.py, bateria.py ou icones.py --watch fique rodando em paralelo
     encerrar_ajudantes_python_antigos();
 
+    let comp = obter_compositor();
     let (tx, rx): (Sender<EventoSessao>, Receiver<EventoSessao>) = mpsc::channel();
 
-    let janelas_iniciais = COMPOSITOR.janelas_abertas();
+    let janelas_iniciais = comp.janelas_abertas();
     let mut bat = bateria::EstadoBateria::novo(&janelas_iniciais);
     let mut hz = taxa::EstadoTaxa::novo(&janelas_iniciais);
     let mut icn = icones::EstadoIcones::novo();
@@ -281,11 +280,11 @@ fn rodar_daemon() {
     // Primeira aplicação logo ao iniciar
     bat.passo();
     bateria::atualizar_barra();
-    hz.aplicar(&COMPOSITOR);
+    hz.aplicar(comp);
 
     iniciar_escuta_uevent(tx.clone());
     iniciar_escuta_inotify(tx.clone());
-    compositor::iniciar_escuta(&COMPOSITOR, tx, EventoSessao::Compositor);
+    compositor::iniciar_escuta(comp, tx, EventoSessao::Compositor);
 
     loop {
         let prazo = menor_prazo(
@@ -308,23 +307,23 @@ fn rodar_daemon() {
             None => {
                 bat.passo();
                 bateria::atualizar_barra();
-                hz.verificar_prazo(&COMPOSITOR);
-                icn.verificar_prazo(&COMPOSITOR);
+                hz.verificar_prazo(comp);
+                icn.verificar_prazo(comp);
             }
             Some(EventoSessao::EnergiaMudou) => {
                 bat.passo();
                 bateria::atualizar_barra();
-                hz.ao_mudar_energia(&COMPOSITOR);
+                hz.ao_mudar_energia(comp);
             }
             Some(EventoSessao::ConfigEnergiaMudou) => {
                 bat.passo();
                 bateria::atualizar_barra();
             }
             Some(EventoSessao::ConfigTaxaMudou) => {
-                let janelas = COMPOSITOR.janelas_abertas();
+                let janelas = comp.janelas_abertas();
                 bat.recarregar_padroes_jogo(&janelas);
                 bat.passo();
-                hz.recarregar(&COMPOSITOR, &janelas);
+                hz.recarregar(comp, &janelas);
             }
             Some(EventoSessao::FontesIconesMudaram) => {
                 icn.invalidar_cache_tema();
@@ -335,13 +334,13 @@ fn rodar_daemon() {
                     if bat.ao_abrir_janela(&endereco, &classe) {
                         bat.passo();
                     }
-                    hz.ao_abrir_janela(&COMPOSITOR, &endereco, &classe);
+                    hz.ao_abrir_janela(comp, &endereco, &classe);
                 }
                 EventoCompositor::JanelaFechada { endereco } => {
                     if bat.ao_fechar_janela(&endereco) {
                         bat.passo();
                     }
-                    hz.ao_fechar_janela(&COMPOSITOR, &endereco);
+                    hz.ao_fechar_janela(comp, &endereco);
                 }
                 EventoCompositor::MonitoresOuConfigMudaram => {
                     hz.agendar_reaplicacao_pos_reload();
@@ -354,6 +353,35 @@ fn rodar_daemon() {
     }
 }
 
+fn cmd_somente_teste() {
+    let comp = obter_compositor();
+    let nome_comp = if compositor::DaimonCompositor::socket().is_some() {
+        "Daimon"
+    } else {
+        "Hyprland"
+    };
+    println!("=== aero-sessiond (modo teste) ===");
+    println!("Compositor detectado: {nome_comp}");
+    let area = comp.area_ativa();
+    println!("Área de trabalho ativa: {area}");
+
+    let janelas = comp.janelas_abertas();
+    println!("Janelas abertas ({}):", janelas.len());
+    for (id, classe) in &janelas {
+        println!("  - id={id} classe={classe}");
+    }
+
+    let monitores = comp.monitores();
+    println!("Monitores detectados ({}):", monitores.len());
+    for m in &monitores {
+        println!(
+            "  - {} {}x{} @ {:.2} Hz (pos: {}x{}, escala: {:.2})",
+            m.nome, m.largura, m.altura, m.taxa_atual, m.x, m.y, m.escala
+        );
+        println!("    Modos disponíveis: {:?}", m.modos_disponiveis);
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let arg1 = args.get(1).map(String::as_str).unwrap_or("");
@@ -363,13 +391,15 @@ fn main() {
         .and_then(|s| s.to_str())
         .unwrap_or("aero-sessiond");
 
+    let comp = obter_compositor();
     match arg1 {
+        "--somente-teste" => cmd_somente_teste(),
         "--waybar" => bateria::cmd_waybar(),
         "--alternar" => bateria::cmd_alternar(),
         "--cheia" => bateria::cmd_cheia(),
-        "--hz-status" => taxa::cmd_status(&COMPOSITOR),
+        "--hz-status" => taxa::cmd_status(comp),
         "--encerrar-python" => encerrar_ajudantes_python_antigos(),
-        "--status" if prog == "aero-hz" => taxa::cmd_status(&COMPOSITOR),
+        "--status" if prog == "aero-hz" => taxa::cmd_status(comp),
         "--status" | "--battery-status" => bateria::cmd_status(),
         _ => rodar_daemon(),
     }

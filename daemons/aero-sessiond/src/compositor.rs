@@ -428,3 +428,198 @@ where
         }));
     });
 }
+
+/// Implementação de [`Compositor`] para o Daimon usando o socket IPC nativo
+/// (`$DAIMON_SOCKET` ou `$XDG_RUNTIME_DIR/daimon/$WAYLAND_DISPLAY.sock`).
+#[derive(Default, Clone)]
+pub struct DaimonCompositor;
+
+impl DaimonCompositor {
+    /// Descobre o caminho do socket do Daimon:
+    /// 1. $DAIMON_SOCKET se definido e existente;
+    /// 2. $XDG_RUNTIME_DIR/daimon/$WAYLAND_DISPLAY.sock se existente.
+    pub fn socket() -> Option<PathBuf> {
+        if let Some(s) = env::var_os("DAIMON_SOCKET").filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(s);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        let xdg = env::var_os("XDG_RUNTIME_DIR")?;
+        let display = env::var_os("WAYLAND_DISPLAY")?;
+        let p = PathBuf::from(xdg).join("daimon").join(format!("{}.sock", display.to_string_lossy()));
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// Envia um comando JSON ao socket do Daimon e devolve a resposta JSON.
+    fn pedir(cmd_json: &serde_json::Value) -> Option<serde_json::Value> {
+        let sock = Self::socket()?;
+        let mut stream = UnixStream::connect(sock).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let mut linha = cmd_json.to_string();
+        linha.push('\n');
+        stream.write_all(linha.as_bytes()).ok()?;
+        let mut leitor = BufReader::new(stream);
+        let mut resp = String::new();
+        leitor.read_line(&mut resp).ok()?;
+        serde_json::from_str(&resp).ok()
+    }
+}
+
+impl Compositor for DaimonCompositor {
+    fn janelas_abertas(&self) -> Vec<(String, String)> {
+        let Some(resp) = Self::pedir(&serde_json::json!({"cmd": "windows"})) else {
+            return Vec::new();
+        };
+        let Some(data) = resp.get("data").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        data.iter()
+            .filter_map(|w| {
+                let id = w.get("id")?;
+                let app_id = w.get("app_id").and_then(|v| v.as_str()).unwrap_or_default();
+                let endereco = if let Some(n) = id.as_u64() {
+                    format!("{n}")
+                } else {
+                    id.as_str()?.to_string()
+                };
+                Some((endereco, app_id.to_string()))
+            })
+            .collect()
+    }
+
+    fn monitores(&self) -> Vec<MonitorInfo> {
+        let Some(resp) = Self::pedir(&serde_json::json!({"cmd": "outputs"})) else {
+            return Vec::new();
+        };
+        let Some(data) = resp.get("data").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        data.iter()
+            .filter_map(|m| {
+                let nome = m.get("name").and_then(|v| v.as_str())?.to_string();
+                let largura = m.get("w").and_then(|v| v.as_i64()).unwrap_or(1920) as i32;
+                let altura = m.get("h").and_then(|v| v.as_i64()).unwrap_or(1080) as i32;
+                let x = m.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let y = m.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let escala = m.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                let refresh_mhz = m.get("refresh_mhz").and_then(|v| v.as_i64()).unwrap_or(60000);
+                let taxa_atual = (refresh_mhz as f64) / 1000.0;
+                let mut modos_disponiveis = Vec::new();
+                if let Some(arr) = m.get("available_modes").and_then(|v| v.as_array()) {
+                    for modo in arr {
+                        if let Some(s) = modo.as_str() {
+                            modos_disponiveis.push(s.to_string());
+                        }
+                    }
+                }
+                if modos_disponiveis.is_empty() {
+                    modos_disponiveis.push(format!("{}x{}@{:.2}Hz", largura, altura, taxa_atual));
+                }
+                Some(MonitorInfo {
+                    nome,
+                    largura,
+                    altura,
+                    x,
+                    y,
+                    escala,
+                    taxa_atual,
+                    modos_disponiveis,
+                    espelho_de: None,
+                    transformacao: 0,
+                })
+            })
+            .collect()
+    }
+
+    fn definir_taxa(&self, m: &MonitorInfo, hz: f64) -> bool {
+        let hz = match teto_do_dono(&m.nome) {
+            Some(teto) if teto > 0.0 && hz > teto + 0.5 => teto,
+            _ => hz,
+        };
+        let regra = format!(
+            "{},{}x{}@{:.2},{}x{},{}",
+            m.nome,
+            m.largura,
+            m.altura,
+            hz,
+            m.x,
+            m.y,
+            formatar_escala(m.escala)
+        );
+        lembrar_taxa(&m.nome, &regra);
+        true
+    }
+
+    fn area_ativa(&self) -> i32 {
+        let Some(resp) = Self::pedir(&serde_json::json!({"cmd": "focused-workspace"})) else {
+            return 1;
+        };
+        resp.get("data")
+            .and_then(|d| d.get("id"))
+            .and_then(|id| id.as_i64())
+            .unwrap_or(1) as i32
+    }
+
+    fn escutar_eventos(&self, enviar: Box<dyn Fn(EventoCompositor) + Send>) {
+        loop {
+            if let Some(caminho) = Self::socket()
+                && let Ok(mut stream) = UnixStream::connect(caminho)
+            {
+                let cmd = serde_json::json!({"cmd": "subscribe"}).to_string() + "\n";
+                if stream.write_all(cmd.as_bytes()).is_ok() {
+                    let leitor = BufReader::new(stream);
+                    for linha in leitor.lines().map_while(Result::ok) {
+                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&linha) {
+                            let tipo = ev.get("event").and_then(|v| v.as_str()).unwrap_or_default();
+                            match tipo {
+                                "window_opened" => {
+                                    let id = ev.get("id").and_then(|v| v.as_u64()).map(|n| format!("{n}")).unwrap_or_default();
+                                    let classe = ev.get("app_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                    if !id.is_empty() {
+                                        enviar(EventoCompositor::JanelaAberta { endereco: id, classe });
+                                    }
+                                }
+                                "window_closed" => {
+                                    let id = ev.get("id").and_then(|v| v.as_u64()).map(|n| format!("{n}")).unwrap_or_default();
+                                    if !id.is_empty() {
+                                        enviar(EventoCompositor::JanelaFechada { endereco: id });
+                                    }
+                                }
+                                "output_added" | "output_removed" | "output_mode" | "config_changed" => {
+                                    enviar(EventoCompositor::MonitoresOuConfigMudaram);
+                                }
+                                "workspace_changed" => {
+                                    if let Some(to) = ev.get("to").and_then(|v| v.as_i64()) {
+                                        enviar(EventoCompositor::WorkspaceMudou(to as i32));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+/// Escolhe o compositor ativo na sessão:
+/// Se o socket do Daimon estiver disponível (DAIMON_SOCKET ou socket por WAYLAND_DISPLAY), usa `DaimonCompositor`.
+/// Caso contrário, usa `HyprlandCompositor`.
+pub fn obter_compositor() -> &'static dyn Compositor {
+    static DAIMON: DaimonCompositor = DaimonCompositor;
+    static HYPRLAND: HyprlandCompositor = HyprlandCompositor;
+
+    if DaimonCompositor::socket().is_some() {
+        &DAIMON
+    } else {
+        &HYPRLAND
+    }
+}
