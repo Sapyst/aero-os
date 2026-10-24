@@ -35,6 +35,8 @@ import solido  # noqa: E402
 SOLIDO = solido.ativo()          # lido ao iniciar (trocar de visual reinicia o processo do som/Hermes)
 
 CSS_SOLIDO = """
+window.hermes-onda, .hermes-onda { background: none; background-color: transparent; box-shadow: none; }
+window.hermes-cartoes, .hermes-cartoes { background: none; background-color: transparent; box-shadow: none; }
 window.hermes-cartoes { background: none; background-color: transparent; box-shadow: none; }
 .hermes-solido { background-color: @solid_surface_container_high; color: @solid_on_surface; border-radius: %(r)dpx;
   border: none; box-shadow: none; padding: 14px 14px 14px 16px; }
@@ -752,7 +754,8 @@ class HermesUI:
                            capture_output=True, timeout=2)
             x, y = nx, ny
         # the wave comes out of the popup (local coordinates of the focused monitor are close enough)
-        self.onda.soltar(urgente=False, cartao=(x + w / 2, y + h / 2), sobre_tela_cheia=cheia)
+        if not SOLIDO:                     # Solid: sem a onda (era ela que pintava a tela de uma cor só)
+            self.onda.soltar(urgente=False, cartao=(x + w / 2, y + h / 2), sobre_tela_cheia=cheia)
 
     def monitor_tamanho(self):
         try:
