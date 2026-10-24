@@ -943,9 +943,41 @@ fn geometria_da_barra() -> (i32, i32) {
                 }
             }
         }
+        let mut borda = 6i32;
+        if solido_ativo(&home) {
+            if let Ok(out) = Command::new("hyprctl")
+                .args(["getoption", "general:gaps_out", "-j"])
+                .output()
+            {
+                if out.status.success() {
+                    if let Ok(d) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                        let texto = d
+                            .get("custom")
+                            .and_then(|v| v.as_str().map(String::from))
+                            .or_else(|| {
+                                d.get("int").and_then(|v| {
+                                    v.as_i64()
+                                        .map(|n| n.to_string())
+                                        .or_else(|| v.as_f64().map(|n| n.to_string()))
+                                        .or_else(|| v.as_str().map(String::from))
+                                })
+                            })
+                            .unwrap_or_default();
+                        let v: Vec<i32> = texto
+                            .split_whitespace()
+                            .filter_map(|x| x.parse::<f64>().ok().map(|f| f as i32))
+                            .collect();
+                        if !v.is_empty() {
+                            let gd = if v.len() > 1 { v[1] } else { v[0] };
+                            borda = (gd - margin_sides).max(2) + 2;
+                        }
+                    }
+                }
+            }
+        }
         return (
             margin_top + (height - 34) / 2,
-            margin_sides + 6 + 8 + icon_size + 8,
+            margin_sides + borda + 8 + icon_size + 8,
         );
     }
 
@@ -974,6 +1006,26 @@ fn geometria_da_barra() -> (i32, i32) {
     let h = extrair_num("height", 34);
     let mr = extrair_num("margin-right", 12);
     (mt + (h - 34) / 2, mr + 40)
+}
+
+/// Verifica se o visual atual é o Solid (`VISUAL=Solid` no `painel.conf`).
+fn solido_ativo(home: &str) -> bool {
+    for sub in [".config/hypr/painel.conf", ".config/aero/painel.conf"] {
+        if let Ok(txt) = fs::read_to_string(PathBuf::from(home).join(sub)) {
+            for linha in txt.lines() {
+                let l = linha.trim();
+                if l.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = l.split_once('=') {
+                    if k.trim() == "VISUAL" {
+                        return v.trim().trim_matches('"') == "Solid";
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Verifica se o tema atual é claro (`TEMA_MODO=claro` no `painel.conf`).
@@ -1365,7 +1417,7 @@ fn iniciar_vigia_barra(tx_wayland: Sender<EventoWayland>, fd_wakeup: i32) {
             let reader = BufReader::new(stream);
             for linha in reader.lines().map_while(Result::ok) {
                 let l = linha.trim();
-                if l == "openlayer>>waybar" || l == "openlayer>>aerobar" {
+                if l == "openlayer>>waybar" || l == "openlayer>>aerobar" || l == "configreloaded>>" {
                     thread::sleep(Duration::from_millis(300));
                     let _ = tx_wayland.send(EventoWayland::ReerguerBarra);
                     acordar_wayland(fd_wakeup);
