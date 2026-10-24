@@ -33,6 +33,7 @@ set -u    # usar uma variável que não existe = erro (pega erro de digitação)
 LOG="$HOME/.cache/aero-shell/papel-de-parede.log"
 CONF="$HOME/.config/hypr/hyprpaper.conf"
 PAINEL="$HOME/.config/hypr/painel.conf"
+DAIMON_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/aero/daimon.conf"
 mkdir -p "$(dirname "$LOG")"
 registrar() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
 
@@ -359,6 +360,31 @@ with open(caminho + ".tmp", "w") as f:
     json.dump(d, f, indent=2)
 os.replace(caminho + ".tmp", caminho)
 PY
+    # Atualiza daimon.conf para o compositor Daimon (atômico: .tmp + rename; sem apagar outras chaves)
+    python3 -I - "$DAIMON_CONF" "$ALVO" "$FINAL" <<'PY' 2>>"$LOG" || true
+import os, sys
+caminho, area, arquivo = sys.argv[1:4]
+try:
+    with open(caminho, "r") as f:
+        linhas = f.read().splitlines()
+except FileNotFoundError:
+    linhas = []
+chave = f"area.{area}.papel"
+achou = False
+for i, l in enumerate(linhas):
+    k = l.split("=", 1)[0].strip()
+    if k == chave and not l.lstrip().startswith("#"):
+        linhas[i] = f"{chave} = {arquivo}"
+        achou = True
+        break
+if not achou:
+    linhas.append(f"{chave} = {arquivo}")
+os.makedirs(os.path.dirname(caminho), exist_ok=True)
+tmp = caminho + ".tmp"
+with open(tmp, "w") as f:
+    f.write("\n".join(linhas) + "\n")
+os.replace(tmp, caminho)
+PY
     if [ "$NA_TELA" = 1 ]; then
         trocar_hyprpaper "$FINAL"
         onda_soltar
@@ -405,6 +431,34 @@ else:
 with open(conf + ".tmp", "w") as f:                       # grava num .tmp e renomeia:
     f.write(texto)                                        # ninguém lê o arquivo pela metade
 os.replace(conf + ".tmp", conf)
+PY
+#  c) persistir no daimon.conf para o compositor Daimon (atômico: .tmp + rename; sem apagar outras chaves)
+python3 -I - "$DAIMON_CONF" "$FINAL" <<'PY' 2>>"$LOG" || true
+import os, sys
+caminho, arquivo = sys.argv[1:3]
+try:
+    with open(caminho, "r") as f:
+        linhas = f.read().splitlines()
+except FileNotFoundError:
+    linhas = []
+novas = []
+achou = False
+for l in linhas:
+    k = l.split("=", 1)[0].strip()
+    if k.startswith("area.") and k.endswith(".papel") and not l.lstrip().startswith("#"):
+        continue
+    if k == "papel" and not l.lstrip().startswith("#"):
+        novas.append(f"papel = {arquivo}")
+        achou = True
+    else:
+        novas.append(l)
+if not achou:
+    novas.append(f"papel = {arquivo}")
+os.makedirs(os.path.dirname(caminho), exist_ok=True)
+tmp = caminho + ".tmp"
+with open(tmp, "w") as f:
+    f.write("\n".join(novas) + "\n")
+os.replace(tmp, caminho)
 PY
 
 if hyprpaper_rodando; then

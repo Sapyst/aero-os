@@ -70,7 +70,11 @@ WALL_ALVO = [("The workspace you are on", "workspace"), ("All workspaces", "all"
 # Troca de wallpaper (papel-de-parede → onda_wallpaper.py): onda que desdobra o novo, ou instantânea
 WALL_ANIM = [("Wave", "wave"), ("None", "none")]
 WALL_MS_MIN, WALL_MS_MAX, WALL_MS_PADRAO = 600, 2400, 1200
-DAIMON_CONF = os.path.expanduser("~/.config/daimon/daimon.conf")
+DAIMON_CONF = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "aero",
+    "daimon.conf",
+)
 
 
 def gravar_daimon(**chaves):
@@ -79,7 +83,19 @@ def gravar_daimon(**chaves):
         with open(DAIMON_CONF) as f:
             linhas = f.read().splitlines()
     except FileNotFoundError:
-        linhas = []
+        legado = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+            "daimon",
+            "daimon.conf",
+        )
+        if os.path.exists(legado):
+            try:
+                with open(legado) as f:
+                    linhas = f.read().splitlines()
+            except Exception:
+                linhas = []
+        else:
+            linhas = []
     falta = dict(chaves)
     for i, l in enumerate(linhas):
         k = l.split("=", 1)[0].strip()
