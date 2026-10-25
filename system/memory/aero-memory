@@ -509,6 +509,9 @@ def has_main_py(argv):
     return any(os.path.basename(a) == "main.py" for a in argv[1:])
 
 
+# REVISÃO: critério diferente do looks_like_comfy() do agente: aqui main.py é obrigatório e a pasta tem de
+# REVISÃO: se chamar exatamente "comfyui". Ex.: "python main.py" em ~/ComfyUI-dev é ComfyUI pro agente e não
+# REVISÃO: pro guarda (sem +500, sem preferência). Sugestão: uma função só, compartilhada e testada nos dois.
 def is_comfy_backend(argv, cwd_base):
     """Backend do ComfyUI: python rodando main.py, numa pasta ComfyUI ou com "comfy" nos argumentos."""
     if not is_python(argv) or not has_main_py(argv):
@@ -897,6 +900,11 @@ def plan_protection(procs, orig_adj, vistos_antes, restaurando=False):
         if not restaurando:
             if p.vital or p.user_protect:
                 continue
+            # REVISÃO: (caso de borda) +500 vale pra TODO ComfyUI, inclusive o aberto no terminal/script, que o agente
+            # REVISÃO: nunca encerra: num OOM do kernel ele morre primeiro, mesmo no meio de uma geração longa.
+            # REVISÃO: Sugestão: +500 só pro gerenciado (AERO_MEMORY_MANAGED=1 em /proc/PID/environ, que o guarda já pode
+            # REVISÃO: ler com CAP_SYS_PTRACE) e algo menor (ex.: +200) pro resto. A marca é do usuário: ela só pode
+            # REVISÃO: deixar o processo dele MAIS escolhível, nunca protegido (fronteira root/usuário).
             if p.background or p.comfy:
                 if p.adj < PREFER_ADJ:
                     mudar.append((p, PREFER_ADJ, "prefer"))
@@ -994,6 +1002,12 @@ def choose_victim(procs, mem_total, own_pid=None):
     if not candidatos:
         return None
 
+    # REVISÃO: (caso de borda) o ComfyUI grande é a primeira vítima, venha de onde vier e mesmo trabalhando.
+    # REVISÃO: Sugestões: (a) o evento "pressure" já faz o agente pedir /free no aviso; dar a ele uma chance antes
+    # REVISÃO: de matar (ex.: só escolher o ComfyUI se ele continuar grande depois de um aviso); (b) preferir o
+    # REVISÃO: ComfyUI ocioso (CPU ~0 nas últimas passadas, medida pelo próprio guarda, sem confiar em arquivo
+    # REVISÃO: do usuário); ocupado ou não gerenciado só depois dos outros grandes; (c) nunca SIGSTOP num servidor
+    # REVISÃO: GPU (CUDA e clientes HTTP com timeout) e pausar não devolve RAM: matar fica como último recurso.
     def ordem(p):
         preferido = (p.background or p.comfy) and p.mem >= PREFER_MIN_MEM
         return (preferido, p.mem, p.score or 0)
@@ -1944,6 +1958,8 @@ class Guard:
         procs = self.scanner.scan(self.cfg, details=False, only=lambda c: comm_matches(c, nomes))
         n = 0
         for p in procs:
+            # REVISÃO: também retoma o que a PESSOA parou (Ctrl+Z, kill -STOP) sem registro nosso. Risco pequeno (só
+            # REVISÃO: nomes de background=), mas o ideal é retomar só quem está no paused.json ou avisar no evento.
             if p.background and is_user(p.uids) and p.state == "T":
                 try:
                     fd = open_verified(p.pid, p.start, True)
@@ -2026,6 +2042,8 @@ class Guard:
                     if fd is not None:
                         os.close(fd)
             pendentes = {fd for fd, _ in abertos}
+            # REVISÃO: espera até espera_s (KILL_WAIT_S = 3 s) dentro do tick, sem ping do watchdog nem nova leitura do
+            # REVISÃO: PSI. Com WatchdogSec=30 está ok; só não aumentar esse prazo sem rever isso.
             prazo = time.monotonic() + espera_s
             while pendentes:
                 falta = prazo - time.monotonic()

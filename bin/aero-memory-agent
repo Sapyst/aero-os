@@ -502,6 +502,9 @@ def looks_like_comfy(comm, argv, cwd, layout=False):
     return bool(layout) and any(os.path.basename(a) == "main.py" for a in argv[1:4])
 
 
+# REVISÃO: "electron*" casa com QUALQUER app Electron (no Arch o code-oss, obsidian etc. rodam como
+# REVISÃO: electronNN): um servidor aberto por uma tarefa do VS Code sem terminal vira "do app" e pode ser
+# REVISÃO: encerrado quando ele fecha. Sugestão: exigir também a classe ou o caminho do app (/proc/PID/exe).
 def is_app_comm(comm, cls):
     """O processo do app (Electron) do ComfyUI: "electron", ou o próprio nome da classe da janela."""
     c = (comm or "").lower()
@@ -1068,6 +1071,9 @@ class EventTail:
             self.started = True
             self.ino = None
             return []
+        # REVISÃO: só confere que é arquivo regular. Defesa barata: exigir st_uid == 0 e sem escrita pra grupo/outros
+        # REVISÃO: (arquivo e pasta), já que um evento "pressure" dispara /free. Hoje /run/aero-memory é do root 0755,
+        # REVISÃO: então o risco é baixo; vale pra quando --events aponta pra outro lugar.
         if not stat.S_ISREG(st.st_mode):
             return []
         try:
@@ -1521,6 +1527,9 @@ class Agent:
             if b.inode in addrs and st and st["state"] not in ("Z", "X") and st["start"] == b.start:
                 # terminal: o tty some quando o terminal fecha (nohup), então visto uma vez vale pra sempre
                 b.has_tty = b.has_tty or is_terminal_tty(st["tty"])
+                # REVISÃO: isto é convivência, não parentesco: basta uma janela do ComfyUI aberta enquanto o servidor roda
+                # REVISÃO: pra ele virar "do app". Um servidor de script/serviço (sem tty) passa a ser encerrado ao fechar o
+                # REVISÃO: app ou como órfão. Sugestão: app_seen só via find_app_ancestor() ou a marca opt-in (ver orphan_check).
                 if self.windows or self.apps:
                     b.app_seen = True
                 self.sample(b)
@@ -1560,6 +1569,10 @@ class Agent:
         app = find_app_ancestor(pid, self.uid, self.conf["comfy_window_class"], self.proc)
         if app:
             self.track_app(app)
+        # REVISÃO: mesma convivência de cima. E o inverso: se o agente reinicia (Restart=always, reload com outra
+        # REVISÃO: porta) depois que o app fechou, o servidor já foi adotado pelo systemd --user, não há janela, e
+        # REVISÃO: app_seen fica False: o órfão que o app deixou nunca é limpo. Persistir (pid, start) dos servidores
+        # REVISÃO: do app no arquivo de estado resolveria.
         b.app_seen = bool(app or self.windows or self.apps)
         self.sample(b)
         self.safe("collect", self.collect_models, b)
@@ -1630,6 +1643,9 @@ class Agent:
         rate = self.cpu_rate(b)
         if rate is not None and rate >= CPU_BUSY_S / QUEUE_EVERY_S:
             return False
+        # REVISÃO: servidor parado (estado "T": Ctrl+Z, ou SIGSTOP do guarda se "python" estiver em background=)
+        # REVISÃO: não responde a fila (q None) e tem CPU 0 -> parece "quieto" e pode ser encerrado no meio de um
+        # REVISÃO: trabalho. Sugestão: se proc_stat(b.pid)["state"] == "T", devolver False (não está quieto, está pausado).
         return q is not None or rate is not None
 
     def schedule_close(self, why):
@@ -1669,6 +1685,9 @@ class Agent:
             self.finish_gone(notify=reason != "server ended" or bool(gone and gone[4]))
         elif v == "clients":
             log(f"ComfyUI closed; server kept: {ext} other connection(s) use it (a browser tab?)")
+        # REVISÃO: (caso de borda) servidor aberto no terminal nunca é encerrado: o processo fica segurando RAM
+        # REVISÃO: (python+torch, ~1-3 GB) e o contexto CUDA na VRAM pra sempre. Os modelos ainda saem pelo
+        # REVISÃO: descarregamento ocioso (queue_tick) e no aperto (evento "pressure"), o processo não. Ver orphan_check.
         elif v == "terminal":
             self.say_once(f"tty-{b.pid}", "ComfyUI closed; server kept: it was started from a terminal")
         elif v == "app":
@@ -1681,6 +1700,16 @@ class Agent:
         # sem o Hyprland conectado não dá pra saber se há janela: nunca chama de órfão
         candidate = (bool(self.conf["comfy_free_on_close"]) and self.hypr_sock is not None and not self.windows
                      and not self.apps and not b.has_tty and self.close_at is None)
+        # REVISÃO: (caso de borda) sugestão pro servidor que o app não abriu (terminal, script, serviço):
+        # REVISÃO:  1) opt-in explícito: AERO_MEMORY_MANAGED=1 no ambiente (ler /proc/PID/environ, mesmo uid) ou um
+        # REVISÃO:     arquivo $XDG_RUNTIME_DIR/aero/comfy-managed com "pid starttime" -> tratar como do app;
+        # REVISÃO:  2) config (memory-agent.conf): comfy_unowned_idle_min=N (0 = nunca, o padrão) e, se quiser, uma
+        # REVISÃO:     lista de pastas (cwd) permitidas; o resto continua intocado, como hoje;
+        # REVISÃO:  3) ocioso N min: notificar "ComfyUI started from a terminal has been idle N min, holding X GB"
+        # REVISÃO:     com botões Stop / Unload models (notify-send --action). Hoje reap_notifiers() encerra o
+        # REVISÃO:     notify-send em 5 s: a resposta precisa de outro caminho (D-Bus ActionInvoked) sem travar o laço;
+        # REVISÃO:  4) "Unload models" = ask_free() (POST /free), sem matar; "Stop" = stop_backend() só se quiet_now();
+        # REVISÃO:  5) sem opt-in, nunca encerrar sozinho: só avisar (no máximo uma vez por período ocioso).
         if candidate and not b.app_seen:
             self.say_once(f"noapp-{b.pid}", f"ComfyUI server pid {b.pid} was not started by the ComfyUI app; "
                                             "left alone")
@@ -1712,6 +1741,9 @@ class Agent:
         st = proc_status(b.pid, self.proc)
         if not same_user(st, self.uid):
             return
+        # REVISÃO: trava o laço principal até STOP_WAIT_S + KILL_WAIT_S (~13 s): sem ler o socket do Hyprland nem os
+        # REVISÃO: eventos do guarda nesse tempo. E só o pid principal leva o sinal: filhos (custom nodes com
+        # REVISÃO: subprocessos) que seguram VRAM continuam vivos; gpu_sample() já soma os descendentes.
         result = stop_process(b.pid, b.start)
         log(f"{what} pid {b.pid} ({b.comm}): {result}")
         if result == "stuck":
