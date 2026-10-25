@@ -748,7 +748,8 @@ class App(Adw.Application):
             self.janela = SuperMenu(self)
             self.hold()       # continua rodando mesmo com a janela escondida
         args = linha.get_arguments()
-        dots = visual_atual() == "DotStyle"
+        # a nuvem de bolhas (nuvem.py) é o Kairos do dono no DotStyle E no Solid; os outros visuais usam o painel
+        dots = visual_atual() in ("DotStyle", "Solid")
         if "--clique-fora" in args:
             if not dots:
                 self.janela.clique_fora()      # the cloud covers the screen and closes on its own empty clicks
