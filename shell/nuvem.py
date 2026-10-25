@@ -28,6 +28,7 @@ from gi.repository import Gtk4LayerShell as Camada  # noqa: E402
 
 import apps  # noqa: E402
 import campotexto  # noqa: E402
+import solido  # noqa: E402
 
 USO = os.path.expanduser("~/.cache/aero-shell/menu-uso.json")
 FG = (0.925, 0.92, 0.91)
@@ -170,14 +171,26 @@ class Nuvem(Gtk.Window):
             Camada.set_anchor(self, borda, True)
         Camada.set_exclusive_zone(self, -1)
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.NONE)
+        self.raiz = Gtk.Overlay()
+        self.veu = Gtk.DrawingArea(hexpand=True, vexpand=True, can_target=False)
+        self.veu.set_draw_func(self._desenhar_veu)
+        self.raiz.set_child(self.veu)
+
         self.area = Gtk.DrawingArea(hexpand=True, vexpand=True)
         self.area.set_draw_func(self.desenhar)
-        self.set_child(self.area)
+        self.raiz.add_overlay(self.area)
+        self.set_child(self.raiz)
+
+        self.campo_solido = None
+        try:
+            self._mon_solido = solido.vigiar(self._tema_mudou, "outros")
+        except Exception:
+            self._mon_solido = None
         self.bolhas, self.cache = [], {}
         self.busca = ""
         # the search is a real text field (cursor, Ctrl+A with the red outline, Ctrl+C/X/V...): campotexto.py
         self.campo = campotexto.CampoTexto(self._busca_mudou, limite=40)
-        self.campo.redesenhar = lambda: self.area.queue_draw()
+        self.campo.redesenhar = self._redesenhar
         self.mouse = None
         self.sel = 0
         self.t_abrir = 0.0
@@ -194,6 +207,27 @@ class Nuvem(Gtk.Window):
         teclas = Gtk.EventControllerKey()
         teclas.connect("key-pressed", self._tecla)
         self.add_controller(teclas)
+
+    def _redesenhar(self):
+        self.area.queue_draw()
+        if hasattr(self, "veu") and self.veu is not None:
+            self.veu.queue_draw()
+
+    def _tema_mudou(self):
+        solido.recarregar()
+        self._redesenhar()
+
+    def _desenhar_veu(self, _w, cr, w, h):
+        if not solido.ativo():
+            return
+        agora = time.monotonic()
+        if self.t_fechar is None:
+            fundo = min(1.0, (agora - self.t_abrir) / 0.25)
+        else:
+            fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
+        sr, sg, sb = solido.rgb("surface")
+        cr.set_source_rgba(sr, sg, sb, 0.88 * fundo)
+        cr.paint()
 
     # ---------- data ----------
 
@@ -526,8 +560,11 @@ class Nuvem(Gtk.Window):
         self.campo.texto, self.campo.cursor, self.campo.tudo = "", 0, False
         self.carregar()
         self.enfeites = None                       # re-seeded around the new layout on the first frame
+        k_centro = 0.22 if solido.ativo() else 0.35
         for b in self.bolhas:                      # born at the centre: the spring throws them out to their place
-            b.cx, b.cy = b.x * 0.35, b.y * 0.35
+            b.cx, b.cy = b.x * k_centro, b.y * k_centro
+            if solido.ativo():
+                b.atraso = min(0.30, math.hypot(b.x, b.y) / 1600) + 0.05
         self.t_abrir, self.t_fechar = time.monotonic(), None
         Camada.set_keyboard_mode(self, Camada.KeyboardMode.EXCLUSIVE)
         self.present()
@@ -589,16 +626,66 @@ class Nuvem(Gtk.Window):
             mexendo = True
         abrindo = agora - self.t_abrir < 0.9
         lente = self.mouse is not None and agora - self.ultimo_mov < 0.6
+        fechando = self.t_fechar is not None
+
+        solido_on = solido.ativo()
+        if solido_on:
+            abrindo_gl = agora - self.t_abrir < 0.65
+            precisa_gl = mexendo or abrindo_gl or fechando or (self.mouse is not None and agora - self.ultimo_mov < 0.5)
+            if precisa_gl and self.campo_solido is None:
+                try:
+                    from liquido import CampoSolido
+                    self.campo_solido = CampoSolido(cor=solido.rgb("surface_container_high"), k=22.0)
+                    self.campo_solido.insert_before(self.raiz, self.area)
+                except Exception:
+                    self.campo_solido = None
+            elif not precisa_gl and self.campo_solido is not None:
+                if self.campo_solido.get_parent() is self.raiz:
+                    self.raiz.remove_overlay(self.campo_solido)
+                self.campo_solido = None
+                self.area.queue_draw()
+
+            if self.campo_solido is not None:
+                fundo = (
+                    min(1.0, (agora - self.t_abrir) / 0.25)
+                    if not fechando
+                    else 1 - suave(0, 0.3, agora - self.t_fechar)
+                )
+                gotas = []
+                for b in self.bolhas:
+                    if b.escala > 0.4:
+                        bx, by, br, ba = self._onde(b, agora)
+                        if br > 1.0 and ba > 0.01:
+                            gotas.append((bx, by, br))
+                self.campo_solido.cor = (*solido.rgb("surface_container_high"), 1.0)
+                self.campo_solido.formas(gotas, fundo)
+
         self.area.queue_draw()
+        if solido_on and hasattr(self, "veu") and self.veu is not None:
+            self.veu.queue_draw()
+
         if self.t_fechar is not None and agora - self.t_fechar > 0.32:
+            if getattr(self, "campo_solido", None) is not None:
+                if self.campo_solido.get_parent() is self.raiz:
+                    self.raiz.remove_overlay(self.campo_solido)
+                self.campo_solido = None
             self.tique = None
             self.set_visible(False)
             f, self._depois = getattr(self, "_depois", None), None
             if f:
                 GLib.idle_add(lambda: (f(), False)[1])
             return GLib.SOURCE_REMOVE
+
         # still: every dot at rest, nothing moving, pointer quiet -> stop drawing (0 CPU) until something moves
-        if not (mexendo or abrindo or lente or self.t_fechar is not None or getattr(self, "_ativos", 1) > 0):
+        em_repouso = not (mexendo or abrindo or lente or fechando)
+        if not solido_on:
+            em_repouso = em_repouso and getattr(self, "_ativos", 1) <= 0
+        if em_repouso:
+            if getattr(self, "campo_solido", None) is not None:
+                if self.campo_solido.get_parent() is self.raiz:
+                    self.raiz.remove_overlay(self.campo_solido)
+                self.campo_solido = None
+                self.area.queue_draw()
             self.tique = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
@@ -680,14 +767,18 @@ class Nuvem(Gtk.Window):
 
     def desenhar(self, _area, cr, w, h):
         agora = time.monotonic()
-        # a whisper of a dot grid so the cloud has a floor (never hides the desktop)
+        solido_on = solido.ativo()
         if self.t_fechar is None:
             fundo = min(1.0, (agora - self.t_abrir) / 0.25)
         else:
             fundo = 1 - suave(0, 0.3, agora - self.t_fechar)
-        cr.set_source_rgba(0.02, 0.02, 0.025, 0.12 * fundo)
-        cr.paint()
-        self.desenhar_enfeites(cr, w, h, agora, fundo)
+
+        if not solido_on:
+            # a whisper of a dot grid so the cloud has a floor (never hides the desktop)
+            cr.set_source_rgba(0.02, 0.02, 0.025, 0.12 * fundo)
+            cr.paint()
+            self.desenhar_enfeites(cr, w, h, agora, fundo)
+
         sobre = self.bolha_em(*self.mouse) if self.mouse else None
         foco = sobre if sobre is not None else (self.sel if (self.busca or getattr(self, "navegou", False)) else None)
         # tiny dots first, then the bubbles, and the focused one last (on top of its neighbours)
@@ -698,27 +789,48 @@ class Nuvem(Gtk.Window):
             if r < 0.6 or a <= 0.01:
                 continue
             cr.new_path()                                     # never connect to the previous text's point
-            if b.escala < 0.5:                                # filtered out: a tiny dot
-                cr.set_source_rgba(*FG, 0.25 * a)
-                cr.arc(x, y, max(2.0, r * 0.5), 0, 2 * math.pi)
-                cr.fill()
+            if b.escala < 0.5:
+                if solido_on:
+                    # Solid: small dimmed solid circle (not a dot)
+                    cr.set_source_rgba(*solido.rgb("surface_dim"), 0.35 * a)
+                    cr.arc(x, y, max(3.5, r * 0.4), 0, 2 * math.pi)
+                    cr.fill()
+                else:
+                    # DotStyle: tiny dot
+                    cr.set_source_rgba(*FG, 0.25 * a)
+                    cr.arc(x, y, max(2.0, r * 0.5), 0, 2 * math.pi)
+                    cr.fill()
                 continue
             selecionada = i == self.sel and (bool(self.busca) or getattr(self, "navegou", False))
-            if i == sobre or selecionada:                     # a soft halo around the focused bubble
-                import cairo
-                g = cairo.RadialGradient(x, y, r * 0.8, x, y, r * 1.6)
-                for k in range(9):
-                    t = k / 8
-                    g.add_color_stop_rgba(t, *FG, 0.22 * a * math.exp(-4 * t * t) * (1 - t ** 6))
-                cr.set_source(g)
-                cr.arc(x, y, r * 1.6, 0, 2 * math.pi)
-                cr.fill()
-            cr.arc(x, y, r, 0, 2 * math.pi)
-            cr.set_source_rgba(0.08, 0.08, 0.09, 0.82 * a)
-            cr.fill_preserve()
-            cr.set_source_rgba(*FG, 0.16 * a)
-            cr.set_line_width(1)
-            cr.stroke()
+            if solido_on:
+                # Solid bubble: flat tonal circle (surface_container_high), sem contorno
+                if self.campo_solido is None or not getattr(self.campo_solido, "ok", False):
+                    cr.arc(x, y, r, 0, 2 * math.pi)
+                    cr.set_source_rgba(*solido.rgb("surface_container_high"), a)
+                    cr.fill()
+                # State layer on hover / focus / lens
+                if i == sobre or selecionada or b.lente > 0.02:
+                    k_lente = max(b.lente, 1.0 if (i == sobre or selecionada) else 0.0)
+                    cr.arc(x, y, r, 0, 2 * math.pi)
+                    cr.set_source_rgba(*solido.rgb("on_surface"), 0.10 * a * k_lente)
+                    cr.fill()
+            else:
+                if i == sobre or selecionada:                     # a soft halo around the focused bubble
+                    import cairo
+                    g = cairo.RadialGradient(x, y, r * 0.8, x, y, r * 1.6)
+                    for k in range(9):
+                        t = k / 8
+                        g.add_color_stop_rgba(t, *FG, 0.22 * a * math.exp(-4 * t * t) * (1 - t ** 6))
+                    cr.set_source(g)
+                    cr.arc(x, y, r * 1.6, 0, 2 * math.pi)
+                    cr.fill()
+                cr.arc(x, y, r, 0, 2 * math.pi)
+                cr.set_source_rgba(0.08, 0.08, 0.09, 0.82 * a)
+                cr.fill_preserve()
+                cr.set_source_rgba(*FG, 0.16 * a)
+                cr.set_line_width(1)
+                cr.stroke()
+
             ic = self.icone(b)
             if ic is not None:
                 sup, placa = ic
@@ -740,14 +852,27 @@ class Nuvem(Gtk.Window):
                 cr.paint_with_alpha(a)
                 cr.restore()
             else:
-                self._texto(cr, b.nome[:1].upper(), x, y, f"Doto Black {int(r * 0.7)}", a)
+                if solido_on:
+                    self._texto_solido(cr, b.nome[:1].upper(), x, y, f"Inter Bold {int(r * 0.7)}", a, cor=solido.rgb("on_surface"))
+                else:
+                    self._texto(cr, b.nome[:1].upper(), x, y, f"Doto Black {int(r * 0.7)}", a)
             if i == foco:
-                self._etiqueta(cr, b.nome.upper(), x, y + r + 18, a)
-        # the search line, written in dots at the top
-        if self.busca:
-            campotexto.desenhar(cr, self.campo, w / 2, 80, "Doto Black 26", fundo)
-        elif self.t_fechar is None and agora - self.t_abrir < 2.5:
-            self._texto(cr, "TYPE TO SEARCH", w / 2, 80, "Doto Black 26", fundo * 0.5)
+                if solido_on:
+                    self._etiqueta_solido(cr, b.nome, x, y + r + 18, a)
+                else:
+                    self._etiqueta(cr, b.nome.upper(), x, y + r + 18, a)
+
+        # the search line
+        if solido_on:
+            if self.busca:
+                campotexto.desenhar(cr, self.campo, w / 2, 80, "Inter Medium 24", fundo, maiusculas=False)
+            elif self.t_fechar is None and agora - self.t_abrir < 2.5:
+                self._texto_solido(cr, "Type to search", w / 2, 80, "Inter Medium 24", fundo * 0.6)
+        else:
+            if self.busca:
+                campotexto.desenhar(cr, self.campo, w / 2, 80, "Doto Black 26", fundo)
+            elif self.t_fechar is None and agora - self.t_abrir < 2.5:
+                self._texto(cr, "TYPE TO SEARCH", w / 2, 80, "Doto Black 26", fundo * 0.5)
 
     def _etiqueta(self, cr, s, x, y, alfa):
         """The focused app's name in dots on a small dark pill, always readable."""
@@ -779,6 +904,37 @@ class Nuvem(Gtk.Window):
         PangoCairo.show_layout(cr, layout)
         cr.move_to(x - tw / 2, y - th / 2)
         cr.set_source_rgba(*FG, alfa)
+        PangoCairo.show_layout(cr, layout)
+        cr.new_path()
+
+    def _etiqueta_solido(self, cr, s, x, y, alfa):
+        """Solid: app name in Inter on a tonal pill (surface_container_highest)."""
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription.from_string("Inter Medium 13"))
+        layout.set_text(s, -1)
+        tw, th = layout.get_pixel_size()
+        w, h = tw + 26, th + 10
+        x0, y0, r = x - w / 2, y - h / 2, h / 2
+        cr.new_sub_path()
+        cr.arc(x0 + w - r, y0 + r, r, -math.pi / 2, math.pi / 2)
+        cr.arc(x0 + r, y0 + r, r, math.pi / 2, 3 * math.pi / 2)
+        cr.close_path()
+        cr.set_source_rgba(*solido.rgb("surface_container_highest"), 0.95 * alfa)
+        cr.fill()
+        cr.move_to(x - tw / 2, y - th / 2)
+        cr.set_source_rgba(*solido.rgb("on_surface"), alfa)
+        PangoCairo.show_layout(cr, layout)
+        cr.new_path()
+
+    def _texto_solido(self, cr, s, x, y, fonte, alfa, cor=None):
+        cr.new_path()
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription.from_string(fonte))
+        layout.set_text(s, -1)
+        tw, th = layout.get_pixel_size()
+        cr.move_to(x - tw / 2, y - th / 2)
+        c = cor or solido.rgb("on_surface_variant")
+        cr.set_source_rgba(*c, alfa)
         PangoCairo.show_layout(cr, layout)
         cr.new_path()
 
