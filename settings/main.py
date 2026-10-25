@@ -52,6 +52,7 @@ from sec_teclado import SecaoTeclado
 from sec_tela import SecaoTela
 from sec_theme import SecaoTema
 from sec_widgets import SecaoWidgets
+from sec_daimon import SecaoDaimon
 
 # A árvore: (nome do grupo, ícone, [(nome do filho, classe da seção, sub-página ou None), ...])
 ARVORE = [
@@ -68,6 +69,7 @@ ARVORE = [
     ("Screen recording", "media-record-symbolic", SecaoGravacao),
     ("Connections", "network-wireless-symbolic", [("Network", SecaoRede, None), ("Bluetooth", SecaoBluetooth, None)]),
     ("System", "emblem-system-symbolic", [
+        ("Daimon", SecaoDaimon, None),
         ("Power", SecaoEnergia, None), ("Memory", SecaoMemoria, None), ("Notifications", SecaoNotificacoes, None), ("Default apps", SecaoPadroes, None), ("Location", SecaoLocal, None),
         ("Updates", SecaoAtualizacoes, None), ("Background services", SecaoServicos, None),
         ("About", SecaoSobre, None)]),
@@ -83,6 +85,7 @@ DURACAO = 220      # ms: abrir/fechar grupo e a página nova entrando
 
 # Palavras extras por seção ("sec" ou "sec:sub-página") pra busca: o que a pessoa digita e não está escrito na tela
 APELIDOS_BUSCA = {
+    "daimon": "compositor window manager style solid shadow dilution vrr tearing nvidia gpu alttab tiling corner radius wallpaper wave",
     "tema": "visual aeros aeroterm look style", "aparencia:colors": "theme dark light mode night accent",
     "aparencia:wallpaper": "background image picture super menu start menu", "aparencia:glass": "blur transparency opacity rounded corners",
     "aparencia:text": "font size animations motion", "icones": "icons ascii pack icon theme super menu dock",
@@ -115,7 +118,7 @@ def normalizar(texto):
 
 
 # nomes antigos de CONFIG_ABA (scripts e Super Menu) -> (seção, sub-página)
-APELIDOS = {"wallpapers": ("aparencia", "wallpaper"), "tema": ("tema", None), "theme": ("tema", None),
+APELIDOS = {"daimon": ("daimon", None), "wallpapers": ("aparencia", "wallpaper"), "tema": ("tema", None), "theme": ("tema", None),
             "aparencia": ("aparencia", "colors"), "areas": ("areas", None)}
 
 
