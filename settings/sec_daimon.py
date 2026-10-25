@@ -225,7 +225,7 @@ class SecaoDaimon(Secao):
         # Grupo 3: Jogos e Desempenho
         # =========================================================================
         grp_jogos = Adw.PreferencesGroup(
-            title="Gaming & Direct Scanout",
+            title="Gaming and Direct Scanout",
             description="High refresh rate display features and low-latency presentation",
         )
 
