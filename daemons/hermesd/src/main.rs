@@ -11,6 +11,13 @@
 //!      `RemoveHistory`, `ClearHistory`, `Dismiss`, `InvokeAction`, `Hold`, `Arm`, `GetConfig`,
 //!      `GetActive`, `GetAudio`, `GetBluetoothDevices`, `GetWifiNetworks`, `GetHestiaState`,
 //!      e sinais `NotificationEvent` e `AudioChanged`).
+//!    - Backends REAIS com leitura de volta (`backends.rs`, documentados em `daemons/API.md`):
+//!      áudio (`ListSinks`, `ListSources`, `SetDefaultSink`, `SetDefaultSource`, `SetVolume`, `SetMute`),
+//!      Wi-Fi (`GetWifi`, `SetWifiEnabled`, `ListNetworks`, `WifiConnect`, `WifiDisconnect`),
+//!      Bluetooth (`GetBluetooth`, `SetBluetoothPowered`, `BluetoothConnect`, `BluetoothDisconnect`)
+//!      e Não perturbe (`GetDnd`, `SetDnd`), com os sinais `AudioChanged(s)`, `WifiChanged(s)`,
+//!      `BluetoothChanged(s)` e `DndChanged(b)`. Todo setter devolve o estado que REALMENTE ficou.
+//!    - `--teste`: sobe como `com.aero.Hermes.Teste` sem tocar em `org.freedesktop.Notifications`.
 //!    - Valida `~/.config/aero/hermes.json` com os mesmos padrões e limites de `hermes.py`.
 //!    - Sanitiza markup Pango (`<b>`, `<i>`, `<u>`, `<br>`, entidades XML), aplica limite de
 //!      20 notificações/s por remetente, substituição por tag (`x-canonical-private-synchronous` /
@@ -36,7 +43,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,9 +58,23 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::interface;
 
+mod backends;
+
 const CAMINHO_NOTIF: &str = "/org/freedesktop/Notifications";
 const NOME_NOTIF: &str = "org.freedesktop.Notifications";
 const NOME_HERMES: &str = "com.aero.Hermes";
+
+/// Nome de barramento que este processo assume: `com.aero.Hermes` normalmente, `com.aero.Hermes.Teste`
+/// com `--teste` (instância de teste ao lado da real, sem tocar em `org.freedesktop.Notifications`).
+static NOME_BUS: OnceLock<String> = OnceLock::new();
+
+fn nome_bus() -> &'static str {
+    NOME_BUS.get().map(String::as_str).unwrap_or(NOME_HERMES)
+}
+
+fn modo_teste() -> bool {
+    nome_bus() != NOME_HERMES
+}
 
 /// Motivos de fechamento da especificação freedesktop Notifications.
 const EXPIROU: u32 = 1;
@@ -1079,8 +1100,13 @@ fn consultar_lista_pactl(tipo: &str) -> Vec<JsonValue> {
             .unwrap_or(&nome)
             .to_string();
         let bonito = nome_bonito_audio(&desc, &nome, eh_entrada);
+        let id_pw = backends::id_pipewire(&JsonValue::Object(obj.clone()));
+        let vol = backends::volume_pct_pactl(&JsonValue::Object(obj.clone()));
         obj.insert("padrao".to_string(), JsonValue::Bool(nome == padrao));
+        obj.insert("is_default".to_string(), JsonValue::Bool(nome == padrao));
         obj.insert("pretty_name".to_string(), JsonValue::String(bonito));
+        obj.insert("id".to_string(), JsonValue::from(id_pw));
+        obj.insert("volume_pct".to_string(), JsonValue::from(vol));
         itens.push(d);
     }
     itens
@@ -1096,6 +1122,17 @@ fn coletar_audio_atual() -> EstadoAudio {
     EstadoAudio {
         sinks: consultar_lista_pactl("sinks"),
         sources: consultar_lista_pactl("sources"),
+    }
+}
+
+impl EstadoAudio {
+    /// Estado compacto para a API (`ListSinks`/`ListSources`/`AudioChanged`):
+    /// `{"sinks": [{id,index,name,pretty_name,is_default,volume,muted}], "sources": [...]}`.
+    fn compacto(&self) -> JsonValue {
+        json!({
+            "sinks": self.sinks.iter().map(backends::aparelho_compacto).collect::<Vec<_>>(),
+            "sources": self.sources.iter().map(backends::aparelho_compacto).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -1380,6 +1417,8 @@ struct EstadoHermes {
     taxa: HashMap<String, (u64, u32)>,
     modos: BTreeSet<String>,
     audio: EstadoAudio,
+    /// Último JSON compacto de áudio emitido em `AudioChanged` (evita repetir o mesmo estado).
+    audio_json_emitido: String,
     bluetooth: EstadoBluetooth,
     wifi: EstadoWifi,
     tx_timer: Sender<ComandoTimer>,
@@ -1894,6 +1933,144 @@ impl ServicoNotificacoes {
 
 struct ServicoControleHermes {
     estado: Arc<Mutex<EstadoHermes>>,
+    /// Conexão da sessão (para emitir os sinais de estado a partir das threads dos setters).
+    sessao: DbusConn,
+    /// Conexão do sistema (NetworkManager, BlueZ); `None` sem barramento do sistema.
+    sistema: Option<DbusConn>,
+}
+
+/// Emite `AudioChanged(estado_json)` em `com.aero.Hermes`.
+fn emitir_audio_changed(conn: &DbusConn, estado: &JsonValue) {
+    let _ = conn.emit_signal(
+        None::<&str>,
+        CAMINHO_NOTIF,
+        NOME_HERMES,
+        "AudioChanged",
+        &(estado.to_string(),),
+    );
+}
+
+/// Emite `WifiChanged` / `BluetoothChanged` / `DndChanged` em `com.aero.Hermes`.
+fn emitir_estado(conn: &DbusConn, sinal: &str, payload: &JsonValue) {
+    let _ = conn.emit_signal(
+        None::<&str>,
+        CAMINHO_NOTIF,
+        NOME_HERMES,
+        sinal,
+        &(payload.to_string(),),
+    );
+}
+
+fn emitir_dnd_changed(conn: &DbusConn, ligado: bool) {
+    let _ = conn.emit_signal(None::<&str>, CAMINHO_NOTIF, NOME_HERMES, "DndChanged", &(ligado,));
+}
+
+/// Resposta padrão de erro dos setters: `{"error": "...", ...estado atual}`.
+fn com_erro(mut estado: JsonValue, erro: Option<String>) -> String {
+    if let (Some(e), Some(obj)) = (erro, estado.as_object_mut()) {
+        obj.insert("error".to_string(), JsonValue::String(e));
+    }
+    estado.to_string()
+}
+
+fn pendente(mut estado: JsonValue) -> String {
+    if let Some(obj) = estado.as_object_mut() {
+        obj.insert("pending".to_string(), JsonValue::Bool(true));
+    }
+    estado.to_string()
+}
+
+impl ServicoControleHermes {
+    /// Relê o áudio na fonte (pactl), guarda no estado e emite `AudioChanged` com o estado novo.
+    fn releitura_audio(estado: &Arc<Mutex<EstadoHermes>>, sessao: &DbusConn) -> JsonValue {
+        // o wpctl volta antes de o pipewire-pulse refletir a mudança: um respiro curto antes de reler
+        thread::sleep(Duration::from_millis(60));
+        let novo = coletar_audio_atual();
+        let js = novo.compacto();
+        {
+            let mut est = estado.lock().unwrap();
+            est.audio = novo;
+            est.audio_json_emitido = js.to_string();
+        }
+        emitir_audio_changed(sessao, &js);
+        js
+    }
+
+    /// Executa um setter de áudio e devolve o estado real que ficou (JSON).
+    fn acao_audio(&self, acao: impl FnOnce() -> Result<(), String> + Send + 'static) -> String {
+        let estado = Arc::clone(&self.estado);
+        let sessao = self.sessao.clone();
+        match backends::com_prazo(move || {
+            let r = acao();
+            let js = Self::releitura_audio(&estado, &sessao);
+            com_erro(js, r.err())
+        }) {
+            Some(resp) => resp,
+            None => pendente(self.estado.lock().unwrap().audio.compacto()),
+        }
+    }
+
+    fn wifi_json(&self) -> JsonValue {
+        match &self.sistema {
+            Some(c) => backends::wifi_estado(c),
+            None => json!({"enabled": false, "connected": false, "ssid": "", "strength": 0, "error": "no system bus"}),
+        }
+    }
+
+    fn bluetooth_json(&self) -> JsonValue {
+        match &self.sistema {
+            Some(c) => backends::bluetooth_estado(c),
+            None => json!({"powered": false, "devices": [], "error": "no system bus"}),
+        }
+    }
+
+    /// Executa um setter de Wi-Fi ou Bluetooth numa thread, relê o estado, emite o sinal e responde
+    /// (ou responde `pending` se passou do prazo; a thread emite o sinal quando terminar).
+    fn acao_sistema(
+        &self,
+        sinal: &'static str,
+        ler: fn(&DbusConn) -> JsonValue,
+        acao: impl FnOnce(&DbusConn) -> Result<(), String> + Send + 'static,
+    ) -> String {
+        let Some(sistema) = self.sistema.clone() else {
+            return com_erro(json!({}), Some("no system bus".into()));
+        };
+        let sessao = self.sessao.clone();
+        let sistema2 = sistema.clone();
+        match backends::com_prazo(move || {
+            let r = acao(&sistema2);
+            let js = ler(&sistema2);
+            emitir_estado(&sessao, sinal, &js);
+            com_erro(js, r.err())
+        }) {
+            Some(resp) => resp,
+            None => pendente(ler(&sistema)),
+        }
+    }
+
+    fn definir_dnd(&self, ligado: bool) -> bool {
+        let mudou;
+        {
+            let mut est = self.estado.lock().unwrap();
+            mudou = if ligado {
+                est.modos.insert("dnd".to_string())
+            } else {
+                est.modos.remove("dnd")
+            };
+            if mudou {
+                let lista_modos: Vec<String> = est.modos.iter().cloned().collect();
+                let _ = est.tx_timer.send(ComandoTimer::EmitirEventoHermes {
+                    evento: "modes",
+                    payload: json!(lista_modos),
+                });
+            }
+        }
+        if mudou {
+            emitir_dnd_changed(&self.sessao, ligado);
+            avisar_waybar_dnd();
+        }
+        ligado
+    }
 }
 
 #[interface(name = "com.aero.Hermes")]
@@ -1913,6 +2090,7 @@ impl ServicoControleHermes {
     #[zbus(name = "SetModes")]
     fn set_modes(&self, modes: Vec<String>) {
         let re = Regex::new(r"^[\w-]{1,32}$").unwrap();
+        let dnd_antes = self.estado.lock().unwrap().modos.contains("dnd");
         {
             let mut est = self.estado.lock().unwrap();
             est.modos = modes
@@ -1926,6 +2104,10 @@ impl ServicoControleHermes {
                 payload: json!(lista_modos),
             });
         }
+        let dnd_depois = self.estado.lock().unwrap().modos.contains("dnd");
+        if dnd_antes != dnd_depois {
+            emitir_dnd_changed(&self.sessao, dnd_depois);
+        }
         avisar_waybar_dnd();
     }
 
@@ -1933,6 +2115,10 @@ impl ServicoControleHermes {
     fn set_mode(&self, nome: String, ligado: bool) {
         let re = Regex::new(r"^[\w-]{1,32}$").unwrap();
         if !re.is_match(&nome) {
+            return;
+        }
+        if nome == "dnd" {
+            self.definir_dnd(ligado);
             return;
         }
         {
@@ -2142,6 +2328,135 @@ impl ServicoControleHermes {
         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
     }
 
+    // ---------- Áudio (PipeWire) com leitura de volta ----------
+
+    /// Saídas de som: `[{id,index,name,pretty_name,is_default,volume,muted}]` (`id` = objeto do PipeWire).
+    #[zbus(name = "ListSinks")]
+    fn list_sinks(&self) -> String {
+        let est = self.estado.lock().unwrap();
+        est.audio.compacto()["sinks"].to_string()
+    }
+
+    /// Entradas de som (microfones), mesmo formato de `ListSinks`.
+    #[zbus(name = "ListSources")]
+    fn list_sources(&self) -> String {
+        let est = self.estado.lock().unwrap();
+        est.audio.compacto()["sources"].to_string()
+    }
+
+    #[zbus(name = "SetDefaultSink")]
+    fn set_default_sink(&self, id: u32) -> String {
+        self.acao_audio(move || backends::audio_definir_padrao(id))
+    }
+
+    #[zbus(name = "SetDefaultSource")]
+    fn set_default_source(&self, id: u32) -> String {
+        self.acao_audio(move || backends::audio_definir_padrao(id))
+    }
+
+    /// Volume em % (0..=150) de uma saída ou entrada pelo `id` do PipeWire.
+    #[zbus(name = "SetVolume")]
+    fn set_volume(&self, id: u32, pct: u32) -> String {
+        self.acao_audio(move || backends::audio_definir_volume(id, pct))
+    }
+
+    #[zbus(name = "SetMute")]
+    fn set_mute(&self, id: u32, muted: bool) -> String {
+        self.acao_audio(move || backends::audio_definir_mudo(id, muted))
+    }
+
+    // ---------- Wi-Fi (NetworkManager) ----------
+
+    /// `{"enabled","connected","ssid","strength","state"}` lido agora do NetworkManager.
+    #[zbus(name = "GetWifi")]
+    fn get_wifi(&self) -> String {
+        self.wifi_json().to_string()
+    }
+
+    #[zbus(name = "SetWifiEnabled")]
+    fn set_wifi_enabled(&self, enabled: bool) -> String {
+        self.acao_sistema("WifiChanged", backends::wifi_estado, move |c| {
+            backends::wifi_definir_ligado(c, enabled)?;
+            // o NM leva um instante para desligar/ligar o rádio; esperamos refletir antes de reler
+            for _ in 0..10 {
+                thread::sleep(Duration::from_millis(100));
+                if backends::wifi_estado(c)["enabled"].as_bool() == Some(enabled) {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Redes visíveis: `[{"ssid","strength","secured","known","in_use"}]`; `rescan` pede uma varredura nova.
+    #[zbus(name = "ListNetworks")]
+    fn list_networks(&self, rescan: bool) -> String {
+        let Some(c) = &self.sistema else {
+            return "[]".to_string();
+        };
+        match backends::wifi_listar(c, rescan) {
+            Ok(lista) => JsonValue::Array(lista).to_string(),
+            Err(e) => json!({"error": e}).to_string(),
+        }
+    }
+
+    /// Conecta ao `ssid` (senha vazia = usar a conexão salva). A resposta traz `pending` enquanto o NM
+    /// negocia; o `WifiChanged` final confirma `connected`.
+    #[zbus(name = "WifiConnect")]
+    fn wifi_connect(&self, ssid: String, password: String) -> String {
+        self.acao_sistema("WifiChanged", backends::wifi_estado, move |c| {
+            backends::wifi_conectar(c, &ssid, &password)
+        })
+    }
+
+    #[zbus(name = "WifiDisconnect")]
+    fn wifi_disconnect(&self) -> String {
+        self.acao_sistema("WifiChanged", backends::wifi_estado, backends::wifi_desconectar)
+    }
+
+    // ---------- Bluetooth (BlueZ) ----------
+
+    /// `{"powered","adapter","devices":[{"addr","name","connected","paired","trusted","battery"}]}`.
+    #[zbus(name = "GetBluetooth")]
+    fn get_bluetooth(&self) -> String {
+        self.bluetooth_json().to_string()
+    }
+
+    #[zbus(name = "SetBluetoothPowered")]
+    fn set_bluetooth_powered(&self, powered: bool) -> String {
+        self.acao_sistema("BluetoothChanged", backends::bluetooth_estado, move |c| {
+            backends::bluetooth_definir_ligado(c, powered)
+        })
+    }
+
+    #[zbus(name = "BluetoothConnect")]
+    fn bluetooth_connect(&self, addr: String) -> String {
+        self.acao_sistema("BluetoothChanged", backends::bluetooth_estado, move |c| {
+            backends::bluetooth_conectar(c, &addr)
+        })
+    }
+
+    #[zbus(name = "BluetoothDisconnect")]
+    fn bluetooth_disconnect(&self, addr: String) -> String {
+        self.acao_sistema("BluetoothChanged", backends::bluetooth_estado, move |c| {
+            backends::bluetooth_desconectar(c, &addr)
+        })
+    }
+
+    // ---------- Não perturbe ----------
+
+    #[zbus(name = "GetDnd")]
+    fn get_dnd(&self) -> bool {
+        self.estado.lock().unwrap().modos.contains("dnd")
+    }
+
+    /// Liga/desliga o modo `dnd` e devolve o estado que ficou (emite `DndChanged` e `NotificationEvent("modes")`).
+    #[zbus(name = "SetDnd")]
+    fn set_dnd(&self, enabled: bool) -> bool {
+        self.definir_dnd(enabled);
+        self.estado.lock().unwrap().modos.contains("dnd")
+    }
+
     #[zbus(signal, name = "NotificationEvent")]
     async fn notification_event(
         emitter: &SignalEmitter<'_>,
@@ -2149,8 +2464,20 @@ impl ServicoControleHermes {
         payload_json: &str,
     ) -> zbus::Result<()>;
 
+    /// Estado completo do áudio (JSON de `ListSinks`/`ListSources` juntos: `{"sinks":[..],"sources":[..]}`).
     #[zbus(signal, name = "AudioChanged")]
-    async fn audio_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+    async fn audio_changed(emitter: &SignalEmitter<'_>, state_json: &str) -> zbus::Result<()>;
+
+    /// Mesmo JSON de `GetWifi`.
+    #[zbus(signal, name = "WifiChanged")]
+    async fn wifi_changed(emitter: &SignalEmitter<'_>, state_json: &str) -> zbus::Result<()>;
+
+    /// Mesmo JSON de `GetBluetooth`.
+    #[zbus(signal, name = "BluetoothChanged")]
+    async fn bluetooth_changed(emitter: &SignalEmitter<'_>, state_json: &str) -> zbus::Result<()>;
+
+    #[zbus(signal, name = "DndChanged")]
+    async fn dnd_changed(emitter: &SignalEmitter<'_>, enabled: bool) -> zbus::Result<()>;
 }
 
 // ---------------- Threads de Timers e Monitoramento por Eventos (0% CPU parado) ----------------
@@ -2282,17 +2609,18 @@ fn laco_audio_eventos(estado: Arc<Mutex<EstadoHermes>>, conn_sessao: DbusConn) {
                         && ultimo_disparo.elapsed() >= Duration::from_millis(40) {
                             ultimo_disparo = Instant::now();
                             let novo = coletar_audio_atual();
-                            {
+                            let js = novo.compacto();
+                            let txt = js.to_string();
+                            let mudou = {
                                 let mut est = estado.lock().unwrap();
                                 est.audio = novo;
+                                let mudou = est.audio_json_emitido != txt;
+                                est.audio_json_emitido = txt;
+                                mudou
+                            };
+                            if mudou {
+                                emitir_audio_changed(&conn_sessao, &js);
                             }
-                            let _ = conn_sessao.emit_signal(
-                                None::<&str>,
-                                CAMINHO_NOTIF,
-                                NOME_HERMES,
-                                "AudioChanged",
-                                &(),
-                            );
                         }
                 }
             }
@@ -2303,12 +2631,13 @@ fn laco_audio_eventos(estado: Arc<Mutex<EstadoHermes>>, conn_sessao: DbusConn) {
 }
 
 /// Monitora sinais D-Bus do `org.bluez` e `org.freedesktop.NetworkManager` no barramento do sistema.
-fn laco_sistema_dbus(estado: Arc<Mutex<EstadoHermes>>) {
+fn laco_sistema_dbus(estado: Arc<Mutex<EstadoHermes>>, conn_sessao: DbusConn) {
     let Ok(sys_conn) = DbusConn::system() else {
         return;
     };
     for regra in [
         "type='signal',path='/org/freedesktop/NetworkManager',interface='org.freedesktop.DBus.Properties'",
+        "type='signal',path_namespace='/org/freedesktop/NetworkManager/Devices',interface='org.freedesktop.DBus.Properties'",
         "type='signal',path_namespace='/org/bluez'",
     ] {
         let _ = sys_conn.call_method(
@@ -2321,26 +2650,55 @@ fn laco_sistema_dbus(estado: Arc<Mutex<EstadoHermes>>) {
     }
     let iter = zbus::blocking::MessageIterator::from(&sys_conn);
 
+    // Último JSON emitido de cada um: só emite de novo quando o estado REALMENTE mudou (o BlueZ e o NM
+    // disparam PropertiesChanged para RSSI, varreduras etc. que não mudam nada do que a UI mostra).
+    let mut ultimo_bt = String::new();
+    let mut ultimo_wifi = String::new();
+
     for msg_res in iter {
         let Ok(msg) = msg_res else {
             continue;
         };
         let hdr = msg.header();
+        if hdr.message_type() != zbus::message::Type::Signal {
+            continue;
+        }
         let path = hdr.path().map(|p| p.as_str()).unwrap_or("");
 
         if path.starts_with("/org/bluez") {
             let bt = consultar_bluetooth_dbus(&sys_conn);
-            let mut est = estado.lock().unwrap();
-            est.bluetooth = bt;
-        } else if path == "/org/freedesktop/NetworkManager" {
+            {
+                let mut est = estado.lock().unwrap();
+                est.bluetooth = bt;
+            }
+            let js = backends::bluetooth_estado(&sys_conn);
+            let txt = js.to_string();
+            if txt != ultimo_bt {
+                ultimo_bt = txt;
+                emitir_estado(&conn_sessao, "BluetoothChanged", &js);
+            }
+        } else if path.starts_with("/org/freedesktop/NetworkManager") {
             let wf = consultar_wifi_dbus(&sys_conn);
-            let mut est = estado.lock().unwrap();
-            est.wifi = wf;
+            {
+                let mut est = estado.lock().unwrap();
+                est.wifi = wf;
+            }
+            let js = backends::wifi_estado(&sys_conn);
+            let txt = js.to_string();
+            if txt != ultimo_wifi {
+                ultimo_wifi = txt;
+                emitir_estado(&conn_sessao, "WifiChanged", &js);
+            }
         }
     }
 }
 
 fn main() {
+    if env::args().any(|a| a == "--teste") {
+        // Instância de teste: outro nome de barramento, sem assumir org.freedesktop.Notifications nem
+        // mexer no som.py — roda ao lado do hermesd real (ou num `dbus-run-session`).
+        let _ = NOME_BUS.set(format!("{NOME_HERMES}.Teste"));
+    }
     let config = ler_config();
     let (tx_timer, rx_timer) = mpsc::channel();
 
@@ -2359,7 +2717,6 @@ fn main() {
         .as_ref()
         .map(consultar_wifi_dbus)
         .unwrap_or_default();
-    drop(conn_sistema);
 
     let mut estado_ini = EstadoHermes {
         config,
@@ -2369,6 +2726,7 @@ fn main() {
         taxa: HashMap::new(),
         modos,
         audio: audio_ini,
+        audio_json_emitido: String::new(),
         bluetooth: bt_ini,
         wifi: wifi_ini,
         tx_timer,
@@ -2384,18 +2742,32 @@ fn main() {
     };
     let srv_ctl = ServicoControleHermes {
         estado: Arc::clone(&estado),
+        sessao: conn_sessao.clone(),
+        sistema: conn_sistema,
     };
 
-    conn_sessao
-        .object_server()
-        .at(CAMINHO_NOTIF, srv_notif)
-        .expect("hermesd: falha ao registrar org.freedesktop.Notifications");
+    if !modo_teste() {
+        conn_sessao
+            .object_server()
+            .at(CAMINHO_NOTIF, srv_notif)
+            .expect("hermesd: falha ao registrar org.freedesktop.Notifications");
+    }
     conn_sessao
         .object_server()
         .at(CAMINHO_NOTIF, srv_ctl)
         .expect("hermesd: falha ao registrar com.aero.Hermes");
 
-    let tinha_dono_py = conn_sessao
+    if modo_teste() {
+        conn_sessao
+            .request_name_with_flags(
+                WellKnownName::try_from(nome_bus()).expect("hermesd: nome de teste inválido"),
+                RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting,
+            )
+            .expect("hermesd: falha ao assumir o nome de teste");
+        eprintln!("hermesd: modo de teste em {}", nome_bus());
+    }
+
+    let tinha_dono_py = !modo_teste() && conn_sessao
         .call_method(
             Some("org.freedesktop.DBus"),
             "/org/freedesktop/DBus",
@@ -2407,21 +2779,24 @@ fn main() {
         .and_then(|m| m.body().deserialize::<bool>().ok())
         .unwrap_or(false);
 
-    conn_sessao
-        .request_name_with_flags(
-            WellKnownName::from_static_str_unchecked(NOME_NOTIF),
-            RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting,
-        )
-        .expect("hermesd: falha ao assumir org.freedesktop.Notifications");
+    if !modo_teste() {
+        conn_sessao
+            .request_name_with_flags(
+                WellKnownName::from_static_str_unchecked(NOME_NOTIF),
+                RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting,
+            )
+            .expect("hermesd: falha ao assumir org.freedesktop.Notifications");
 
-    conn_sessao
-        .request_name_with_flags(
-            WellKnownName::from_static_str_unchecked(NOME_HERMES),
-            RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting,
-        )
-        .expect("hermesd: falha ao assumir com.aero.Hermes");
+        conn_sessao
+            .request_name_with_flags(
+                WellKnownName::from_static_str_unchecked(NOME_HERMES),
+                RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting,
+            )
+            .expect("hermesd: falha ao assumir com.aero.Hermes");
+    }
 
     let conn_som = conn_sessao.clone();
+    if !modo_teste() {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
         if tinha_dono_py {
@@ -2465,6 +2840,7 @@ fn main() {
                 .spawn();
         }
     });
+    }
 
     let est_timer = Arc::clone(&estado);
     let conn_timer = conn_sessao.clone();
@@ -2481,9 +2857,10 @@ fn main() {
         .expect("hermesd: falha ao criar thread de áudio");
 
     let est_sys = Arc::clone(&estado);
+    let conn_sys_sinais = conn_sessao.clone();
     thread::Builder::new()
         .name("hestia-sysbus".to_string())
-        .spawn(move || laco_sistema_dbus(est_sys))
+        .spawn(move || laco_sistema_dbus(est_sys, conn_sys_sinais))
         .expect("hermesd: falha ao criar thread do system bus");
 
     // A thread principal dorme indefinidamente (o zbus processa mensagens nas suas threads internas
