@@ -16,11 +16,21 @@
 //!   `~/.config/hypr/painel.conf`, `~/.config/dconf/user` e `~/.cache/hypr-tema/tema`.
 //! - **Socket do compositor (`trait Compositor`)**: janelas abertas/fechadas, monitores/reload e
 //!   troca de área de trabalho (`workspacev2`).
+//!
+//! 4. **Serviço D-Bus `com.aero.Sessiond`** (`servico.rs`, documentado em `daemons/API.md`): tema
+//!    claro/escuro em Rust puro (`tema.rs`, sem scripts `hypr-*`), brilho interno/externo (`brilho.rs`),
+//!    modo de energia (`perfil.rs`) e ociosidade (`ocioso.rs`, inerte sem `idle_nativo` em `sessao.json`).
 
 mod bateria;
+mod brilho;
 mod compositor;
 mod icones;
+mod ocioso;
+mod perfil;
+mod servico;
+mod sessao;
 mod taxa;
+mod tema;
 
 use compositor::{EventoCompositor, obter_compositor};
 use std::env;
@@ -40,6 +50,8 @@ enum EventoSessao {
     ConfigEnergiaMudou,
     /// Arquivo `taxa.json` foi modificado.
     ConfigTaxaMudou,
+    /// Arquivo `sessao.json` (serviço D-Bus: tema automático, ociosidade) foi modificado.
+    ConfigSessaoMudou,
     /// Arquivos de paleta/ícones (`painel.conf`, `widgets.json`, esquema claro/escuro) mudaram.
     FontesIconesMudaram,
     /// Evento vindo do compositor (janela abriu/fechou, monitor/config, workspace).
@@ -194,6 +206,7 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
             let mut viu_energia = false;
             let mut viu_tomada_sim = false;
             let mut viu_taxa = false;
+            let mut viu_sessao = false;
             let mut viu_icones = false;
 
             while pos + std::mem::size_of::<libc::inotify_event>() <= total {
@@ -209,6 +222,7 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
                                 "energia.json" => viu_energia = true,
                                 ".simulacao_tomada" => viu_tomada_sim = true,
                                 "taxa.json" => viu_taxa = true,
+                                "sessao.json" => viu_sessao = true,
                                 "widgets.json" => viu_icones = true,
                                 _ => {}
                             }
@@ -231,6 +245,9 @@ fn iniciar_escuta_inotify(tx: Sender<EventoSessao>) {
             }
             if viu_taxa {
                 let _ = tx.send(EventoSessao::ConfigTaxaMudou);
+            }
+            if viu_sessao {
+                let _ = tx.send(EventoSessao::ConfigSessaoMudou);
             }
             if viu_icones {
                 let _ = tx.send(EventoSessao::FontesIconesMudaram);
@@ -286,6 +303,9 @@ fn rodar_daemon() {
     iniciar_escuta_inotify(tx.clone());
     compositor::iniciar_escuta(comp, tx, EventoSessao::Compositor);
 
+    // Serviço D-Bus com.aero.Sessiond (tema, brilho, modo de energia, ociosidade)
+    let servico_dbus = servico::iniciar(false);
+
     loop {
         let prazo = menor_prazo(
             menor_prazo(bat.proximo_prazo(), hz.proximo_prazo()),
@@ -324,6 +344,11 @@ fn rodar_daemon() {
                 bat.recarregar_padroes_jogo(&janelas);
                 bat.passo();
                 hz.recarregar(comp, &janelas);
+            }
+            Some(EventoSessao::ConfigSessaoMudou) => {
+                if let Some(s) = &servico_dbus {
+                    s.recarregar();
+                }
             }
             Some(EventoSessao::FontesIconesMudaram) => {
                 icn.invalidar_cache_tema();
@@ -382,6 +407,17 @@ fn cmd_somente_teste() {
     }
 }
 
+/// Só o serviço D-Bus, como `com.aero.Sessiond.Teste` (para testar ao lado do daemon real).
+fn cmd_dbus_teste() {
+    let Some(_srv) = servico::iniciar(true) else {
+        eprintln!("aero-sessiond: sem barramento de sessão");
+        std::process::exit(1);
+    };
+    loop {
+        thread::park();
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let arg1 = args.get(1).map(String::as_str).unwrap_or("");
@@ -394,6 +430,7 @@ fn main() {
     let comp = obter_compositor();
     match arg1 {
         "--somente-teste" => cmd_somente_teste(),
+        "--dbus-teste" => cmd_dbus_teste(),
         "--waybar" => bateria::cmd_waybar(),
         "--alternar" => bateria::cmd_alternar(),
         "--cheia" => bateria::cmd_cheia(),

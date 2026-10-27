@@ -456,7 +456,7 @@ impl DaimonCompositor {
     }
 
     /// Envia um comando JSON ao socket do Daimon e devolve a resposta JSON.
-    fn pedir(cmd_json: &serde_json::Value) -> Option<serde_json::Value> {
+    pub fn pedir(cmd_json: &serde_json::Value) -> Option<serde_json::Value> {
         let sock = Self::socket()?;
         let mut stream = UnixStream::connect(sock).ok()?;
         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
