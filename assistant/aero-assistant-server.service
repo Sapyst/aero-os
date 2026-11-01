@@ -1,0 +1,8 @@
+[Unit]
+Description=Local model for Aero Assistant
+
+[Service]
+Slice=background.slice
+Environment=JANAS_GPU=0
+ExecStart=%h/.local/share/aero-assistant/janas/janas/janas-server %h/.local/share/aero-assistant/models/qwen3.6-35b-a3b-q4km.jns --host 127.0.0.1 --port 8791 --name aero --ctx 16384 --think off --no-web --no-mcp --no-store --keep 2 --keep-disk 1 --cache 6 --no-gpu
+Restart=no

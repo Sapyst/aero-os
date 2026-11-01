@@ -1,0 +1,6 @@
+- Laptop: Ryzen AI 9 HX 370, 30 GB RAM, RTX 5070 Laptop 8 GB and Radeon 890M.
+- Arch Linux with Hyprland and the AeroOS desktop. Bar, dock and notifications are AeroOS programs.
+- Disk C: NVMe, Btrfs, root and /home, with Snapper snapshots of root only. Disk D: NVMe, Btrfs, at /mnt/d.
+- Swap: zram plus /swap/swapfile. /tmp is RAM, limited to 2 GB.
+- Audio: PipeWire. Files: ez-fm. Terminal: kitty.
+- Run background work with aero-bg. aero-build-clean removes stale Rust builds daily.

@@ -1,0 +1,18 @@
+[package]
+name = "aero-assistant"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Local Arch Linux assistant for AeroOS"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
