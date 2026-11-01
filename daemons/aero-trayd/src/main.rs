@@ -2651,8 +2651,10 @@ fn main() {
         }
 
         if (pfds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0 {
-            if guard.read().is_err() {
-                break;
+            if let Err(erro) = guard.read() {
+                // A lost connection is a failure, so the supervisor brings the tray back.
+                eprintln!("aero-trayd: lost the Wayland connection: {erro}");
+                std::process::exit(1);
             }
         } else {
             drop(guard);
