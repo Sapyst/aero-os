@@ -12,4 +12,6 @@ fi
 gdbus call --session --dest com.aero.Clipboard --object-path /com/aero/Clipboard \
     --method org.gtk.Actions.Activate alternar '[]' '{}' >/dev/null 2>&1 && exit 0
 # Abre a janela sob demanda (sai da memória ao fechar)
+# Thumbnails are local files; going through gvfs can hang the window before it opens
+export GIO_USE_VFS=local
 exec python3 "$HOME/.local/share/aero-shell/clipboard.py" "$@"
