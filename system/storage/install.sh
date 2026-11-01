@@ -5,6 +5,7 @@ here=$(dirname "$(readlink -f "$0")")
 sudo install -Dm644 "$here/tmp.mount.conf" /etc/systemd/system/tmp.mount.d/aero-storage.conf
 sudo systemctl daemon-reload
 install -Dm644 "$here/aero-temp.conf" "$HOME/.config/user-tmpfiles.d/aero-temp.conf"
+install -Dm644 "$here/aero-temp.env" "$HOME/.config/environment.d/aero-temp.conf"
 install -Dm644 "$here/background.slice.conf" "$HOME/.config/systemd/user/background.slice.d/aero.conf"
 install -Dm755 "$here/aero-bg" "$HOME/.local/bin/aero-bg"
 install -Dm755 "$here/aero-build-clean" "$HOME/.local/bin/aero-build-clean"

@@ -10,7 +10,7 @@ No daemon: only systemd rules, so this uses no memory while idle.
 
 Run `aero-bg <command>` to start work at background priority.
 
-`/tmp/claude-<uid>` becomes a link to the SSD at login, once `/tmp` is empty after a reboot.
+Claude Code keeps its scratch files on the SSD through `CLAUDE_CODE_TMPDIR`, set at login. Do not link `/tmp/claude-<uid>`: Claude Code refuses a symlink there and will not start.
 
 Install with `./install.sh`.
 
