@@ -1,0 +1,16 @@
+[Unit]
+Description=Remove stale Rust build artifacts
+ConditionACPower=true
+ConditionCPUPressure=15%
+ConditionIOPressure=15%
+
+[Service]
+Slice=background.slice
+Type=oneshot
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+CPUWeight=idle
+IOWeight=1
+MemoryHigh=256M
+ExecStart=%h/.local/bin/aero-build-clean --apply

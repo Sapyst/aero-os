@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs a command at background priority: aero-bg cargo build
+exec systemd-run --user --scope --quiet --slice=background.slice -- "$@"

@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Removes stale Rust build artifacts, keeping each project's latest build.
+
+Dry run by default; --apply deletes. Only touches folders with Cargo's
+CACHEDIR.TAG. An old variant of a dependency goes only when a newer one exists
+and the old one fell outside the latest build. Skips everything while Cargo
+runs, and any target holding a running program.
+
+To stay light it remembers its target list, searches for new ones weekly and
+opens a target only if it built since the last cleanup. --all ignores that.
+"""
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+ROOTS = [HOME / "Projects", Path("/mnt/d/Projetos"), HOME / ".cache"]
+SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
+STATE = HOME / ".cache" / "aero-build-clean.json"
+SEARCH_EVERY = 7 * 24 * 3600
+MAX_DEPTH = 6
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "site-packages", "__pycache__", ".godot", ".gradle"}
+WINDOW = 24 * 3600  # artifacts up to a day older than the last build count as that build
+HASH = re.compile(r"^(?:lib)?(.+)-([0-9a-f]{16})(?:\.[^/]*)?$")
+SECTIONS = ("deps", "build", ".fingerprint", "incremental")
+
+
+def processes():
+    names, exes = set(), []
+    for p in Path("/proc").iterdir():
+        if p.name.isdigit():
+            try:
+                names.add((p / "comm").read_text().strip())
+                exes.append(os.readlink(p / "exe"))
+            except OSError:
+                pass
+    return names, exes
+
+
+def find_targets():
+    found = []
+    for root in ROOTS:
+        if not root.is_dir():
+            continue
+        base = len(root.parts)
+        for current, dirs, files in os.walk(root):
+            if "CACHEDIR.TAG" in files:
+                dirs[:] = []
+                try:
+                    if SIGNATURE in Path(current, "CACHEDIR.TAG").read_text():
+                        found.append(current)
+                except OSError:
+                    pass
+            elif len(Path(current).parts) - base >= MAX_DEPTH:
+                dirs[:] = []
+            else:
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+    return found
+
+
+def read_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {"search": 0, "cleaned": {}}
+
+
+def built_at(target):
+    # Adding or removing artifacts changes deps/'s mtime, so one stat per profile is enough.
+    return max((os.stat(profile / "deps").st_mtime for profile in profiles(target)), default=0)
+
+
+def profiles(target):
+    for folder in [target] + [d for d in target.iterdir() if d.is_dir()]:
+        for entry in folder.iterdir() if folder.is_dir() else []:
+            if entry.is_dir() and (entry / "deps").is_dir():
+                yield entry
+
+
+def mtime_of(path):
+    if path.is_dir():
+        with os.scandir(path) as it:
+            return max((e.stat(follow_symlinks=False).st_mtime for e in it), default=path.stat().st_mtime)
+    return path.stat().st_mtime
+
+
+def size_of(path):
+    if path.is_dir():
+        total = 0
+        for current, _, files in os.walk(path):
+            for a in files:
+                try:
+                    total += os.lstat(os.path.join(current, a)).st_size
+                except OSError:
+                    pass
+        return total
+    return path.lstat().st_size
+
+
+def stale(profile):
+    groups = {}
+    latest = 0
+    for section in SECTIONS:
+        folder = profile / section
+        if not folder.is_dir():
+            continue
+        for item in folder.iterdir():
+            m = HASH.match(item.name)
+            if not m:
+                continue
+            t = mtime_of(item)
+            latest = max(latest, t)
+            groups.setdefault((section, m.group(1)), {}).setdefault(m.group(2), []).append((item, t))
+    cutoff = latest - WINDOW
+    for variants in groups.values():
+        newest = {h: max(t for _, t in items) for h, items in variants.items()}
+        if len(newest) < 2:
+            continue
+        freshest = max(newest.values())
+        for h, items in variants.items():
+            if newest[h] < cutoff and newest[h] < freshest:
+                yield from (i for i, _ in items)
+
+
+def main():
+    apply = "--apply" in sys.argv
+    scan_all = "--all" in sys.argv or not apply
+    state = read_state()
+    now = time.time()
+    if scan_all or now - state.get("search", 0) > SEARCH_EVERY:
+        state["targets"] = find_targets()
+        state["search"] = now
+    cleaned = state.get("cleaned", {})
+    pending = []
+    for path in state.get("targets", []):
+        target = Path(path)
+        if not target.is_dir():
+            cleaned.pop(path, None)
+            continue
+        built = built_at(target)
+        if scan_all or built > cleaned.get(path, 0):
+            pending.append(target)
+    total = 0
+    if pending:
+        names, exes = processes()
+        if names & {"cargo", "rustc"}:
+            print("Cargo is running; nothing done.")
+            return
+        for target in pending:
+            if any(e.startswith(f"{target}/") for e in exes):
+                print(f"skipped, program in use: {target}")
+                continue
+            gain = 0
+            for profile in profiles(target):
+                for item in stale(profile):
+                    gain += size_of(item)
+                    if apply:
+                        if item.is_dir() and not item.is_symlink():
+                            shutil.rmtree(item, ignore_errors=True)
+                        else:
+                            item.unlink(missing_ok=True)
+            if apply:
+                cleaned[str(target)] = built_at(target)
+            total += gain
+            if gain:
+                print(f"{gain / 2**30:7.2f} GB  {target}")
+    if apply:
+        state["cleaned"] = cleaned
+        STATE.write_text(json.dumps(state))
+    verb = "freed" if apply else "would be freed"
+    print(f"{time.strftime('%F %T')}: {len(pending)} targets opened, {total / 2**30:.2f} GB {verb}")
+
+
+if __name__ == "__main__":
+    main()
