@@ -756,19 +756,12 @@ fn buscar_layout_menu(conn: &DbusConn, servico: &str, caminho_menu: &str) -> Vec
     ) else {
         return Vec::new();
     };
-    let Ok(corpo) = msg.body().deserialize::<(u32, OwnedValue)>() else {
+    // The reply is (u(ia{sv}av)): the layout is a plain structure, not a variant.
+    type Layout = (i32, std::collections::HashMap<String, OwnedValue>, Vec<OwnedValue>);
+    let Ok((_, (_, _, filhos))) = msg.body().deserialize::<(u32, Layout)>() else {
         return Vec::new();
     };
-    let raiz: &Value<'_> = &corpo.1;
-    if let Value::Structure(s) = raiz {
-        let campos = s.fields();
-        if campos.len() >= 3 {
-            if let Value::Array(ref arr) = campos[2] {
-                return converter_filhos_dbusmenu(arr.iter());
-            }
-        }
-    }
-    Vec::new()
+    converter_filhos_dbusmenu(filhos.iter().map(|v| &**v))
 }
 
 // ---------------- Fallback de abrir aplicativo (.desktop) ----------------
@@ -2670,5 +2663,24 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_live {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn reads_a_real_menu() {
+        let conn = DbusConn::session().unwrap();
+        let service = std::env::var("MENU_SERVICE").unwrap();
+        let linhas = buscar_layout_menu(&conn, &service, "/com/canonical/dbusmenu");
+        println!("rows={}", linhas.len());
+        for l in &linhas {
+            if let LinhaMenu::Botao { rotulo, ativo, .. } = l {
+                println!("  {rotulo} enabled={ativo}");
+            }
+        }
+        assert!(!linhas.is_empty());
     }
 }
