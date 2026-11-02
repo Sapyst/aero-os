@@ -21,4 +21,8 @@ ExecStartPost=-/usr/bin/systemd-run --user --quiet --collect --unit=aero-assista
 ExecStopPost=-/usr/bin/systemctl --user stop aero-assistant-idle.timer
 EOF
 systemctl --user daemon-reload
+install -Dm644 models.json "$HOME/.local/share/aero-assistant/models.json"
+install -Dm755 gui/app.py "$HOME/.local/share/aero-assistant/gui/app.py"
+install -Dm644 com.aero.Assistant.desktop "$HOME/.local/share/applications/com.aero.Assistant.desktop"
+ln -sf "$HOME/.local/share/aero-assistant/gui/app.py" "$HOME/.local/bin/aero-assistant-app"
 "$HOME/.local/bin/aero-assistant" index

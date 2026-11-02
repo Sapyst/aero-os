@@ -1,0 +1,34 @@
+{
+  "engine": {
+    "name": "Janas",
+    "license": "GPL-3.0",
+    "version": "v2026.10.30.1",
+    "url": "https://github.com/prabanta-dev/janas/releases/download/v2026.10.30.1/janas-linux-x86_64.tar.gz",
+    "sha256": "db12a79d9c4c78a1cd81e63398f0fb06f47e7cd99243c3a1aadc909c862317bf",
+    "size": 26542137
+  },
+  "models": [
+    {
+      "name": "Qwen3.6-35B-A3B",
+      "file": "qwen3.6-35b-a3b-q4km.jns",
+      "url": "https://huggingface.co/prabanta-dev/Qwen3.6-35B-A3B-JNS/resolve/main/qwen3.6-35b-a3b-q4km.jns",
+      "sha256": "8feaeb66d93593b9876b564ca3878f2a9252e46b8d4e2d06caa4e19d43dc6464",
+      "size": 22285709312,
+      "memory_gb": 16,
+      "context": 16384,
+      "license": "Apache-2.0",
+      "tier": "Tested"
+    },
+    {
+      "name": "Qwen3-4B",
+      "file": "qwen3-4b-q4km.jns",
+      "url": "https://huggingface.co/prabanta-dev/Qwen3-4B-JNS/resolve/main/qwen3-4b-q4km.jns",
+      "sha256": "1cbd8ebfdf14aee05777f5278e655382f040cdedc21d282e93806fc8cf279fc5",
+      "size": 2497753088,
+      "memory_gb": 8,
+      "context": 8192,
+      "license": "Apache-2.0",
+      "tier": "Compatible"
+    }
+  ]
+}

@@ -355,6 +355,9 @@ fn propose_inner(args: &Value, opt: &Options) -> String {
         Ok(r) => r,
         Err(e) => return format!("REJECTED by the checker: {e}. Fix the command or tell the user why it cannot be done."),
     };
+    if tui::events_on() {
+        return approve_in_window(command, reason, &risk);
+    }
     if opt.no_exec || !io::stderr().is_terminal() {
         let tag = if matches!(risk, Risk::High(_)) { "high risk" } else { "normal" };
         eprintln!("\n[proposed, {tag}] {command}\n  {reason}");
@@ -374,6 +377,110 @@ fn propose_inner(args: &Value, opt: &Options) -> String {
     // The command owns the terminal, so pacman's questions and sudo's password stay visible.
     let code = Command::new("sh").arg("-c").arg(command).status().ok().and_then(|s| s.code()).unwrap_or(-1);
     format!("RAN, exit={code}")
+}
+
+/// Commands that ask questions or a password get a terminal; the rest run in the background.
+fn needs_terminal(command: &str) -> bool {
+    ["sudo", "pacman", "makepkg", "paru", "yay", "nano", "vim"].iter().any(|p| command.split_whitespace().any(|w| w == *p))
+}
+
+fn approve_in_window(command: &str, reason: &str, risk: &Risk) -> String {
+    let why = match risk {
+        Risk::High(w) => Some(w.clone()),
+        Risk::Normal => None,
+    };
+    tui::emit_event(json!({"type":"proposal","command":command,"reason":reason,"high":why.is_some(),"why":why}));
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).unwrap_or(0) == 0 {
+        return "NOT RUN: the window closed.".into();
+    }
+    let reply: Value = serde_json::from_str(answer.trim()).unwrap_or(json!({}));
+    let approved = match risk {
+        Risk::High(_) => reply["answer"] == "YES",
+        Risk::Normal => reply["answer"] == "yes",
+    };
+    if !approved {
+        tui::emit_event(json!({"type":"ran","ran":false}));
+        return "NOT RUN: the user declined.".into();
+    }
+    tui::status("Running the approved command");
+    let code = if needs_terminal(command) {
+        let file = data_dir().join(format!("exit-{}", std::process::id()));
+        let script = format!("{command}\necho $? > {f}\nprintf '\\nDone. Press Enter to close.'\nread _", f = quote(&file));
+        let _ = Command::new("kitty").args(["--class", "com.aero.Assistant.Terminal", "sh", "-c", &script]).stdin(Stdio::null()).status();
+        let code = fs::read_to_string(&file).ok().and_then(|t| t.trim().parse::<i32>().ok()).unwrap_or(-1);
+        let _ = fs::remove_file(&file);
+        code
+    } else {
+        Command::new("sh").arg("-c").arg(command).stdin(Stdio::null()).status().ok().and_then(|s| s.code()).unwrap_or(-1)
+    };
+    tui::emit_event(json!({"type":"ran","ran":true,"exit":code}));
+    format!("RAN, exit={code}")
+}
+
+/// Runs the model server chosen in model.conf.
+fn serve() -> ! {
+    use std::os::unix::process::CommandExt;
+    let dir = data_dir();
+    let conf = fs::read_to_string(config_path("model.conf")).unwrap_or_default();
+    let value = |key: &str| conf.lines().find_map(|l| l.strip_prefix(&format!("{key}=")).map(|v| v.trim().to_string()));
+    let file = value("file").unwrap_or_else(|| "qwen3.6-35b-a3b-q4km.jns".into());
+    let ctx = value("context").unwrap_or_else(|| "16384".into());
+    let model = dir.join("models").join(&file);
+    let error = Command::new(dir.join("janas/janas/janas-server"))
+        .arg(&model)
+        .args(["--host", "127.0.0.1", "--port", "8791", "--name", "aero", "--ctx", &ctx, "--think", "off", "--no-web", "--no-mcp", "--no-store", "--keep", "2", "--keep-disk", "1", "--cache", "6", "--no-gpu"])
+        .exec();
+    eprintln!("Could not start the model: {error}");
+    std::process::exit(1);
+}
+
+fn tools_allowed() -> bool {
+    !fs::read_to_string(config_path("model.conf")).unwrap_or_default().lines().any(|l| l.trim() == "tools=off")
+}
+
+/// The engine behind the graphical app: requests on stdin, reply text on stdout, tool lines on
+/// stderr, and structured events on file descriptor 3.
+fn events_mode(opt: &mut Options) {
+    tui::start_events();
+    let mut messages = base_messages();
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let request: Value = serde_json::from_str(line.trim()).unwrap_or(json!({}));
+        if request["type"] != "message" {
+            continue;
+        }
+        let text = request["text"].as_str().unwrap_or("").to_string();
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        tui::set_busy(true);
+        if !by_rule(&text, opt) {
+            let question = match request["cascade"].as_array().map(|c| (c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0))) {
+                Some((i, n)) => format!("(Queued request {i} of {n}. It was written while earlier requests ran, and comes after them.)\n{text}"),
+                None => text,
+            };
+            tui::status("Opening the model");
+            let result = ensure_server().and_then(|_| turn(&mut messages, &question, opt).map(|_| ()));
+            if let Err(e) = result {
+                if INTERRUPTED.swap(false, Ordering::SeqCst) {
+                    tui::emit_event(json!({"type":"interrupted"}));
+                } else {
+                    tui::emit_event(json!({"type":"error","text":e}));
+                }
+            }
+        }
+        tui::set_busy(false);
+        tui::emit_event(json!({"type":"done"}));
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        schedule_idle_stop();
+    }
+    if server_up() {
+        schedule_idle_stop();
+    }
 }
 
 fn call_tool(name: &str, args: &Value, opt: &Options) -> String {
@@ -477,7 +584,7 @@ fn chat(messages: &[Value], print: bool, allow_tools: bool) -> Result<Reply, Str
     if INTERRUPTED.load(Ordering::SeqCst) {
         return Err("Interrupted.".into());
     }
-    let body = json!({"model":"aero","messages":messages,"tools":tools(),"tool_choice":if allow_tools {"auto"} else {"none"},"stream":true,"stream_options":{"include_usage":true},"temperature":0.0,"max_tokens":900});
+    let body = json!({"model":"aero","messages":messages,"tools":tools(),"tool_choice":if allow_tools && tools_allowed() {"auto"} else {"none"},"stream":true,"stream_options":{"include_usage":true},"temperature":0.0,"max_tokens":900});
     tui::status("Reading the prompt");
     let resp = ureq::post(&format!("{API}/chat/completions")).timeout(Duration::from_secs(900)).send_json(body).map_err(|e| {
         if INTERRUPTED.load(Ordering::SeqCst) {
@@ -1019,6 +1126,14 @@ fn main() {
         } else {
             let _ = Command::new("systemctl").args(["--user", "stop", UNIT]).status();
         }
+        return;
+    }
+    if words.first().map(String::as_str) == Some("serve") {
+        serve();
+    }
+    if words.first().map(String::as_str) == Some("events") {
+        let mut events_opt = Options { log: None, no_exec: false };
+        events_mode(&mut events_opt);
         return;
     }
     if words.first().map(String::as_str) == Some("check-command") {

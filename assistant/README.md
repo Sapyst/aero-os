@@ -2,6 +2,7 @@
 
 A local Arch Linux assistant. `aero "request"` (also `-aero` and `aero-assistant`), or no arguments for a conversation.
 
+- **Window:** `aero-assistant-app` is a GTK front end on the same engine. It downloads the engine and a model only after consent; `models.json` lists them with their hashes.
 - **Rules first:** `triggers.conf` answers common requests with exact facts, without loading the model. Two word groups must match, and actions fire only on a command, never on a question.
 - **Model second:** anything else goes to Qwen3.6-35B on Janas, which reads the system through checked tools and the offline Arch Wiki. It closes after 5 idle minutes; `aero-assistant stop` closes it now.
 - **Nothing changes without a yes.** `src/guard.rs` lists what may run freely and checks each proposal.

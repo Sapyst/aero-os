@@ -38,6 +38,28 @@ unsafe extern "C" {
     fn ioctl(fd: i32, req: u64, arg: *mut WinSize) -> i32;
     fn poll(fds: *mut PollFd, n: u64, timeout: i32) -> i32;
     fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+}
+
+pub fn events_on() -> bool {
+    EVENTS.load(Ordering::SeqCst)
+}
+
+/// Sends one JSON line to a graphical front end on file descriptor 3.
+pub fn emit_event(event: serde_json::Value) {
+    if events_on() {
+        let line = format!("{event}\n");
+        unsafe {
+            write(3, line.as_ptr() as *const std::ffi::c_void, line.len());
+        }
+    }
+}
+
+/// Starts metrics for a front end, with no terminal screen.
+pub fn start_events() {
+    EVENTS.store(true, Ordering::SeqCst);
+    PAUSED.store(true, Ordering::SeqCst);
+    spawn(sampler);
 }
 
 pub enum Event {
@@ -69,6 +91,7 @@ struct State {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static FINISHED: AtomicBool = AtomicBool::new(false);
+static EVENTS: AtomicBool = AtomicBool::new(false);
 
 fn state() -> &'static Mutex<State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -189,6 +212,7 @@ fn apply_region(rows: u16) {
 }
 
 pub fn status(text: &str) {
+    emit_event(serde_json::json!({"type":"status","text":text}));
     if !active() {
         return;
     }
@@ -199,6 +223,7 @@ pub fn status(text: &str) {
 }
 
 pub fn set_busy(busy: bool) {
+    emit_event(serde_json::json!({"type":"busy","busy":busy}));
     if !active() {
         return;
     }
@@ -214,6 +239,7 @@ pub fn set_busy(busy: bool) {
 }
 
 pub fn add_token() {
+    emit_event(serde_json::json!({"type":"token"}));
     if !active() {
         return;
     }
@@ -223,6 +249,7 @@ pub fn add_token() {
 }
 
 pub fn set_context(used: u64) {
+    emit_event(serde_json::json!({"type":"context","used":used}));
     if let Ok(mut s) = state().lock() {
         s.context = Some(used);
     }
@@ -502,8 +529,18 @@ fn sampler() {
             s.hardware = hardware;
             s.process_rows = process_rows;
             s.total_row = total_row;
-            s.hardware_row = hardware_row;
+            s.hardware_row = hardware_row.clone();
         }
+        emit_event(serde_json::json!({
+            "type":"metrics",
+            "rows":[
+                {"name":"assistant","pid":me,"memory":human(own_kb),"cpu":format!("{own_cpu:.0}%")},
+                {"name":"model","pid":model_pid,"memory":if model {human(model_kb)} else {model_text.clone()},"cpu":format!("{model_cpu:.0}%")},
+                {"name":"tools","pid":0,"memory":human(tool_kb),"cpu":format!("{tool_cpu:.0}%"),"detail":tool_names.join(", ")},
+                {"name":"total","pid":0,"memory":human(own_kb + tool_kb + model_kb),"cpu":format!("{:.0}%",own_cpu + tool_cpu + model_cpu)}
+            ],
+            "hardware":hardware_row,
+        }));
         redraw();
     }
 }

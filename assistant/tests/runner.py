@@ -175,7 +175,7 @@ def check_daily_fact(answer: str, expectation: str) -> tuple[bool, str]:
         return False, "Answer missing brightness info"
 
     if "ip route" in expectation:
-        has_net = ("10.0.0.1" in answer or "wlp98s0" in answer or "default" in ans_lower or "gateway" in ans_lower)
+        has_net = ("default" in ans_lower or "gateway" in ans_lower)
         if has_net:
             return True, "Default route reported"
         return False, "Answer missing default route/gateway"

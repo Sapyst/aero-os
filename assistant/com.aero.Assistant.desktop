@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Aero Assistant
+Comment=Local Arch Linux assistant
+Exec=aero-assistant-app
+Icon=internet-chat
+Terminal=false
+Categories=System;Utility;
+StartupWMClass=com.aero.Assistant
