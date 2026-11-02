@@ -1,6 +1,7 @@
-//! Decides which commands may run: read-only tools without asking, proposals after checks.
-
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::fsinfo;
 
 fn has(argv: &[String], bad: &[&str]) -> Option<String> {
     argv.iter()
@@ -41,7 +42,7 @@ pub fn readonly(argv: &[String]) -> Result<Vec<String>, String> {
         "df" | "free" | "lsblk" | "findmnt" | "uname" | "uptime" | "lscpu" | "lspci" | "lsusb"
         | "ps" | "ss" | "sensors" | "which" | "whereis" | "whoami" | "id" | "date" | "stat" | "ls" | "file"
         | "wc" | "pgrep" | "zramctl" | "readlink" | "realpath" | "nproc" | "groups" | "printenv"
-        | "fc-list" | "lsmod" | "modinfo" | "vulkaninfo" | "glxinfo" | "inxi" | "tty" => {
+        | "fc-list" | "lsmod" | "modinfo" | "vulkaninfo" | "glxinfo" | "inxi" | "tty" | "getent" => {
             if exe == "ps" || exe == "ss" {
                 if let Some(a) = has(argv, &["-K", "--kill"]) {
                     return Err(format!("{a} is not allowed"));
@@ -400,17 +401,526 @@ pub fn normalize(command: &str) -> String {
         .join(" && ")
 }
 
+#[derive(Clone, Debug)]
+enum ShToken {
+    Word(String, bool),
+    Op(String),
+}
+
+fn tokenize(cmd: &str) -> Result<Vec<ShToken>, String> {
+    let mut tokens = vec![];
+    let mut chars = cmd.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == ';' || c == '&' || c == '|' {
+            chars.next();
+            if (c == '&' && chars.peek() == Some(&'&')) || (c == '|' && chars.peek() == Some(&'|')) {
+                chars.next();
+                tokens.push(ShToken::Op(format!("{c}{c}")));
+            } else {
+                tokens.push(ShToken::Op(c.to_string()));
+            }
+            continue;
+        }
+        let mut word = String::new();
+        let mut is_pure_single = false;
+        let mut parts = 0;
+        while let Some(&ch) = chars.peek() {
+            if ch.is_whitespace() || ch == ';' || ch == '&' || ch == '|' {
+                break;
+            }
+            chars.next();
+            parts += 1;
+            if ch == '\'' {
+                let mut lit = String::new();
+                let mut closed = false;
+                for sc in chars.by_ref() {
+                    if sc == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    lit.push(sc);
+                }
+                if !closed {
+                    return Err("unclosed single quote in command".into());
+                }
+                word.push_str(&lit);
+                if parts == 1 && chars.peek().map_or(true, |nc| nc.is_whitespace() || *nc == ';' || *nc == '&' || *nc == '|') {
+                    is_pure_single = true;
+                }
+            } else if ch == '"' {
+                let mut closed = false;
+                while let Some(dc) = chars.next() {
+                    if dc == '"' {
+                        closed = true;
+                        break;
+                    } else if dc == '\\' {
+                        if let Some(esc) = chars.next() {
+                            word.push(esc);
+                        }
+                    } else {
+                        word.push(dc);
+                    }
+                }
+                if !closed {
+                    return Err("unclosed double quote in command".into());
+                }
+            } else if ch == '\\' {
+                if let Some(esc) = chars.next() {
+                    word.push(esc);
+                }
+            } else {
+                word.push(ch);
+            }
+        }
+        tokens.push(ShToken::Word(word, is_pure_single));
+    }
+    Ok(tokens)
+}
+
+fn pattern_matches(pat: &str, s: &str) -> bool {
+    let (p_bytes, s_bytes) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0, 0);
+    let (mut p_star, mut s_star) = (None, 0);
+    while si < s_bytes.len() {
+        if pi < p_bytes.len() && (p_bytes[pi] == b'?' || p_bytes[pi] == s_bytes[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p_bytes.len() && p_bytes[pi] == b'*' {
+            p_star = Some(pi);
+            pi += 1;
+            s_star = si;
+        } else if let Some(star) = p_star {
+            pi = star + 1;
+            s_star += 1;
+            si = s_star;
+        } else {
+            return false;
+        }
+    }
+    while pi < p_bytes.len() && p_bytes[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p_bytes.len()
+}
+
+fn expand_word(word: &str, is_literal: bool, cwd: &Path) -> Result<String, String> {
+    if is_literal {
+        return Ok(word.to_string());
+    }
+    if word.contains('`') || word.contains("$(") || word.contains("${(") {
+        return Err(format!("command substitution in '{word}' cannot be resolved with certainty"));
+    }
+    let home = fsinfo::home();
+    let mut out = String::new();
+    let mut chars = word.chars().peekable();
+
+    if chars.peek() == Some(&'~') {
+        chars.next();
+        let mut user = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '/' {
+                break;
+            }
+            user.push(c);
+            chars.next();
+        }
+        if user.is_empty() {
+            out.push_str(&home);
+        } else {
+            match fsinfo::user_home(&user) {
+                Some(uh) => out.push_str(&uh),
+                None => return Err(format!("user '~{user}' cannot be resolved with certainty")),
+            }
+        }
+    }
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let mut var_name = String::new();
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                for vc in chars.by_ref() {
+                    if vc == '}' {
+                        break;
+                    }
+                    var_name.push(vc);
+                }
+            } else {
+                while let Some(&vc) = chars.peek() {
+                    if vc.is_alphanumeric() || vc == '_' {
+                        var_name.push(vc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if var_name.is_empty() {
+                out.push('$');
+            } else {
+                match var_name.as_str() {
+                    "HOME" => out.push_str(&home),
+                    "USER" => out.push_str(&fsinfo::user_name(fsinfo::uid())),
+                    "UID" => out.push_str(&fsinfo::uid().to_string()),
+                    "PWD" => out.push_str(&cwd.to_string_lossy()),
+                    other => {
+                        if let Ok(val) = std::env::var(other) {
+                            out.push_str(&val);
+                        } else {
+                            return Err(format!("environment variable '${other}' cannot be resolved with certainty"));
+                        }
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_targets(raw_path: &str, is_literal: bool, cwd: &Path) -> Result<Vec<PathBuf>, String> {
+    let expanded = expand_word(raw_path, is_literal, cwd)?;
+    let full = if Path::new(&expanded).is_relative() {
+        cwd.join(&expanded)
+    } else {
+        PathBuf::from(&expanded)
+    };
+    let clean = fsinfo::clean_path(&full);
+    let s = clean.to_string_lossy().to_string();
+    let home = fsinfo::home();
+
+    if !is_literal && (expanded.contains('*') || expanded.contains('?') || expanded.contains('[')) {
+        if s.starts_with("/tmp/claude-") || s == "/tmp/claude*" || s == "/tmp/claude" {
+            return Err(format!("glob '{s}' targets protected /tmp/claude-*"));
+        }
+        if !home.is_empty() && (s == format!("{home}/.claude*") || s.starts_with(&format!("{home}/.claude/")) || s == format!("{home}/.claude")) {
+            return Err(format!("glob '{s}' targets protected ~/.claude"));
+        }
+        if s == "/*" || s == "/.*" || s == "/*/*" {
+            return Err(format!("glob '{s}' targets root system directories"));
+        }
+        if s == "/home/*" || s == "/home/.*" || s == "/home/*/*" {
+            return Err(format!("glob '{s}' targets home folders"));
+        }
+        if !home.is_empty() && (s == format!("{home}/*") || s == format!("{home}/.*") || s == format!("{home}/*/*")) {
+            return Err(format!("glob '{s}' targets all top-level folders of $HOME"));
+        }
+        if s == "/mnt/d/*" || s == "/mnt/d/.*" || s == "/mnt/d/*/*" {
+            return Err(format!("glob '{s}' targets all top-level folders of /mnt/d"));
+        }
+        if s == "/etc/*" || s == "/usr/*" || s == "/boot/*" || s == "/var/*" {
+            return Err(format!("glob '{s}' targets protected system directories"));
+        }
+
+        let comps: Vec<&str> = expanded.split('/').collect();
+        let mut candidates = if expanded.starts_with('/') {
+            vec![PathBuf::from("/")]
+        } else {
+            vec![cwd.to_path_buf()]
+        };
+        for comp in comps {
+            if comp.is_empty() {
+                continue;
+            }
+            if !comp.contains('*') && !comp.contains('?') && !comp.contains('[') {
+                candidates = candidates.into_iter().map(|c| c.join(comp)).collect();
+            } else {
+                let mut next = vec![];
+                for cand in candidates {
+                    if let Ok(entries) = fs::read_dir(&cand) {
+                        for e in entries.flatten() {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if pattern_matches(comp, &name) {
+                                next.push(cand.join(&name));
+                            }
+                        }
+                    }
+                }
+                candidates = next;
+            }
+        }
+        if candidates.is_empty() {
+            return Err(format!("glob '{expanded}' matches no files and cannot be resolved with certainty"));
+        }
+        return Ok(candidates.into_iter().map(|c| fsinfo::clean_path(&c)).collect());
+    }
+
+    Ok(vec![clean])
+}
+
+fn check_target_safety(p: &Path, is_recursive: bool) -> Result<(), String> {
+    let clean = fsinfo::clean_path(p);
+    let s = clean.to_string_lossy().to_string();
+    let home = fsinfo::home();
+
+    // 1. /tmp/claude-* and ~/.claude
+    if s.starts_with("/tmp/claude-") || s == "/tmp/claude" || s.starts_with("/tmp/claude/") {
+        return Err(format!("{s} is protected (/tmp/claude-*)"));
+    }
+    if !home.is_empty() && (s == format!("{home}/.claude") || fsinfo::is_within(&s, &format!("{home}/.claude"))) {
+        return Err(format!("{s} is protected (~/.claude)"));
+    }
+
+    // 2. Exact protected system directories and $HOME
+    if s == "/" || s == "/home" || s == "/etc" || s == "/usr" || s == "/boot" || s == "/var" {
+        return Err(format!("{s} is a protected system directory"));
+    }
+    if !home.is_empty() && s == home {
+        return Err(format!("{s} is the user home directory"));
+    }
+
+    // 3. Top-level folder of $HOME or /mnt/d
+    if !home.is_empty() && clean.parent() == Some(Path::new(&home)) && s != home {
+        let is_dir = clean.is_dir() || is_recursive || !clean.exists();
+        if is_dir {
+            return Err(format!("{s} is a top-level folder of $HOME"));
+        }
+    }
+    if clean.parent() == Some(Path::new("/mnt/d")) && s != "/mnt/d" {
+        let is_dir = clean.is_dir() || is_recursive || !clean.exists();
+        if is_dir {
+            return Err(format!("{s} is a top-level folder of /mnt/d"));
+        }
+    }
+
+    // 4. Mount points
+    let mounts = fsinfo::mounts();
+    if mounts.iter().any(|m| m.point == s) {
+        return Err(format!("{s} is a mount point"));
+    }
+
+    // 5. Symlinks
+    if let Ok(meta) = fs::symlink_metadata(&clean) {
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(&clean) {
+                let resolved_target = if target.is_relative() {
+                    fsinfo::clean_path(&clean.parent().unwrap_or(Path::new("/")).join(target))
+                } else {
+                    fsinfo::clean_path(&target)
+                };
+                check_target_safety(&resolved_target, is_recursive)?;
+            }
+        }
+    }
+    if let Ok(canon) = fs::canonicalize(&clean) {
+        if canon != clean {
+            check_target_safety(&canon, is_recursive)?;
+        }
+    }
+
+    // 6. Running processes using the path
+    let (uses, _) = fsinfo::process_uses();
+    for u in &uses {
+        if u.path == s {
+            return Err(format!("running process '{}' (PID {}) uses {s} ({})", u.name, u.pid, u.how));
+        }
+        if (is_recursive || clean.is_dir()) && fsinfo::is_within(&u.path, &s) {
+            return Err(format!("running process '{}' (PID {}) uses {} inside {s}", u.name, u.pid, u.path));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_single_command(words: &[(String, bool)], cwd: &mut PathBuf, cwd_uncertain: &mut bool) -> Result<(), String> {
+    let mut w = words;
+    while let Some((word, _)) = w.first() {
+        if word == "sudo" || word == "env" || word.contains('=') {
+            w = &w[1..];
+        } else {
+            break;
+        }
+    }
+    while w.first().is_some_and(|(word, _)| word.starts_with('-')) {
+        w = &w[1..];
+    }
+    let Some((exe, _)) = w.first() else {
+        return Ok(());
+    };
+
+    if exe == "cd" {
+        if let Some((target, lit)) = w.get(1) {
+            match expand_word(target, *lit, cwd) {
+                Ok(expanded) => {
+                    let full = if Path::new(&expanded).is_relative() {
+                        cwd.join(&expanded)
+                    } else {
+                        PathBuf::from(&expanded)
+                    };
+                    *cwd = fsinfo::clean_path(&full);
+                }
+                Err(_) => {
+                    *cwd_uncertain = true;
+                }
+            }
+        } else {
+            *cwd = PathBuf::from(fsinfo::home());
+        }
+        return Ok(());
+    }
+
+    if ["sh", "bash", "zsh", "dash"].contains(&exe.as_str()) {
+        for (i, (arg, _)) in w.iter().enumerate() {
+            if arg == "-c" {
+                if let Some((script, _)) = w.get(i + 1) {
+                    check_command_chain(script, cwd)?;
+                } else {
+                    return Err("shell -c without command".into());
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if exe == "xargs" {
+        let rest: Vec<&str> = w.iter().skip(1).filter(|(a, _)| !a.starts_with('-')).map(|(a, _)| a.as_str()).collect();
+        if let Some(sub) = rest.first() {
+            if ["rm", "rmdir", "unlink", "shred"].contains(sub) {
+                return Err("xargs rm targets cannot be resolved with certainty".into());
+            }
+        }
+        return Ok(());
+    }
+
+    if exe == "find" {
+        let has_delete = w.iter().any(|(a, _)| a == "-delete" || a == "-exec" || a == "-execdir");
+        let runs_rm = w.iter().any(|(a, _)| a == "rm" || a == "rmdir" || a == "unlink" || a == "shred");
+        if has_delete && (w.iter().any(|(a, _)| a == "-delete") || runs_rm) {
+            let roots: Vec<&(String, bool)> = w.iter().skip(1).take_while(|(a, _)| !a.starts_with('-') && !a.starts_with('(')).collect();
+            if roots.is_empty() {
+                if *cwd_uncertain {
+                    return Err("find targets current working directory which is uncertain".into());
+                }
+                check_target_safety(cwd, true)?;
+            } else {
+                for (target, lit) in roots {
+                    if *cwd_uncertain && Path::new(target).is_relative() {
+                        return Err(format!("find target '{target}' has uncertain working directory"));
+                    }
+                    let paths = resolve_targets(target, *lit, cwd)?;
+                    for p in paths {
+                        check_target_safety(&p, true)?;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if ["rm", "rmdir", "unlink", "shred"].contains(&exe.as_str()) {
+        let is_recursive = exe == "rmdir" || w.iter().any(|(a, _)| a.starts_with('-') && (a.contains('r') || a.contains('R')));
+        let mut operands = vec![];
+        let mut past_double_dash = false;
+        for (arg, lit) in w.iter().skip(1) {
+            if past_double_dash {
+                operands.push((arg.clone(), *lit));
+            } else if arg == "--" {
+                past_double_dash = true;
+            } else if arg.starts_with('-') {
+                // flags like -rf, -f, --recursive
+            } else {
+                operands.push((arg.clone(), *lit));
+            }
+        }
+        if operands.is_empty() {
+            return Err("destructive command has no target path".into());
+        }
+        for (operand, lit) in operands {
+            if *cwd_uncertain && Path::new(&operand).is_relative() {
+                return Err(format!("target '{operand}' has uncertain working directory"));
+            }
+            let targets = resolve_targets(&operand, lit, cwd)?;
+            for t in targets {
+                check_target_safety(&t, is_recursive)?;
+            }
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+fn check_command_chain(cmd: &str, initial_cwd: &Path) -> Result<(), String> {
+    let tokens = tokenize(cmd)?;
+    let mut cwd = initial_cwd.to_path_buf();
+    let mut cwd_uncertain = false;
+
+    let mut current_words: Vec<(String, bool)> = vec![];
+    let mut idx = 0;
+    while idx <= tokens.len() {
+        let is_end = idx == tokens.len();
+        let is_op = !is_end && matches!(tokens[idx], ShToken::Op(_));
+        if is_end || is_op {
+            if !current_words.is_empty() {
+                check_single_command(&current_words, &mut cwd, &mut cwd_uncertain)?;
+                current_words.clear();
+            }
+        } else if let ShToken::Word(ref w, lit) = tokens[idx] {
+            current_words.push((w.clone(), lit));
+        }
+        idx += 1;
+    }
+    Ok(())
+}
+
+pub fn check_destructive_proposal(command: &str) -> Result<(), String> {
+    let initial_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(fsinfo::home()));
+    check_command_chain(command, &initial_cwd)
+}
+
+/// Commands that replace or lose data without looking destructive.
+fn overwrite_risk(compact: &str) -> Option<String> {
+    let mut rest = compact.to_string();
+    for harmless in ["2>&1", ">&2", "2>/dev/null", ">/dev/null", "> /dev/null", "echo 3 > /proc/sys/vm/drop_caches"] {
+        rest = rest.replace(harmless, "");
+    }
+    if rest.contains('>') {
+        return Some("this writes over a file with a redirect".into());
+    }
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let has = |w: &str| words.contains(&w);
+    let reason = if has("mv") && !words.iter().any(|w| *w == "-n" || *w == "--no-clobber") {
+        Some("mv can replace an existing target or move a whole folder")
+    } else if has("truncate") {
+        Some("truncate erases file contents")
+    } else if has("tee") {
+        Some("tee writes over a file")
+    } else if has("sed") && words.iter().any(|w| w.starts_with("-i") || *w == "--in-place") {
+        Some("sed -i edits a file in place")
+    } else if has("ln") && words.iter().any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('f') || *w == "--force") {
+        Some("ln -f replaces an existing file")
+    } else if has("cp") && (has("/dev/null") || !words.iter().any(|w| *w == "-n" || *w == "--no-clobber" || w.starts_with("--update"))) {
+        Some("cp can write over an existing file")
+    } else if has("git") && ((has("reset") && has("--hard")) || has("clean") || has("restore") || (has("checkout") && has("--"))) {
+        Some("this discards git work")
+    } else if has("trash") && has("--empty") {
+        Some("this empties the trash for good")
+    } else if has("systemctl") && !has("--user") && (has("stop") || has("disable")) {
+        Some("this stops a system service")
+    } else if has("crontab") && has("-r") {
+        Some("this removes all scheduled jobs")
+    } else {
+        None
+    };
+    reason.map(|r| format!("{r}, which can lose data or interrupt your work"))
+}
+
 /// Validates a proposal before it reaches the user, and rates its risk.
 pub fn proposal(command: &str) -> Result<Risk, String> {
     let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    let refused = ["rm -rf /", "rm -rf ~", "rm -fr /", ":(){", "> /dev/nvme", "> /dev/sd", "chmod -R 777 /", "chown -R / "];
+    let refused = [":(){", "> /dev/nvme", "> /dev/sd", "chmod -R 777 /", "chown -R / "];
     for bad in refused {
-        let hit = compact.contains(bad);
-        let only_subpath = bad == "rm -rf /" && compact.split("rm -rf /").nth(1).is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_alphanumeric()));
-        let home_subpath = bad == "rm -rf ~" && compact.split("rm -rf ~").nth(1).is_some_and(|rest| rest.starts_with('/') && rest.len() > 1);
-        if hit && !only_subpath && !home_subpath {
+        if compact.contains(bad) {
             return Err(format!("refused: {bad} destroys the system or the home folder"));
         }
+    }
+    if let Err(e) = check_destructive_proposal(command) {
+        return Err(format!("refused: {e}"));
     }
     for words in segments(command) {
         let mut w = words.as_slice();
@@ -445,6 +955,9 @@ pub fn proposal(command: &str) -> Result<Risk, String> {
             }
         }
     }
+    if let Some(why) = overwrite_risk(&compact) {
+        return Ok(Risk::High(why));
+    }
     if let Some(h) = high.iter().find(|h| compact.contains(**h)) {
         return Ok(Risk::High(format!("this includes `{}`, which can lose data or interrupt your work", h.trim())));
     }
@@ -457,7 +970,7 @@ mod tests {
     fn v(s: &str) -> Vec<String> { s.split_whitespace().map(String::from).collect() }
     #[test]
     fn readonly_allows_daily_commands() {
-        for c in ["df -h /", "free -h", "lsblk", "ps aux", "journalctl -b -p 3", "systemctl status bluetooth", "systemctl --user list-timers", "pacman -Qi linux", "pacman -Ss firefox", "pacman -Qdt", "ip addr", "ip route show", "nmcli device status", "wpctl status", "hyprctl monitors", "nvidia-smi", "sensors", "swapon --show", "find /etc -name *.pacnew", "btrfs filesystem df /", "bluetoothctl show", "uname -r", "du -sh /tmp"] {
+        for c in ["df -h /", "free -h", "lsblk", "ps aux", "journalctl -b -p 3", "systemctl status bluetooth", "systemctl --user list-timers", "pacman -Qi linux", "pacman -Ss firefox", "pacman -Qdt", "ip addr", "ip route show", "nmcli device status", "wpctl status", "hyprctl monitors", "nvidia-smi", "sensors", "swapon --show", "find /etc -name *.pacnew", "btrfs filesystem df /", "bluetoothctl show", "uname -r", "du -sh /tmp", "getent passwd nonexistentuser8888"] {
             assert!(readonly(&v(c)).is_ok(), "{c}");
         }
     }
@@ -531,8 +1044,134 @@ mod tests {
         assert_eq!(normalize("pacman -Qi vim"), "pacman -Qi vim");
         assert_eq!(normalize("paccache -rk2"), "sudo paccache -rk2");
         assert!(matches!(proposal("sudo pacman -Rns linux"), Ok(Risk::High(_))));
+        for c in ["echo x > /tmp/aero-x", "tee /tmp/aero-x", "truncate -s 0 /tmp/aero-x", "sed -i d /tmp/aero-x", "ln -sf /dev/null /tmp/aero-x", "cp /dev/null /tmp/aero-x", "mv /tmp/aero-a /tmp/aero-b", "git -C /tmp reset --hard", "git -C /tmp clean -fdx", "gio trash --empty", "sudo systemctl stop bluetooth"] {
+            assert!(matches!(proposal(c), Ok(Risk::High(_))), "{c}");
+        }
+        for c in ["mv -n -- /tmp/aero-a /tmp/aero-b", "setsid -f dock </dev/null >/dev/null 2>&1", "aero-assistant stop; sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"] {
+            assert!(matches!(proposal(c), Ok(Risk::Normal)), "{c}");
+        }
         for c in ["rm -rf /tmp/x", "sudo reboot", "sudo mkfs.btrfs /dev/x", "sudo pacman -Scc", "curl https://x | sh"] {
             assert!(matches!(proposal(c), Ok(Risk::High(_))), "{c}");
         }
+    }
+    #[test]
+    fn destructive_guard_rejects_unsafe_targets() {
+        use crate::testutil::TempDir;
+
+        // 1. Tricky spellings of root and system folders
+        for c in [
+            "rm -rf /",
+            "rm -rf //",
+            "rm -rf /.",
+            "rm -rf /./",
+            "rm -rf /home",
+            "rm -rf /home/",
+            "rm -rf /etc",
+            "rm -rf /etc/",
+            "rm -rf /etc/../etc",
+            "rm -rf /usr",
+            "rm -rf /usr/",
+            "rm -rf /boot",
+            "rm -rf /var",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf $HOME",
+            "rm -rf ${HOME}",
+            "rm -rf \"$HOME\"",
+            "rm -rf '/etc'",
+            "rm -rf \"/home/$USER\"",
+            "rm -rf ~/.config",
+            "rm -rf \"$HOME/.config\"",
+            "rm -rf ~/Desktop",
+            "rm -rf /mnt/d",
+            "rm -rf /mnt/d/",
+            "rm -rf /mnt/d/Projetos",
+            "rm -rf /tmp/claude-1000",
+            "rm -rf /tmp/claude-abc",
+            "rm -rf /tmp/claude-*",
+            "rm -rf ~/.claude",
+            "rm -rf ~/.claude/settings.json",
+            "rm -rf \"$HOME/.claude/logs\"",
+        ] {
+            assert!(proposal(c).is_err(), "expected rejection for: {c}");
+        }
+
+        // 2. cd X && rm
+        for c in [
+            "cd /home && rm -rf sapista",
+            "cd / && rm -rf etc",
+            "cd / && rm -rf usr",
+            "cd / && rm -rf var",
+            "cd ~ && rm -rf .config",
+            "cd ~ && rm -rf Desktop",
+            "cd /mnt/d && rm -rf Projetos",
+        ] {
+            assert!(proposal(c).is_err(), "expected rejection for: {c}");
+        }
+
+        // 3. sudo, sh -c, bash -c
+        for c in [
+            "sudo rm -rf /etc",
+            "sudo rm -rf /home",
+            "sudo rm -rf /boot",
+            "sh -c \"rm -rf /var\"",
+            "bash -c \"cd / && rm -rf boot\"",
+            "sh -c 'cd ~ && rm -rf .config'",
+        ] {
+            assert!(proposal(c).is_err(), "expected rejection for: {c}");
+        }
+
+        // 4. find -delete and xargs
+        for c in [
+            "find / -delete",
+            "find /etc -delete",
+            "find ~ -delete",
+            "find /mnt/d -delete",
+            "find /tmp/claude-1000 -delete",
+            "find ~/.claude -delete",
+            "find /etc -exec rm -rf {} +",
+            "echo /etc | xargs rm",
+            "find . | xargs rm -rf",
+            "xargs -I{} rm {}",
+        ] {
+            assert!(proposal(c).is_err(), "expected rejection for: {c}");
+        }
+
+        // 5. Dangerous globs and uncertain variables
+        for c in [
+            "rm -rf /*",
+            "rm -rf /home/*",
+            "rm -rf ~/*",
+            "rm -rf /mnt/d/*",
+            "rm -rf $UNKNOWN_VAR_XYZ_999",
+            "rm -rf $(whoami)",
+            "rm -rf `whoami`",
+        ] {
+            assert!(proposal(c).is_err(), "expected rejection for: {c}");
+        }
+
+        // 6. Symlinks pointing to protected targets
+        let t = TempDir::new("guard-symlink");
+        let link_etc = t.link("/etc", "link_to_etc");
+        let link_claude = t.link("/tmp/claude-1000", "link_to_claude");
+        assert!(proposal(&format!("rm -rf {}", link_etc.display())).is_err());
+        assert!(proposal(&format!("rm {}", link_claude.display())).is_err());
+
+        // 7. Running processes using the path
+        let t_proc = TempDir::new("guard-proc");
+        let proc_dir = t_proc.dir("active_dir");
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir(&proc_dir)
+            .spawn()
+            .expect("spawn test process");
+        // Give OS a moment to record proc cwd
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let res = proposal(&format!("rm -rf {}", proc_dir.display()));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(res.is_err(), "expected rejection for path used by active process");
     }
 }
