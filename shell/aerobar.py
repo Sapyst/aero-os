@@ -185,6 +185,7 @@ ICONES = {
     "gear":  ["...#...", ".#####.", ".##.##.", "###.###", ".##.##.", ".#####.", "...#..."],
     "grid":  ["##.##..", "##.##..", ".......", "##.##..", "##.##..", ".......", "......."],
     "min":   [".......", ".......", ".......", ".......", ".......", "#######", "#######"],
+    "mic":   ["..###..", "..###..", "..###..", ".#####.", "...#...", "..###..", "......."],
 }
 
 
@@ -408,6 +409,20 @@ class Volume(Modulo):
         lancar(f"pactl set-sink-volume @DEFAULT_SINK@ {'+' if dy < 0 else '-'}5%")
 
 
+class Microfone(Modulo):
+    def largura(self, cr):
+        if not getattr(self.barra, "mic_ativo", False):
+            return 0
+        return 8 + ICONE + 8
+
+    def desenhar(self, cr, x):
+        if not getattr(self.barra, "mic_ativo", False):
+            return
+        if CFG["glow"]:
+            halo(cr, x + 8 + ICONE / 2, ALTURA / 2, 12, RED, 0.7)
+        icone(cr, "mic", x + 8, ALTURA / 2 - ICONE / 2, ICONE, RED)
+
+
 class IconeSimples(Modulo):
     def __init__(self, barra, nome, desenho, cliques=None, cor=lambda: FG, alfa=lambda: 1.0, dica=""):
         super().__init__(barra, nome, cliques, dica)
@@ -515,6 +530,7 @@ class Barra(Gtk.Window):
         self.ws_ativo, self.ws_usados = 1, set()
         self.minimizados, self.idioma = 0, "US"
         self.volume, self.mudo = 0, False
+        self.mic_ativo = False
         self.wifi_nivel, self.wifi_nome = 0, ""
         self.bt_ligado, self.bt_conectados = False, 0
         self.bat_nivel, self.na_tomada, self.carregando, self.perfil = 0, False, False, "balanced"
@@ -534,6 +550,7 @@ class Barra(Gtk.Window):
         self.centro = [Relogio(self, "clock", {1: lambda: self.calendario.alternar(self.centro[0])})]
         self.direita = [
             Idioma(self, "lang", {1: "hyprctl switchxkblayout all next"}, "Keyboard layout"),
+            Microfone(self, "mic", {1: f"{BIN}/aero-voice --toggle"}, "Microphone"),
             Volume(self, "vol", {1: f"{som} popup simples", 3: f"{som} popup completo",
                                  2: "pactl set-sink-mute @DEFAULT_SINK@ toggle"}),
             IconeSimples(self, "wifi", lambda: wifi_icone(self.wifi_nivel),
@@ -1000,6 +1017,20 @@ class Barra(Gtk.Window):
         GLib.idle_add(self.redesenhar)
         return False
 
+    def ler_mic(self):
+        arq = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "aero-mic-active")
+        ativo = os.path.exists(arq)
+        if not ativo:
+            try:
+                out = rodar("pactl", "list", "short", "source-outputs")
+                ativo = bool(out.strip())
+            except Exception:
+                ativo = False
+        if ativo != getattr(self, "mic_ativo", False):
+            self.mic_ativo = ativo
+            GLib.idle_add(self.redesenhar)
+        return False
+
     def ouvir_pactl(self):
         while True:
             try:
@@ -1008,6 +1039,8 @@ class Barra(Gtk.Window):
                 for linha in p.stdout:
                     if "sink" in linha or "server" in linha:
                         self.ler_volume()
+                    if "source" in linha or "server" in linha:
+                        self.ler_mic()
             except OSError:
                 pass
             time.sleep(3)
@@ -1084,6 +1117,7 @@ class Barra(Gtk.Window):
 
     def tique_bateria(self):
         self.ler_bateria()
+        self.ler_mic()
         return True
 
     def ler_minimizados(self):

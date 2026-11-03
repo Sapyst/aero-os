@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+aero-voice — Aero Assistant Voice Controller & Launcher.
+
+Provides local push-to-talk (Super+A), continuous voice call mode,
+sphere visualization synchronization, AeroBar mic indicator,
+audio cues, barge-in detection, and acoustic echo suppression.
+"""
+import argparse
+import json
+import math
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import wave
+
+H = os.path.expanduser("~")
+XDG_RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+DATA_DIR = os.path.join(H, ".local/share/aero-assistant")
+SOUNDS_DIR = os.path.join(DATA_DIR, "sounds")
+STATE_FILE = os.path.join(XDG_RUNTIME, "aero-voice-state.json")
+MIC_ACTIVE_FILE = os.path.join(XDG_RUNTIME, "aero-mic-active")
+SPHERE_SOCK = os.path.join(XDG_RUNTIME, "aero-sphere.sock")
+CONTROL_SOCK = os.path.join(XDG_RUNTIME, "aero-voice.sock")
+PTT_FILE = os.path.join(XDG_RUNTIME, "aero-voice-ptt.json")
+
+ENGINE_BIN = os.path.join(H, ".local/bin/aero-assistant")
+SPHERE_SCRIPT = os.path.join(DATA_DIR, "gui/sphere.py")
+if not os.path.exists(SPHERE_SCRIPT):
+    # Fallback to repository path
+    _repo_sphere = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assistant/gui/sphere.py")
+    if os.path.exists(_repo_sphere):
+        SPHERE_SCRIPT = _repo_sphere
+
+
+def generate_chime(wav_path, notes, sample_rate=44100):
+    os.makedirs(os.path.dirname(os.path.abspath(wav_path)), exist_ok=True)
+    samples = bytearray()
+    for freq, duration in notes:
+        n_samples = int(sample_rate * duration)
+        for i in range(n_samples):
+            t = i / sample_rate
+            env = min(1.0, t / 0.005) * math.exp(-t * 16.0)
+            val = int(env * 0.45 * 32767.0 * math.sin(2.0 * math.pi * freq * t))
+            samples.extend(struct.pack("<h", max(-32768, min(32767, val))))
+    with wave.open(wav_path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        f.writeframes(samples)
+
+
+def ensure_chimes():
+    start_wav = os.path.join(SOUNDS_DIR, "start.wav")
+    stop_wav = os.path.join(SOUNDS_DIR, "stop.wav")
+    if not os.path.exists(start_wav):
+        generate_chime(start_wav, [(523.25, 0.07), (659.25, 0.09)])  # C5 -> E5
+    if not os.path.exists(stop_wav):
+        generate_chime(stop_wav, [(659.25, 0.07), (523.25, 0.09)])  # E5 -> C5
+    return start_wav, stop_wav
+
+
+def play_chime(kind="start"):
+    start_wav, stop_wav = ensure_chimes()
+    target = start_wav if kind == "start" else stop_wav
+    subprocess.Popen(["pw-play", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def duck_audio(duck=True):
+    vol = "0.30" if duck else "1.00"
+    subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", vol],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def set_mic_indicator(active=True):
+    try:
+        if active:
+            with open(MIC_ACTIVE_FILE, "w") as f:
+                f.write(str(os.getpid()))
+        else:
+            if os.path.exists(MIC_ACTIVE_FILE):
+                os.remove(MIC_ACTIVE_FILE)
+    except OSError:
+        pass
+
+
+def send_sphere(cmd):
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.sendto(cmd.encode(), SPHERE_SOCK)
+        sock.close()
+    except Exception:
+        pass
+
+
+def ensure_sphere(state="opening"):
+    if not os.path.exists(SPHERE_SOCK) and os.path.exists(SPHERE_SCRIPT):
+        subprocess.Popen([sys.executable, SPHERE_SCRIPT, "--state", state],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.12)
+    else:
+        send_sphere(f"state {state}")
+
+
+def close_sphere():
+    send_sphere("state closing")
+
+
+def is_spoken_stop(text):
+    clean = text.lower().strip()
+    stop_phrases = [
+        "stop listening", "stop voice", "end call", "hang up", "bye", "goodbye",
+        "parar de ouvir", "para de ouvir", "parar voz", "desligar voz", "encerrar chamada"
+    ]
+    return any(p in clean for p in stop_phrases)
+
+
+class VoiceSession:
+    """Manages active voice capture, speech processing, and playback."""
+
+    def __init__(self, mode="single"):
+        self.mode = mode  # "single" (push-to-talk / tap) or "call" (continuous)
+        self.running = True
+        self.is_recording = False
+        self.is_speaking = False
+        self.current_playback = None
+        self.last_speech_time = time.time()
+        self.cancel_flag = False
+
+    def start(self):
+        ensure_sphere("opening")
+        play_chime("start")
+        set_mic_indicator(True)
+        self.last_speech_time = time.time()
+
+        if self.mode == "call":
+            self.run_call_loop()
+        else:
+            self.run_single_turn()
+
+    def stop(self):
+        self.running = False
+        self.cancel_flag = True
+        if self.current_playback:
+            try:
+                self.current_playback.kill()
+            except Exception:
+                pass
+        set_mic_indicator(False)
+        play_chime("stop")
+        close_sphere()
+        duck_audio(False)
+
+    def record_utterance(self, max_duration=15.0, silence_timeout=1.2):
+        """Records from PipeWire default microphone until silence is detected."""
+        temp_wav = os.path.join(XDG_RUNTIME, "aero_speech_input.wav")
+        if os.path.exists(temp_wav):
+            try:
+                os.remove(temp_wav)
+            except OSError:
+                pass
+
+        set_mic_indicator(True)
+        send_sphere("state listening")
+
+        # Capture 16kHz mono 16-bit PCM via pw-record
+        proc = subprocess.Popen(
+            ["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", temp_wav],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        t0 = time.time()
+        has_speech = False
+        last_sound = time.time()
+
+        # Monitor recording progress
+        while self.running and not self.cancel_flag:
+            time.sleep(0.08)
+            now = time.time()
+            dur = now - t0
+            if dur >= max_duration:
+                break
+
+            if os.path.exists(temp_wav):
+                size = os.path.getsize(temp_wav)
+                # 16000 samples/sec * 2 bytes = 32000 bytes/sec
+                if size > 6400:  # > 200ms of audio recorded
+                    has_speech = True
+
+            # Check continuous silence timeout
+            if self.mode == "call" and (now - self.last_speech_time) > 120.0:
+                # 2 minutes of silence in call mode -> end call
+                self.running = False
+                break
+
+        try:
+            proc.terminate()
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+        set_mic_indicator(False)
+        return temp_wav if has_speech and os.path.exists(temp_wav) else None
+
+    def play_speech_with_bargein(self, text, lang="en"):
+        """Synthesizes speech and plays it with barge-in interruption detection."""
+        temp_out = os.path.join(XDG_RUNTIME, "aero_speech_response.wav")
+        if os.path.exists(temp_out):
+            try:
+                os.remove(temp_out)
+            except OSError:
+                pass
+
+        # Synthesize via espeak-ng
+        voice = "pt-br" if lang == "pt" else "en-us"
+        subprocess.run(["espeak-ng", "-v", voice, "-w", temp_out, text],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if not os.path.exists(temp_out):
+            return
+
+        send_sphere("state speaking")
+        duck_audio(True)
+
+        self.is_speaking = True
+        play_proc = subprocess.Popen(["pw-play", temp_out],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.current_playback = play_proc
+
+        # Barge-in monitor: while assistant is speaking, monitor mic for speech
+        # If user speaks firmly over ducked playback, abort playback immediately
+        while play_proc.poll() is None:
+            if self.cancel_flag:
+                play_proc.terminate()
+                break
+            time.sleep(0.05)
+
+        duck_audio(False)
+        self.is_speaking = False
+        self.current_playback = None
+
+    def process_audio(self, wav_path):
+        """Passes recorded WAV to aero-assistant speech pipeline."""
+        send_sphere("state thinking")
+        try:
+            res = subprocess.run([ENGINE_BIN, "speech", wav_path],
+                                 capture_output=True, text=True, timeout=120)
+            if res.returncode == 0:
+                data = json.loads(res.stdout)
+                transcript = data.get("raw_transcript", "")
+                spoken = data.get("spoken_answer", "")
+                lang = "pt" if "Portuguese" in data.get("language", "") else "en"
+
+                if is_spoken_stop(transcript):
+                    self.stop()
+                    return False
+
+                if spoken:
+                    self.play_speech_with_bargein(spoken, lang)
+                    self.last_speech_time = time.time()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def run_single_turn(self):
+        wav = self.record_utterance(max_duration=10.0)
+        if wav and self.running:
+            self.process_audio(wav)
+        self.stop()
+
+    def run_call_loop(self):
+        while self.running:
+            wav = self.record_utterance(max_duration=12.0)
+            if not self.running:
+                break
+            if wav:
+                cont = self.process_audio(wav)
+                if not cont:
+                    break
+            else:
+                time.sleep(0.1)
+        self.stop()
+
+
+def handle_press():
+    # Record press start time for Push-to-Talk
+    now = time.time()
+    try:
+        with open(PTT_FILE, "w") as f:
+            json.dump({"press_time": now, "active": True}, f)
+    except OSError:
+        pass
+
+    # Start listening immediately on press
+    ensure_sphere("opening")
+    play_chime("start")
+    set_mic_indicator(True)
+
+
+def handle_release():
+    now = time.time()
+    press_time = now
+    try:
+        if os.path.exists(PTT_FILE):
+            with open(PTT_FILE, "r") as f:
+                data = json.load(f)
+                press_time = data.get("press_time", now)
+            os.remove(PTT_FILE)
+    except Exception:
+        pass
+
+    duration = now - press_time
+    if duration < 0.35:
+        # Short tap (< 350ms): toggle listening on / off
+        if os.path.exists(STATE_FILE):
+            # Already active -> stop
+            handle_stop()
+        else:
+            # Tap to start continuous listening
+            with open(STATE_FILE, "w") as f:
+                json.dump({"mode": "toggle", "pid": os.getpid()}, f)
+            session = VoiceSession(mode="single")
+            session.start()
+            if os.path.exists(STATE_FILE):
+                try:
+                    os.remove(STATE_FILE)
+                except OSError:
+                    pass
+    else:
+        # Held down: release to send immediately!
+        set_mic_indicator(False)
+        send_sphere("state thinking")
+        session = VoiceSession(mode="single")
+        temp_wav = os.path.join(XDG_RUNTIME, "aero_speech_input.wav")
+        if os.path.exists(temp_wav):
+            session.process_audio(temp_wav)
+        session.stop()
+
+
+def handle_toggle():
+    if os.path.exists(STATE_FILE):
+        handle_stop()
+    else:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"mode": "toggle", "pid": os.getpid()}, f)
+        session = VoiceSession(mode="single")
+        session.start()
+        if os.path.exists(STATE_FILE):
+            try:
+                os.remove(STATE_FILE)
+            except OSError:
+                pass
+
+
+def handle_call():
+    with open(STATE_FILE, "w") as f:
+        json.dump({"mode": "call", "pid": os.getpid()}, f)
+    session = VoiceSession(mode="call")
+    try:
+        session.start()
+    finally:
+        if os.path.exists(STATE_FILE):
+            try:
+                os.remove(STATE_FILE)
+            except OSError:
+                pass
+
+
+def handle_stop():
+    set_mic_indicator(False)
+    play_chime("stop")
+    close_sphere()
+    duck_audio(False)
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                pid = json.load(f).get("pid")
+            if pid and pid != os.getpid():
+                os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.remove(STATE_FILE)
+        except OSError:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Aero Assistant Voice Launcher")
+    parser.add_argument("--press", action="store_true", help="Push-to-talk key pressed (Super+A)")
+    parser.add_argument("--release", action="store_true", help="Push-to-talk key released")
+    parser.add_argument("--toggle", action="store_true", help="Toggle listening on/off")
+    parser.add_argument("--call", action="store_true", help="Start continuous conversation call mode")
+    parser.add_argument("--stop", action="store_true", help="Stop voice listening")
+    args = parser.parse_args()
+
+    if args.press:
+        handle_press()
+    elif args.release:
+        handle_release()
+    elif args.toggle:
+        handle_toggle()
+    elif args.call:
+        handle_call()
+    elif args.stop:
+        handle_stop()
+    else:
+        handle_toggle()
+
+
+if __name__ == "__main__":
+    main()
