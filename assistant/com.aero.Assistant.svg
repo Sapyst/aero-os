@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+<defs><radialGradient id="g" cx="35%" cy="30%" r="80%"><stop offset="0" stop-color="#b9f6c8"/><stop offset="1" stop-color="#2fae62"/></radialGradient></defs>
+<rect x="6" y="6" width="116" height="116" rx="28" fill="#141f19"/>
+<circle cx="64.0" cy="64.0" r="7.2" fill="url(#g)"/>
+<circle cx="78.0" cy="64.0" r="5.8" fill="url(#g)"/>
+<circle cx="71.0" cy="76.1" r="5.8" fill="url(#g)"/>
+<circle cx="57.0" cy="76.1" r="5.8" fill="url(#g)"/>
+<circle cx="50.0" cy="64.0" r="5.8" fill="url(#g)"/>
+<circle cx="57.0" cy="51.9" r="5.8" fill="url(#g)"/>
+<circle cx="71.0" cy="51.9" r="5.8" fill="url(#g)"/>
+<circle cx="92.0" cy="64.0" r="4.4" fill="url(#g)"/>
+<circle cx="88.2" cy="78.0" r="4.4" fill="url(#g)"/>
+<circle cx="78.0" cy="88.2" r="4.4" fill="url(#g)"/>
+<circle cx="64.0" cy="92.0" r="4.4" fill="url(#g)"/>
+<circle cx="50.0" cy="88.2" r="4.4" fill="url(#g)"/>
+<circle cx="39.8" cy="78.0" r="4.4" fill="url(#g)"/>
+<circle cx="36.0" cy="64.0" r="4.4" fill="url(#g)"/>
+<circle cx="39.8" cy="50.0" r="4.4" fill="url(#g)"/>
+<circle cx="50.0" cy="39.8" r="4.4" fill="url(#g)"/>
+<circle cx="64.0" cy="36.0" r="4.4" fill="url(#g)"/>
+<circle cx="78.0" cy="39.8" r="4.4" fill="url(#g)"/>
+<circle cx="88.2" cy="50.0" r="4.4" fill="url(#g)"/>
+<circle cx="106.0" cy="64.0" r="3.0" fill="url(#g)"/>
+<circle cx="103.5" cy="78.4" r="3.0" fill="url(#g)"/>
+<circle cx="96.2" cy="91.0" r="3.0" fill="url(#g)"/>
+<circle cx="85.0" cy="100.4" r="3.0" fill="url(#g)"/>
+<circle cx="71.3" cy="105.4" r="3.0" fill="url(#g)"/>
+<circle cx="56.7" cy="105.4" r="3.0" fill="url(#g)"/>
+<circle cx="43.0" cy="100.4" r="3.0" fill="url(#g)"/>
+<circle cx="31.8" cy="91.0" r="3.0" fill="url(#g)"/>
+<circle cx="24.5" cy="78.4" r="3.0" fill="url(#g)"/>
+<circle cx="22.0" cy="64.0" r="3.0" fill="url(#g)"/>
+<circle cx="24.5" cy="49.6" r="3.0" fill="url(#g)"/>
+<circle cx="31.8" cy="37.0" r="3.0" fill="url(#g)"/>
+<circle cx="43.0" cy="27.6" r="3.0" fill="url(#g)"/>
+<circle cx="56.7" cy="22.6" r="3.0" fill="url(#g)"/>
+<circle cx="71.3" cy="22.6" r="3.0" fill="url(#g)"/>
+<circle cx="85.0" cy="27.6" r="3.0" fill="url(#g)"/>
+<circle cx="96.2" cy="37.0" r="3.0" fill="url(#g)"/>
+<circle cx="103.5" cy="49.6" r="3.0" fill="url(#g)"/>
+</svg>

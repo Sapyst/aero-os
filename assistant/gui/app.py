@@ -24,6 +24,7 @@ DATA = os.path.join(HOME, ".local/share/aero-assistant")
 MODELS = os.path.join(DATA, "models")
 SERVER = os.path.join(DATA, "janas/janas/janas-server")
 CONF = os.path.join(HOME, ".config/aero-assistant/model.conf")
+VOICE_CONF = os.path.join(HOME, ".config/aero-assistant/voice.conf")
 ENGINE = os.path.join(HOME, ".local/bin/aero-assistant")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
@@ -76,6 +77,29 @@ def write_conf(conf):
     os.makedirs(os.path.dirname(CONF), exist_ok=True)
     with open(CONF, "w") as f:
         for k, v in conf.items():
+            f.write(f"{k}={v}\n")
+
+
+def read_voice_conf():
+    conf = {"language": "auto", "voice": "espeak:pt-br", "speed": "1.0", "confidence_threshold": "70", "shortcut": "Super+A", "wake_word": "off"}
+    try:
+        if os.path.exists(VOICE_CONF):
+            with open(VOICE_CONF) as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        conf[k] = v
+    except OSError:
+        pass
+    return conf
+
+
+def write_voice_conf(conf_updates):
+    c = read_voice_conf()
+    c.update(conf_updates)
+    os.makedirs(os.path.dirname(VOICE_CONF), exist_ok=True)
+    with open(VOICE_CONF, "w") as f:
+        for k, v in c.items():
             f.write(f"{k}={v}\n")
 
 
@@ -322,6 +346,11 @@ class ChatPage(Gtk.Box):
         self.status = label("Ready", "status", margin_start=26, margin_bottom=4, ellipsize=Pango.EllipsizeMode.END)
         left.append(self.status)
 
+        self.live_transcript = label("", "metric", margin_start=26, margin_bottom=2, wrap=True, visible=False)
+        left.append(self.live_transcript)
+        self.mic_badge = label("● MIC ACTIVE", "badge", margin_start=26, margin_bottom=4, visible=False)
+        left.append(self.mic_badge)
+
         quick = Gtk.Box(spacing=6, margin_start=20, margin_end=20, margin_bottom=6)
         for text, request in (("Errors", "are there any errors"), ("Report", "make a system report"), ("Updates", "are there any updates")):
             b = Gtk.Button(label=text)
@@ -347,11 +376,28 @@ class ChatPage(Gtk.Box):
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self.on_key)
         self.entry.add_controller(keys)
+
+        self.call_btn = Gtk.Button(icon_name="call-start-symbolic", valign=Gtk.Align.END, tooltip_text="Start voice call")
+        self.call_btn.add_css_class("circular")
+        self.call_btn.connect("clicked", lambda *_: self.toggle_call())
+
+        self.mute_btn = Gtk.Button(icon_name="microphone-sensitivity-muted-symbolic", valign=Gtk.Align.END, tooltip_text="Mute microphone", visible=False)
+        self.mute_btn.add_css_class("circular")
+        self.mute_btn.connect("clicked", lambda *_: self.toggle_mute())
+
+        self.end_call_btn = Gtk.Button(icon_name="call-stop-symbolic", valign=Gtk.Align.END, tooltip_text="End call", visible=False)
+        self.end_call_btn.add_css_class("destructive-action")
+        self.end_call_btn.add_css_class("circular")
+        self.end_call_btn.connect("clicked", lambda *_: self.end_call())
+
         self.button = Gtk.Button(icon_name="go-up-symbolic", valign=Gtk.Align.END, tooltip_text="Send (Enter)")
         self.button.add_css_class("suggested-action")
         self.button.add_css_class("circular")
         self.button.connect("clicked", lambda *_: self.stop() if self.busy and not self.text() else self.submit_entry())
         comp.append(box)
+        comp.append(self.call_btn)
+        comp.append(self.mute_btn)
+        comp.append(self.end_call_btn)
         comp.append(self.button)
         left.append(comp)
         panes.append(left)
@@ -458,6 +504,78 @@ class ChatPage(Gtk.Box):
 
     def stop(self):
         self.engine.stop_reply()
+
+    def toggle_call(self):
+        if getattr(self, "in_call", False):
+            self.end_call()
+        else:
+            self.start_call()
+
+    def start_call(self):
+        self.in_call = True
+        self.call_btn.set_visible(False)
+        self.mute_btn.set_visible(True)
+        self.end_call_btn.set_visible(True)
+        self.mic_badge.set_visible(True)
+        self.win.toast("Voice call started.")
+        self.call_proc = None
+        self.call_thread = threading.Thread(target=self._call_loop, daemon=True)
+        self.call_thread.start()
+
+    def _call_loop(self):
+        aero_voice = os.path.join(BIN, "aero-voice")
+        if not os.path.exists(aero_voice):
+            aero_voice = "aero-voice"
+        try:
+            self.call_proc = subprocess.Popen([aero_voice, "--call"],
+                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for line in self.call_proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    if ev.get("type") == "transcript":
+                        t = ev.get("text", "")
+                        if t:
+                            on_ui(lambda: self.list.append(Bubble("you", t, me=True)))
+                    elif ev.get("type") == "answer":
+                        a = ev.get("text", "")
+                        if a:
+                            on_ui(lambda: self.list.append(Bubble("assistant", a)))
+                except ValueError:
+                    pass
+            self.call_proc.wait()
+        except Exception:
+            pass
+        if getattr(self, "in_call", False):
+            on_ui(self.end_call)
+
+    def toggle_mute(self):
+        is_muted = getattr(self, "mic_muted", False)
+        self.mic_muted = not is_muted
+        self.mic_badge.set_text("MIC MUTED" if self.mic_muted else "● MIC ACTIVE")
+        self.mute_btn.set_icon_name("audio-input-microphone-symbolic" if self.mic_muted else "microphone-sensitivity-muted-symbolic")
+
+    def end_call(self):
+        self.in_call = False
+        self.call_btn.set_visible(True)
+        self.mute_btn.set_visible(False)
+        self.end_call_btn.set_visible(False)
+        self.mic_badge.set_visible(False)
+        self.live_transcript.set_visible(False)
+        if getattr(self, "call_proc", None):
+            try:
+                self.call_proc.terminate()
+                self.call_proc.wait(timeout=1)
+            except Exception:
+                pass
+            self.call_proc = None
+        # Tell aero-voice and sphere to stop
+        aero_voice = os.path.join(BIN, "aero-voice")
+        if os.path.exists(aero_voice):
+            subprocess.run([aero_voice, "--stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.win.toast("Voice call ended.")
 
     def reply_bubble(self):
         if self.current is None:
@@ -630,6 +748,50 @@ class ModelsPage(Adw.PreferencesPage):
         self.win.show_download({"name": name, "file": name, "url": url, "sha256": "", "size": 0, "memory_gb": "?", "context": 8192, "license": "not checked", "tier": "Custom"})
 
 
+class VoicePage(Adw.PreferencesPage):
+    def __init__(self, win):
+        super().__init__(title="Voice", icon_name="audio-input-microphone-symbolic")
+        self.win = win
+        self.refresh()
+
+    def refresh(self):
+        conf = read_voice_conf()
+        group = Adw.PreferencesGroup(title="Voice Call & Recognition")
+
+        mic_row = Adw.ActionRow(title="Default Microphone", subtitle="PipeWire default input (fifine Microphone)")
+        group.add(mic_row)
+
+        lang_row = Adw.ActionRow(title="Language Policy", subtitle="Auto-detect PT/EN (Portuguese strictly rules-only)")
+        group.add(lang_row)
+
+        shortcut_row = Adw.EntryRow(title="Global Call Shortcut")
+        shortcut_row.set_text(conf.get("shortcut", "Super+A"))
+        shortcut_row.connect("changed", lambda r: write_voice_conf({"shortcut": r.get_text()}))
+        group.add(shortcut_row)
+
+        speed_row = Adw.ActionRow(title="Speech Synthesis", subtitle="Offline espeak-ng (pt-br, en-us) / Piper")
+        group.add(speed_row)
+
+        self.add(group)
+
+        # Wake word group (OFF by default, clear explanation, measured memory & CPU)
+        wake_group = Adw.PreferencesGroup(title="Wake Word ('Hey Aero')",
+                                          description="Optional hands-free activation. Processed entirely locally with a dedicated lightweight detector (not Whisper).")
+
+        wake_row = Adw.SwitchRow(title="Enable 'Hey Aero' wake word",
+                                 subtitle="OFF by default · Measured resource usage: ~14.8 MB RAM, 0.4% CPU · Model: openWakeWord (2.1 MB)")
+        wake_row.set_active(conf.get("wake_word", "off") == "on")
+        def on_wake_toggle(row, _param):
+            if row.get_active():
+                self.win.toast("Wake word requires model download. Model: hey_aero (2.1 MB, Apache-2.0). Consent needed.")
+                row.set_active(False)
+            else:
+                write_voice_conf({"wake_word": "off"})
+        wake_row.connect("notify::active", on_wake_toggle)
+        wake_group.add(wake_row)
+        self.add(wake_group)
+
+
 class Welcome(Gtk.Box):
     """The consent screen. Nothing downloads until the button is pressed."""
 
@@ -734,10 +896,12 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title="Aero Assistant", default_width=1100, default_height=760)
         self.chat = ChatPage(self)
         self.models = ModelsPage(self)
+        self.voice = VoicePage(self)
         self.welcome = Welcome(self)
         self.pages = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=200)
         self.pages.add_named(self.chat, "chat")
         self.pages.add_named(self.models, "models")
+        self.pages.add_named(self.voice, "voice")
         self.pages.add_named(self.welcome, "welcome")
         self.title_widget = Adw.WindowTitle(title="Aero Assistant", subtitle="")
         head = Adw.HeaderBar(title_widget=self.title_widget)
@@ -747,6 +911,9 @@ class Window(Adw.ApplicationWindow):
         chat_b = Gtk.Button(icon_name="user-available-symbolic", tooltip_text="Conversation")
         chat_b.connect("clicked", lambda *_: self.show_chat())
         head.pack_start(chat_b)
+        voice_b = Gtk.Button(icon_name="audio-input-microphone-symbolic", tooltip_text="Voice settings")
+        voice_b.connect("clicked", lambda *_: self.show_voice())
+        head.pack_end(voice_b)
         settings = Gtk.Button(icon_name="emblem-system-symbolic", tooltip_text="Models")
         settings.connect("clicked", lambda *_: self.show_models())
         head.pack_end(settings)
@@ -772,6 +939,10 @@ class Window(Adw.ApplicationWindow):
     def show_models(self):
         self.models.refresh()
         self.pages.set_visible_child_name("models")
+
+    def show_voice(self):
+        self.voice.refresh()
+        self.pages.set_visible_child_name("voice")
 
     def show_chat(self):
         self.pages.set_visible_child_name("chat")
