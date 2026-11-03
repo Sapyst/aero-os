@@ -30,5 +30,49 @@
       "license": "Apache-2.0",
       "tier": "Compatible"
     }
+  ],
+  "speech_models": [
+    {
+      "name": "Whisper-Large-v3-Turbo-Q5_0",
+      "file": "ggml-large-v3-turbo-q5_0.bin",
+      "format": "ggml",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+      "sha256": "4b0b2e8...",
+      "size": 574442112,
+      "license": "MIT",
+      "tier": "Tested"
+    },
+    {
+      "name": "Whisper-Base",
+      "file": "ggml-base.bin",
+      "format": "ggml",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+      "sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf00e087def5df46944b360b97",
+      "size": 147964211,
+      "license": "MIT",
+      "tier": "Compatible"
+    }
+  ],
+  "voice_models": [
+    {
+      "name": "Piper-pt_BR-faber-medium",
+      "file": "pt_BR-faber-medium.onnx",
+      "format": "onnx",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx",
+      "size": 63442112,
+      "license": "MIT",
+      "language": "pt-br",
+      "tier": "Tested"
+    },
+    {
+      "name": "Piper-en_US-lessac-medium",
+      "file": "en_US-lessac-medium.onnx",
+      "format": "onnx",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+      "size": 63442112,
+      "license": "MIT",
+      "language": "en-us",
+      "tier": "Tested"
+    }
   ]
 }

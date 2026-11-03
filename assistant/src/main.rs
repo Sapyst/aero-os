@@ -1,6 +1,7 @@
 //! aero-assistant: a local Arch Linux assistant. The model reads the system through
 //! checked tools and only ever proposes changes; nothing changes without the user's yes.
 
+mod composer;
 mod fsinfo;
 mod guard;
 mod origin;
@@ -8,8 +9,11 @@ mod pathinfo;
 mod recent;
 #[cfg(test)]
 mod testutil;
+mod rule_engine;
 mod triggers;
 mod tui;
+mod utterance;
+mod voice;
 mod wiki;
 
 use guard::Risk;
@@ -459,6 +463,16 @@ fn events_mode(opt: &mut Options) {
         INTERRUPTED.store(false, Ordering::SeqCst);
         tui::set_busy(true);
         if !by_rule(&text, opt) {
+            if !rule_engine::allow_to_model(&text) {
+                let answer = handle_unmatched_portuguese(&text);
+                println!("{answer}");
+                tui::emit_event(json!({"type":"text","text":answer}));
+                tui::set_busy(false);
+                tui::emit_event(json!({"type":"done"}));
+                INTERRUPTED.store(false, Ordering::SeqCst);
+                schedule_idle_stop();
+                continue;
+            }
             let question = match request["cascade"].as_array().map(|c| (c[0].as_u64().unwrap_or(0), c[1].as_u64().unwrap_or(0))) {
                 Some((i, n)) => format!("(Queued request {i} of {n}. It was written while earlier requests ran, and comes after them.)\n{text}"),
                 None => text,
@@ -738,6 +752,13 @@ fn turn(messages: &mut Vec<Value>, question: &str, opt: &mut Options) -> Result<
     Err("no final answer".into())
 }
 
+pub fn query_model_for_voice(question: &str) -> Result<String, String> {
+    ensure_server()?;
+    let mut messages = base_messages();
+    let mut opt = Options { log: None, no_exec: true };
+    turn(&mut messages, question, &mut opt)
+}
+
 fn config_path(name: &str) -> PathBuf {
     PathBuf::from(env::var("HOME").unwrap_or_default()).join(".config/aero-assistant").join(name)
 }
@@ -748,6 +769,10 @@ fn quote(path: &std::path::Path) -> String {
 
 /// Compares a planned action with the model's reading of the request, when the model is already up.
 fn second_opinion(question: &str, action: &str) -> bool {
+    // Portuguese is handled only by rules, and it must never reach the language model under any circumstance!
+    if !rule_engine::allow_to_model(question) {
+        return true;
+    }
     if !server_up() {
         eprintln!("\x1b[2m(rule match; model not loaded, so no second check)\x1b[0m");
         return true;
@@ -918,11 +943,44 @@ fn print_header(engine: &str, model: &str, context: u64) {
     println!("\x1b[2mWhile the model works, messages wait in a queue. -send releases the first, --send releases all in order, -queue lists, -clear empties. Ctrl-C stops a reply. Empty line or Ctrl-D leaves.\x1b[0m");
 }
 
+fn handle_unmatched_portuguese(question: &str) -> String {
+    let clean = utterance::clean_utterance(question);
+    let target = clean.requests.first().cloned().unwrap_or(clean.cleaned);
+    let decision = rule_engine::evaluate_decision(&target);
+    match &decision.resolution {
+        rule_engine::Resolution::Clarification(q) => q.clone(),
+        rule_engine::Resolution::CannotAnswer(msg) => msg.clone(),
+        _ => {
+            let slots = rule_engine::extract_slots(&target);
+            let cannot = composer::compose_cannot_answer(
+                if slots.object.is_some() {
+                    composer::CannotAnswerReason::NoRuleExists
+                } else {
+                    composer::CannotAnswerReason::NotUnderstood
+                },
+                slots.object.as_deref(),
+                None,
+                &["bateria", "brilho", "memoria", "rede"],
+                rule_engine::Language::Portuguese,
+            );
+            cannot.spoken
+        }
+    }
+}
+
 fn run_request(line: &str, cascade: Option<(usize, usize)>, messages: &mut Vec<Value>, opt: &mut Options) {
     println!("\n\x1b[36m> {line}\x1b[0m");
     tui::set_busy(true);
     INTERRUPTED.store(false, Ordering::SeqCst);
     if !by_rule(line, opt) {
+        // Hard safety rule: Portuguese requests NEVER reach the language model!
+        if !rule_engine::allow_to_model(line) {
+            let answer = handle_unmatched_portuguese(line);
+            println!("{answer}");
+            tui::set_busy(false);
+            schedule_idle_stop();
+            return;
+        }
         let question = match cascade {
             Some((i, n)) => format!("(Queued request {i} of {n}. It was written while earlier requests ran, and comes after them.)\n{line}"),
             None => line.to_string(),
@@ -1158,6 +1216,43 @@ fn main() {
         println!("{}", call_tool(&name, &args, &opt));
         return;
     }
+    if words.first().map(String::as_str) == Some("explain") {
+        let q = words[1..].join(" ");
+        let clean = utterance::clean_utterance(&q);
+        let req_text = clean.requests.first().cloned().unwrap_or(clean.cleaned.clone());
+        println!("{}", rule_engine::explain_decision(&req_text));
+        return;
+    }
+    if words.first().map(String::as_str) == Some("speech") {
+        let file = words.get(1).map(String::as_str).unwrap_or("");
+        match voice::process_speech_pipeline(std::path::Path::new(file)) {
+            Ok(res) => {
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "raw_transcript": res.raw_transcript,
+                    "cleaned_text": res.cleaned_text,
+                    "language": format!("{:?}", res.language),
+                    "confidence": res.decision.confidence,
+                    "resolution": format!("{:?}", res.decision.resolution),
+                    "spoken_answer": res.answer.spoken,
+                    "display_answer": res.answer.display,
+                    "proposal_command": res.proposal_command,
+                    "proposal_risk": res.proposal_risk.as_ref().map(|r| format!("{r:?}")),
+                    "timings_ms": {
+                        "transcription": res.timings.transcription_ms,
+                        "cleanup": res.timings.cleanup_ms,
+                        "routing": res.timings.routing_ms,
+                        "synthesis": res.timings.synthesis_ms,
+                        "total": res.timings.total_ms,
+                    }
+                })).unwrap_or_default());
+            }
+            Err(e) => {
+                eprintln!("Speech pipeline error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if words.first().map(String::as_str) == Some("--help") || words.first().map(String::as_str) == Some("-h") {
         println!("usage: aero-assistant [--model] [--no-exec] [--log FILE] [QUESTION]\n       aero-assistant index | stop\n\nWithout a question it opens a conversation. Common requests use exact rules from\n~/.config/aero-assistant/triggers.conf; --model always asks the model. Changes always ask first.");
         return;
@@ -1187,6 +1282,11 @@ fn main() {
         }
         return;
     }
+    if !words.is_empty() && !rule_engine::allow_to_model(&request) {
+        let answer = handle_unmatched_portuguese(&request);
+        println!("{answer}");
+        return;
+    }
     if let Err(e) = ensure_server() {
         eprintln!("Error: {e}");
         schedule_idle_stop();
@@ -1207,6 +1307,12 @@ fn main() {
                 break;
             };
             if by_rule(&line, &opt) {
+                schedule_idle_stop();
+                continue;
+            }
+            if !rule_engine::allow_to_model(&line) {
+                let answer = handle_unmatched_portuguese(&line);
+                eprintln!("{answer}");
                 schedule_idle_stop();
                 continue;
             }

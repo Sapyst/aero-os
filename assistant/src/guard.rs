@@ -280,6 +280,7 @@ pub fn readable_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Risk {
     Normal,
     High(String),
