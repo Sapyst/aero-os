@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Aero Voice
+Comment=Start a voice call with the Aero Assistant
+Exec=aero-voice --call
+Icon=com.aero.Voice
+Terminal=false
+Categories=System;Utility;

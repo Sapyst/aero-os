@@ -27,5 +27,7 @@ install -Dm755 gui/sphere.py "$HOME/.local/share/aero-assistant/gui/sphere.py"
 install -Dm755 bin/aero-voice "$HOME/.local/bin/aero-voice"
 install -Dm644 com.aero.Assistant.desktop "$HOME/.local/share/applications/com.aero.Assistant.desktop"
 install -Dm644 com.aero.Assistant.svg "$HOME/.local/share/icons/hicolor/scalable/apps/com.aero.Assistant.svg"
+install -Dm644 com.aero.Voice.desktop "$HOME/.local/share/applications/com.aero.Voice.desktop"
+install -Dm644 com.aero.Voice.svg "$HOME/.local/share/icons/hicolor/scalable/apps/com.aero.Voice.svg"
 ln -sf "$HOME/.local/share/aero-assistant/gui/app.py" "$HOME/.local/bin/aero-assistant-app"
 "$HOME/.local/bin/aero-assistant" index
